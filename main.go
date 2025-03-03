@@ -12,6 +12,7 @@ import (
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -639,12 +640,12 @@ func initLogger(logConfig LogConfig, baseDir string) {
 
 // setupGojaRuntime は goja のランタイムをセットアップします。
 func setupGojaRuntime() *goja.Runtime {
-	runtime := goja.New()
+	vm := goja.New()
 
 	// getAPI 関数の登録
-	runtime.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
+	vm.Set("nyanGetAPI", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 3 {
-			return runtime.ToValue("")
+			return vm.ToValue("")
 		}
 		url := call.Argument(0).String()
 		username := call.Argument(1).String()
@@ -653,16 +654,16 @@ func setupGojaRuntime() *goja.Runtime {
 		result, err := getAPI(url, username, password)
 		if err != nil {
 			log.Println("getAPI error:", err)
-			return runtime.ToValue("")
+			return vm.ToValue("")
 		}
-		return runtime.ToValue(result)
+		return vm.ToValue(result)
 	})
 
 	// jsonAPI 関数の登録
-	runtime.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
+	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 4 {
 			log.Println("jsonAPI: not enough arguments")
-			return runtime.ToValue("")
+			return vm.ToValue("")
 		}
 		url := call.Argument(0).String()
 		jsonData := []byte(call.Argument(1).String())
@@ -672,31 +673,31 @@ func setupGojaRuntime() *goja.Runtime {
 		result, err := jsonAPI(url, jsonData, username, password)
 		if err != nil {
 			log.Println("jsonAPI error:", err)
-			return runtime.ToValue("")
+			return vm.ToValue("")
 		}
-		return runtime.ToValue(result)
+		return vm.ToValue(result)
 	})
 
 	// getCookie, setCookie, setItem, getItem も同様に登録する
-	runtime.Set("nyanGetCookie", func(call goja.FunctionCall) goja.Value {
+	vm.Set("nyanGetCookie", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
-			return runtime.ToValue("")
+			return vm.ToValue("")
 		}
 		cookieName := call.Argument(0).String()
 		if ginContext != nil {
 			cookieValue, err := ginContext.Cookie(cookieName)
 			if err != nil {
 				log.Printf("Error retrieving cookie: %v", err)
-				return runtime.ToValue("")
+				return vm.ToValue("")
 			}
-			return runtime.ToValue(cookieValue)
+			return vm.ToValue(cookieValue)
 		}
-		return runtime.ToValue("")
+		return vm.ToValue("")
 	})
 
-	runtime.Set("nyanSetCookie", func(call goja.FunctionCall) goja.Value {
+	vm.Set("nyanSetCookie", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 2 {
-			return runtime.ToValue(nil)
+			return vm.ToValue(nil)
 		}
 		cookieName := call.Argument(0).String()
 		cookieValue := call.Argument(1).String()
@@ -706,29 +707,31 @@ func setupGojaRuntime() *goja.Runtime {
 		} else {
 			log.Println("ginContext is not set")
 		}
-		return runtime.ToValue(nil)
+		return vm.ToValue(nil)
 	})
 
-	runtime.Set("nyanSetItem", func(call goja.FunctionCall) goja.Value {
+	vm.Set("nyanSetItem", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 2 {
-			return runtime.ToValue(nil)
+			return vm.ToValue(nil)
 		}
 		key := call.Argument(0).String()
 		value := call.Argument(1).String()
 		storage[key] = value
-		return runtime.ToValue(nil)
+		return vm.ToValue(nil)
 	})
 
-	runtime.Set("nyanGetItem", func(call goja.FunctionCall) goja.Value {
+	vm.Set("nyanGetItem", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
-			return runtime.ToValue(nil)
+			return vm.ToValue(nil)
 		}
 		key := call.Argument(0).String()
 		if val, ok := storage[key]; ok {
-			return runtime.ToValue(val)
+			return vm.ToValue(val)
 		}
-		return runtime.ToValue(nil)
+		return vm.ToValue(nil)
 	})
+
+	vm.Set("nyanGetFile", newNyanGetFile(vm))
 
 	// console.log の登録
 	console := map[string]func(...interface{}){
@@ -736,19 +739,19 @@ func setupGojaRuntime() *goja.Runtime {
 			log.Println(args...)
 		},
 	}
-	runtime.Set("console", console)
+	vm.Set("console", console)
 
-	runtime.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
+	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
-			return runtime.ToValue(`{"success":false,"exitCode":0,"stdout":"","stderr":"No command provided"}`)
+			return vm.ToValue(`{"success":false,"exitCode":0,"stdout":"","stderr":"No command provided"}`)
 		}
 		cmdLine := call.Argument(0).String()
 		outJSON := execGoja(cmdLine)
-		return runtime.ToValue(outJSON)
+		return vm.ToValue(outJSON)
 	})
 
 
-	return runtime
+	return vm
 }
 
 // execGoja は OS コマンドを実行して結果を JSON 文字列で返す例
@@ -863,4 +866,35 @@ func handleNyan(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, response)
+}
+
+// newNyanGetFile は、渡された vm をクロージャーにキャプチャして nyanGetFile を返します。
+func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		// 引数のチェック
+		if len(call.Arguments) < 1 {
+			// vm を使ってエラーオブジェクトを生成する
+			panic(vm.NewTypeError("nyanGetFileには1つの引数（ファイルパス）が必要です"))
+		}
+		relativePath := call.Arguments[0].String()
+
+		// 実行中のバイナリのパスを取得し、ディレクトリ部分を取得
+		exePath, err := os.Executable()
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		exeDir := filepath.Dir(exePath)
+
+		// バイナリディレクトリからの相対パスを結合してフルパスを作成
+		fullPath := filepath.Join(exeDir, relativePath)
+
+		// ファイルを読み込み
+		content, err := ioutil.ReadFile(fullPath)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+
+		// 読み込んだ内容を文字列として返す
+		return vm.ToValue(string(content))
+	}
 }

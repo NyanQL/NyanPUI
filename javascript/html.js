@@ -11,6 +11,8 @@ function main() {
     console.log("nyanSetItem:" + typeof nyanSetItem);
     console.log("nyanSetCookie:" + typeof nyanSetCookie);
     console.log("nyanGetCookie:" + typeof nyanGetCookie);
+    console.log("nyanGetFile:" + typeof nyanGetFile);
+    //console.log(nyanGetFile("./README.md"));
 
     //htmlコードを読み込み表示をする。
     return nyanHtmlCode;
