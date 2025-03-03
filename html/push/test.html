@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>WebSocket プッシュ通知サンプル</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 20px;
+        }
+        #log {
+            white-space: pre-wrap;
+            background: #f0f0f0;
+            padding: 10px;
+            border: 1px solid #ccc;
+        }
+    </style>
+</head>
+<body>
+<h1 style="text-align: center">NyanPUI WebSocket プッシュ通知サンプル</h1>
+<div style="text-align: center">にゃんぷいをはじめよう！</div>
+
+<!-- 接続開始ボタン -->
+<button id="connectButton">WebSocket 接続開始</button>
+<div id="log" style="margin-top: 16px;">ログ出力：</div>
+
+<script>
+    const logElement = document.getElementById("log");
+
+    // ログ出力用の関数
+    function appendLog(message) {
+        logElement.textContent += "\n" + message;
+    }
+
+    // ボタンがクリックされたときに接続を開始
+    document.getElementById("connectButton").addEventListener("click", function() {
+        const ws = new WebSocket("ws://localhost:8009/push/receive");
+
+        ws.onopen = function(event) {
+            appendLog("WebSocket 接続が確立されました");
+            // 接続確立後、ボタンを非表示にする
+            document.getElementById("connectButton").style.display = "none";
+            // 必要に応じて初期メッセージを送信する
+            // ws.send("Hello Server!");
+        };
+
+        ws.onmessage = function(event) {
+            appendLog("サーバーからのメッセージ: " + event.data);
+        };
+
+        ws.onerror = function(error) {
+            appendLog("WebSocket エラー: " + error);
+        };
+
+        ws.onclose = function(event) {
+            appendLog("WebSocket 接続が閉じられました。コード: " + event.code);
+            document.getElementById("connectButton").style.display = "block";
+        };
+    });
+</script>
+</body>
+</html>
