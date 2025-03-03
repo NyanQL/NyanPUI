@@ -1,0 +1,20 @@
+{
+  "name": "にゃんぷい",
+  "profile": "なんぷいの説明",
+  "version": "0.0.1",
+  "Port": 8009,
+  "certPath": "",
+  "keyPath": "",
+  "javascript_include": [
+    "./javascript/base.js",
+    "./javascript/lib/nyanPlate.js"
+  ],
+  "log": {
+    "Filename": "./logs/nyanpui.log",
+    "MaxSize": 5,
+    "MaxBackups": 3,
+    "MaxAge": 7,
+    "Compress": true,
+    "EnableLogging": false
+  }
+}

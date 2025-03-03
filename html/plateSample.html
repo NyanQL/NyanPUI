@@ -1,0 +1,53 @@
+<html>
+<style>
+    table, th , td {
+        border:1px solid #888888;
+        width:200px;
+        margin-right: auto;
+        margin-left: auto;
+    }
+    th {
+        background-color: #888888;
+        color: #FFF;
+    }
+    .orange{
+        background-color: #efc3a6;
+    }
+    .apple{
+        background-color: #f6d1d8;
+    }
+    .banana{
+        background-color: yellow;
+    }
+
+</style>
+<body>
+<!-- タイトルとスタイル -->
+<h1 data-nyanString="title" data-nyanStyle="title_style" data-nyanClass="className">Default Title</h1>
+<h2 data-nyanString="sub_title" data-nyanStyle="title_style">Default Subtitle</h2>
+
+<!-- 商品リストをループ処理 -->
+<table>
+    <thead>
+    <th>商品名</th>
+    <th>価格</th>
+    </thead>
+    <tbody data-nyanLoop="items">
+    <tr>
+        <td data-nyanString="title" data-nyanClass="className" data-nyanStyle="style"><!-- りんご --></td>
+        <td><span data-nyanString="price">10</span>円</td>
+    </tr>
+    </tbody>
+</table>
+
+
+
+<div style="
+    position: fixed;
+    width:100%;
+    text-align: center;
+    bottom:1px;
+"
+><a href="https://github.com/NyanQL/NyanPUI" target="_blank" style="text-decoration: none">NyanPUI (GitHub)</a></div>
+</body>
+</html>

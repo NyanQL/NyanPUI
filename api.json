@@ -1,0 +1,27 @@
+{
+  "html": {
+    "script": "./javascript/html.js",
+    "html": "./html/index.html",
+    "description": "トップページです"
+  },
+ "push/request": {
+   "script": "./javascript/html.js",
+   "html": "./html/push/request.html",
+   "description": "リクエストする",
+   "push": "push/receive"
+ },
+  "push/receive": {
+    "script": "./javascript/receive.js",
+    "html": "./html/push/receive.html",
+    "description": "websocketでここに接続しておくと、push/requestにリクエストがあるとpushを受信することができるよ"
+  },
+  "push/test": {
+    "html": "./html/push/test.html",
+    "description": "websocketを試すことができるページ"
+  },
+  "plate": {
+    "script": "./javascript/plate.js",
+    "html": "./html/plateSample.html",
+    "description": "nyanPlateのサンプルページ"
+  }
+}
