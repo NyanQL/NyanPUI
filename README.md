@@ -246,6 +246,16 @@ console.log(nyanHostExec("ls"));
 * stdout : 標準出力
 * stderr : 標準エラー出力
 
+## ファイルの読み込み
+
+ファイルの読み込みができます。
+
+```js
+let text = nyanGetFile("ファイルのパス");
+let data = JSON.parse(text);
+```
+
+
 # HTMLファイルとの連携について
 ## にゃんぷれ (NyanPlate)
 にゃんぷれは、HTML テンプレート内のカスタムデータ属性を使って JSON データに基づいてコンテンツをレンダリングします。
