@@ -133,7 +133,20 @@ func main() {
 
 	// ログ設定を初期化
 	if globalConfig.Log.EnableLogging {
+		// ファイルへのログ出力のみ行う
 		initLogger(globalConfig.Log, exeDir)
+		// Gin のログ設定もファイルへのみ出力するようにする
+		logFile := resolvePath(exeDir, globalConfig.Log.Filename)
+		f, err := os.Create(logFile)
+		if err != nil {
+			log.Printf("Failed to create log file: %v", err)
+		} else {
+			gin.DefaultWriter = f
+		}
+	} else {
+		// ログをターミナル（標準出力）のみに出力する
+		log.SetOutput(os.Stdout)
+		gin.DefaultWriter = os.Stdout
 	}
 
 	// API設定をロード
@@ -142,12 +155,7 @@ func main() {
 		log.Fatal("Error loading API configuration:", err)
 	}
 
-	// Ginのログ設定
 	gin.DisableConsoleColor()
-	logFile := resolvePath(exeDir, globalConfig.Log.Filename)
-	f, _ := os.Create(logFile)
-	gin.DefaultWriter = io.MultiWriter(f)
-
 	r := gin.Default()
 	r.SetTrustedProxies(nil)
 	r.Use(CORSMiddleware())
