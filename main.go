@@ -1024,7 +1024,7 @@ func handleJSONRPC(c *gin.Context) {
 		respondJSONRPCError(c, rpcReq.ID, -32603, "Script execution error", err.Error())
 		return
 	}
-	log.Print(config.Push);
+
 	// 8) Push 処理（必要な場合）
 	if config.Push != "" {
 		// push 先の EndpointConfig を取得
@@ -1079,10 +1079,6 @@ func handleJSONRPC(c *gin.Context) {
 			}
 		}
 	}
-
-
-
-
 	// 10) JSON-RPC 成功レスポンスを構築して返却
 	rpcResp := JSONRPCResponse{
 		JSONRPC: "2.0",
