@@ -88,6 +88,26 @@ type ExecResult struct {
 	Stderr   string `json:"stderr"`
 }
 
+type JSONRPCResponse struct {
+	JSONRPC string           `json:"jsonrpc"`
+	Result  interface{}      `json:"result,omitempty"`
+	Error   *JSONRPCError    `json:"error,omitempty"`
+	ID      interface{}      `json:"id,omitempty"`
+}
+
+type JSONRPCRequest struct {
+	JSONRPC string                 `json:"jsonrpc"`
+	Method  string                 `json:"method"`
+	Params  map[string]interface{} `json:"params"`
+	ID      interface{}            `json:"id"`
+}
+
+type JSONRPCError struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
+}
+
 // このシステムの設定
 var globalConfig Config
 
@@ -165,6 +185,7 @@ func main() {
 	r.Static("/js", resolvePath(exeDir, "./html/js"))
 
 	r.GET("/nyan", handleNyan)
+	r.POST("/nyan-mcp", handleJSONRPC)
 
 	// 各APIエンドポイントを設定
 	for endpoint := range apiConfig {
@@ -933,4 +954,149 @@ func newNyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 		// 読み込んだ内容を文字列として返す
 		return vm.ToValue(string(content))
 	}
+}
+
+func handleJSONRPC(c *gin.Context) {
+	log.Print("handleJSONRPC called")
+	// 1) リクエストボディを読み込み、JSONRPCRequest にパース
+	var rpcReq JSONRPCRequest
+	if err := c.ShouldBindJSON(&rpcReq); err != nil {
+		respondJSONRPCError(c, nil, -32700, "Parse error", err.Error())
+		return
+	}
+	if rpcReq.JSONRPC != "2.0" {
+		respondJSONRPCError(c, rpcReq.ID, -32600, "Invalid Request: 'jsonrpc' must be '2.0'", nil)
+		return
+	}
+	if rpcReq.Method == "" {
+		respondJSONRPCError(c, rpcReq.ID, -32601, "Method not found", nil)
+		return
+	}
+
+	// 2) リクエストパラメータを収集
+	allParams := make(map[string]interface{})
+	for k, v := range rpcReq.Params {
+		allParams[k] = v
+	}
+	// 既存の実装で "api" を利用している場合、未設定なら method をセット
+	if _, ok := allParams["api"]; !ok {
+		allParams["api"] = rpcReq.Method
+	}
+
+	// 3) api.json から、リクエストされたAPI設定を取得
+	config, exists := apiConfig[rpcReq.Method]
+	if !exists {
+		respondJSONRPCError(c, rpcReq.ID, -32601, fmt.Sprintf("API not found: %s", rpcReq.Method), nil)
+		return
+	}
+
+	// 4) JSON-RPC では HTML 出力は想定しないため、script が必須とする
+	if config.Script == "" {
+		respondJSONRPCError(c, rpcReq.ID, -32603, "No script defined for JSON-RPC API", nil)
+		return
+	}
+
+	// 5) 必要なら URL や POST のパラメータもマージ（handleAPIRequest と同様）
+	c.Request.ParseForm()
+	for k, v := range c.Request.PostForm {
+		allParams[k] = v[0]
+	}
+	for k, v := range c.Request.URL.Query() {
+		allParams[k] = v[0]
+	}
+
+	// 6) 実行ファイルのディレクトリを解決し、スクリプトのパスを決定
+	exePath, err := os.Executable()
+	if err != nil {
+		respondJSONRPCError(c, rpcReq.ID, -32603, "Failed to get executable path", err.Error())
+		return
+	}
+	exeDir := filepath.Dir(exePath)
+	scriptPath := resolvePath(exeDir, config.Script)
+	htmlPath := ""
+	if config.HTML != "" {
+		htmlPath = resolvePath(exeDir, config.HTML)
+	}
+
+	// 7) メインのスクリプト実行（runJavaScript は既存関数）
+	resultStr, err := runJavaScript(scriptPath, htmlPath, allParams)
+	if err != nil {
+		respondJSONRPCError(c, rpcReq.ID, -32603, "Script execution error", err.Error())
+		return
+	}
+
+	// 8) Push 処理（必要な場合）
+	if config.Push != "" {
+		// push 先の EndpointConfig を取得
+		pushConfig, ok := apiConfig[config.Push]
+		if !ok {
+			log.Printf("Push target %s not found in apiConfig", config.Push)
+		} else {
+			exePath, err := os.Executable()
+			if err != nil {
+				log.Printf("Failed to get executable path for push: %v", err)
+				return
+			}
+			exeDir := filepath.Dir(exePath)
+
+			// scriptPath, htmlPath を pushConfig から解決
+			scriptPath := resolvePath(exeDir, pushConfig.Script)
+			htmlPath := resolvePath(exeDir, pushConfig.HTML)
+
+			// allParams をどうするか検討：同じパラメータを使うなら reuse する、push 用に変えたいなら新しく定義する
+			// ここでは同じ allParams を使う例
+			pushResult := ""
+			if pushConfig.Script == "" {
+				// script が空の場合は HTML ファイルをそのまま送る（従来通り）
+				content, err := os.ReadFile(htmlPath)
+				if err != nil {
+					log.Printf("Failed to read push HTML file %s: %v", htmlPath, err)
+				} else {
+					pushResult = string(content)
+				}
+			} else {
+				// script がある場合は実行し、その結果を push
+				r, err := runJavaScript(scriptPath, htmlPath, allParams)
+				if err != nil {
+					log.Printf("Failed to run push script: %v", err)
+				} else {
+					pushResult = r
+				}
+			}
+
+			if pushResult != "" {
+				wsConnections.RLock()
+				pushConns := wsConnections.conns[config.Push]
+				wsConnections.RUnlock()
+
+				for _, conn := range pushConns {
+					if err := conn.WriteMessage(websocket.TextMessage, []byte(pushResult)); err != nil {
+						log.Printf("Error pushing message to %s: %v", config.Push, err)
+					} else {
+						log.Printf("Push message sent to %s", config.Push)
+					}
+				}
+			}
+		}
+	}
+	// 10) JSON-RPC 成功レスポンスを構築して返却
+	rpcResp := JSONRPCResponse{
+		JSONRPC: "2.0",
+		Result:  resultStr,
+		ID:      rpcReq.ID,
+	}
+	c.JSON(http.StatusOK, rpcResp)
+}
+
+func respondJSONRPCError(c *gin.Context, id interface{}, code int, message string, data interface{}) {
+	rpcErr := &JSONRPCError{
+		Code:    code,
+		Message: message,
+		Data:    data,
+	}
+	c.JSON(http.StatusOK, JSONRPCResponse{
+		JSONRPC: "2.0",
+		Error:   rpcErr,
+		ID:      id,
+	})
 }
