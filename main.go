@@ -185,7 +185,7 @@ func main() {
 	r.Static("/js", resolvePath(exeDir, "./html/js"))
 
 	r.GET("/nyan", handleNyan)
-	r.POST("/nyan-mcp", handleJSONRPC)
+	r.POST("/nyan-rpc", handleJSONRPC)
 
 	// 各APIエンドポイントを設定
 	for endpoint := range apiConfig {
@@ -350,59 +350,7 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 
 	// push 設定がある場合、対象のWebSocket接続に対してプッシュ
 	// API リクエスト完了後の push 処理
-	if config.Push != "" {
-		// push 先の EndpointConfig を取得
-		pushConfig, ok := apiConfig[config.Push]
-		if !ok {
-			log.Printf("Push target %s not found in apiConfig", config.Push)
-		} else {
-			exePath, err := os.Executable()
-			if err != nil {
-				log.Printf("Failed to get executable path for push: %v", err)
-				return
-			}
-			exeDir := filepath.Dir(exePath)
-
-			// scriptPath, htmlPath を pushConfig から解決
-			scriptPath := resolvePath(exeDir, pushConfig.Script)
-			htmlPath := resolvePath(exeDir, pushConfig.HTML)
-
-			// allParams をどうするか検討：同じパラメータを使うなら reuse する、push 用に変えたいなら新しく定義する
-			// ここでは同じ allParams を使う例
-			pushResult := ""
-			if pushConfig.Script == "" {
-				// script が空の場合は HTML ファイルをそのまま送る（従来通り）
-				content, err := os.ReadFile(htmlPath)
-				if err != nil {
-					log.Printf("Failed to read push HTML file %s: %v", htmlPath, err)
-				} else {
-					pushResult = string(content)
-				}
-			} else {
-				// script がある場合は実行し、その結果を push
-				r, err := runJavaScript(scriptPath, htmlPath, allParams)
-				if err != nil {
-					log.Printf("Failed to run push script: %v", err)
-				} else {
-					pushResult = r
-				}
-			}
-
-			if pushResult != "" {
-				wsConnections.RLock()
-				pushConns := wsConnections.conns[config.Push]
-				wsConnections.RUnlock()
-
-				for _, conn := range pushConns {
-					if err := conn.WriteMessage(websocket.TextMessage, []byte(pushResult)); err != nil {
-						log.Printf("Error pushing message to %s: %v", config.Push, err)
-					} else {
-						log.Printf("Push message sent to %s", config.Push)
-					}
-				}
-			}
-		}
-	}
+	performPush(config, allParams)
 
 }
 
@@ -807,7 +755,6 @@ func setupGojaRuntime() *goja.Runtime {
 		return vm.ToValue(outJSON)
 	})
 
-
 	return vm
 }
 
@@ -1026,59 +973,8 @@ func handleJSONRPC(c *gin.Context) {
 	}
 
 	// 8) Push 処理（必要な場合）
-	if config.Push != "" {
-		// push 先の EndpointConfig を取得
-		pushConfig, ok := apiConfig[config.Push]
-		if !ok {
-			log.Printf("Push target %s not found in apiConfig", config.Push)
-		} else {
-			exePath, err := os.Executable()
-			if err != nil {
-				log.Printf("Failed to get executable path for push: %v", err)
-				return
-			}
-			exeDir := filepath.Dir(exePath)
+	performPush(config, allParams)
 
-			// scriptPath, htmlPath を pushConfig から解決
-			scriptPath := resolvePath(exeDir, pushConfig.Script)
-			htmlPath := resolvePath(exeDir, pushConfig.HTML)
-
-			// allParams をどうするか検討：同じパラメータを使うなら reuse する、push 用に変えたいなら新しく定義する
-			// ここでは同じ allParams を使う例
-			pushResult := ""
-			if pushConfig.Script == "" {
-				// script が空の場合は HTML ファイルをそのまま送る（従来通り）
-				content, err := os.ReadFile(htmlPath)
-				if err != nil {
-					log.Printf("Failed to read push HTML file %s: %v", htmlPath, err)
-				} else {
-					pushResult = string(content)
-				}
-			} else {
-				// script がある場合は実行し、その結果を push
-				r, err := runJavaScript(scriptPath, htmlPath, allParams)
-				if err != nil {
-					log.Printf("Failed to run push script: %v", err)
-				} else {
-					pushResult = r
-				}
-			}
-
-			if pushResult != "" {
-				wsConnections.RLock()
-				pushConns := wsConnections.conns[config.Push]
-				wsConnections.RUnlock()
-
-				for _, conn := range pushConns {
-					if err := conn.WriteMessage(websocket.TextMessage, []byte(pushResult)); err != nil {
-						log.Printf("Error pushing message to %s: %v", config.Push, err)
-					} else {
-						log.Printf("Push message sent to %s", config.Push)
-					}
-				}
-			}
-		}
-	}
 	// 10) JSON-RPC 成功レスポンスを構築して返却
 	rpcResp := JSONRPCResponse{
 		JSONRPC: "2.0",
@@ -1099,4 +995,52 @@ func respondJSONRPCError(c *gin.Context, id interface{}, code int, message strin
 		Error:   rpcErr,
 		ID:      id,
 	})
+}
+
+// performPush は指定された config に対して push 処理を行います。
+func performPush(config EndpointConfig, allParams map[string]interface{}) {
+	if config.Push == "" {
+		return
+	}
+	pushConfig, ok := apiConfig[config.Push]
+	if !ok {
+		log.Printf("Push target %s not found in apiConfig", config.Push)
+		return
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Printf("Failed to get executable path for push: %v", err)
+		return
+	}
+	exeDir := filepath.Dir(exePath)
+	scriptPath := resolvePath(exeDir, pushConfig.Script)
+	htmlPath := resolvePath(exeDir, pushConfig.HTML)
+	var pushResult string
+	if pushConfig.Script == "" {
+		content, err := os.ReadFile(htmlPath)
+		if err != nil {
+			log.Printf("Failed to read push HTML file %s: %v", htmlPath, err)
+			return
+		}
+		pushResult = string(content)
+	} else {
+		result, err := runJavaScript(scriptPath, htmlPath, allParams)
+		if err != nil {
+			log.Printf("Failed to run push script: %v", err)
+			return
+		}
+		pushResult = result
+	}
+	if pushResult != "" {
+		wsConnections.RLock()
+		pushConns := wsConnections.conns[config.Push]
+		wsConnections.RUnlock()
+		for _, conn := range pushConns {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(pushResult)); err != nil {
+				log.Printf("Error pushing message to %s: %v", config.Push, err)
+			} else {
+				log.Printf("Push message sent to %s", config.Push)
+			}
+		}
+	}
 }
