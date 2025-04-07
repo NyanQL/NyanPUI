@@ -332,10 +332,27 @@ WebSocketを使うことで、サーバーからクライアントにメッセ�
 * http://localhost:8009/push/request にアクセスするとサーバーからwebsocketで ws://localhost:8009/push/receive にメッセージを送信します。
 * http://localhost:8009/test に書かれているjavascriptは上記に接続していてサーバからのpushを受け取る処理が書かれています。
 
+# JSON-RPC対応について
+http(s)://{hostname}:{port}/nyan-rpc にアクセスすると、JSON-RPCのAPIを利用することができます。
+NyanPUIはJSON-RPC 2.0に準拠したAPIを提供しています。 ただし、現在 6.Batch については未実装です。
+
+http(s)://{hostname}:{port}/nyan-rpc にアクセスすると、JSON-RPCのAPIを利用することができます。
+JSON-RPC 2.0の仕様については、[こちら](https://www.jsonrpc.org/specification)を参照してください。
+以下のようなJSON-RPCリクエストを送信することで、APIを呼び出すことができます。
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "api名",
+  "params": "にゃんぷいが生成したHTMLテキスト",
+  "id": 1
+}
+```
+
 
 # このAPIサーバの情報を取得する場合
 http(s)://{hostname}:{port}/nyan にアクセスすると、このAPIサーバの情報を取得することができます。
-
+http(s)://{hostname}:{port}/nyan/{API名} にアクセスすると、APIの情報を取得することができます。
 
 
 # 予約語について
