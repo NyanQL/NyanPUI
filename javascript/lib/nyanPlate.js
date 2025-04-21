@@ -1,18 +1,3 @@
-/*
-にゃんぷれーと
-文字列の置き換え data-nyanString="key"
-ループ処理 data-nyanLoop ="key"
-htmlタグへのclassの指定 data-nyanClass = "key"
-htmlタグへのstyleの指定 data-nyanStyle = "key"
-リンクの指定 data-nyanHref = "key"
-idの指定 data-nyanId = "key"
-checked指定 data-nyanChecked = "key"
-selected指定 data-nyanSelected = "key"
-disabled指定 data-nyanDisabled = "key"
-value指定 data-nyanValue = "key"
-name指定 data-nyanName = "key"
-処理の実行は nyanPlate(data, htmlCode);
-*/
 console.log("loaded nyanPlate.js.");
 
 const nyanPlateScript = {
@@ -47,18 +32,10 @@ const nyanPlateScript = {
                     processed = nyanPlateScript.setDisabled(processed, item);
                     processed = nyanPlateScript.setValue(processed, item);
                     processed = nyanPlateScript.setName(processed, item);
-                    // ループ内で置換済みのdata属性は削除
-                    processed = processed
-                        .replace(/\sdata-nyanString="[^"]*"/gi, "")
-                        .replace(/\sdata-nyanClass="[^"]*"/gi, "")
-                        .replace(/\sdata-nyanStyle="[^"]*"/gi, "")
-                        .replace(/\sdata-nyanHref="[^"]*"/gi, "")
-                        .replace(/\sdata-nyanId="[^"]*"/gi, "")
-                        .replace(/\sdata-nyanChecked="[^"]*"/gi, "")
-                        .replace(/\sdata-nyanSelected="[^"]*"/gi, "")
-                        .replace(/\sdata-nyanDisabled="[^"]*"/gi, "")
-                        .replace(/\sdata-nyanValue="[^"]*"/gi, "")
-                        .replace(/\sdata-nyanName="[^"]*"/gi, "");
+                    processed = nyanPlateScript.setSrc(processed, item);
+                    processed = nyanPlateScript.setAlt(processed, item);
+                    // data属性を "Done" に変更
+                    processed = nyanPlateScript.markAsDone(processed);
                     loopResult += processed;
                 });
                 return openTag + loopResult + closeTag;
@@ -66,77 +43,96 @@ const nyanPlateScript = {
         );
     },
 
-    // class指定
     setClass: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanClass="(\w+)"/g, function(match, key) {
-            return 'class="' + (contextData[key] !== undefined ? contextData[key] : "") + '"';
+            return 'class="' + (contextData[key] !== undefined ? contextData[key] : "") + '" data-nyanDoneClass="' + key + '"';
         });
     },
 
-    // style指定
     setStyle: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanStyle="(\w+)"/g, function(match, key) {
-            return 'style="' + (contextData[key] !== undefined ? contextData[key] : "") + '"';
+            return 'style="' + (contextData[key] !== undefined ? contextData[key] : "") + '" data-nyanDoneStyle="' + key + '"';
         });
     },
 
-    // href指定
     setHref: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanHref="(\w+)"/g, function(match, key) {
-            return 'href="' + (contextData[key] !== undefined ? contextData[key] : "") + '"';
+            return 'href="' + (contextData[key] !== undefined ? contextData[key] : "") + '" data-nyanDoneHref="' + key + '"';
         });
     },
 
-    // id指定
     setId: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanId="(\w+)"/g, function(match, key) {
-            return 'id="' + (contextData[key] !== undefined ? contextData[key] : "") + '"';
+            return 'id="' + (contextData[key] !== undefined ? contextData[key] : "") + '" data-nyanDoneId="' + key + '"';
         });
     },
 
-    // checked指定
     setChecked: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanChecked="(\w+)"/g, function(match, key) {
             var val = contextData[key];
-            if (val === true || val === 'checked') return 'checked';
-            return '';
+            if (val === true || val === 'checked') return 'checked data-nyanDoneChecked="' + key + '"';
+            return 'data-nyanDoneChecked="' + key + '"';
         });
     },
 
-    // selected指定
     setSelected: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanSelected="(\w+)"/g, function(match, key) {
             var val = contextData[key];
-            if (val === true || val === 'selected') return 'selected';
-            return '';
+            if (val === true || val === 'selected') return 'selected data-nyanDoneSelected="' + key + '"';
+            return 'data-nyanDoneSelected="' + key + '"';
         });
     },
 
-    // disabled指定
     setDisabled: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanDisabled="(\w+)"/g, function(match, key) {
             var val = contextData[key];
-            if (val === true || val === 'disabled') return 'disabled';
-            return '';
+            if (val === true || val === 'disabled') return 'disabled data-nyanDoneDisabled="' + key + '"';
+            return 'data-nyanDoneDisabled="' + key + '"';
         });
     },
 
-    // value指定
     setValue: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanValue="(\w+)"/g, function(match, key) {
-            return 'value="' + (contextData[key] !== undefined ? contextData[key] : "") + '"';
+            return 'value="' + (contextData[key] !== undefined ? contextData[key] : "") + '" data-nyanDoneValue="' + key + '"';
         });
     },
 
-    // name指定
     setName: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanName="(\w+)"/g, function(match, key) {
-            return 'name="' + (contextData[key] !== undefined ? contextData[key] : "") + '"';
+            return 'name="' + (contextData[key] !== undefined ? contextData[key] : "") + '" data-nyanDoneName="' + key + '"';
         });
+    },
+
+    setSrc: function(htmlSegment, contextData) {
+        return htmlSegment.replace(/data-nyanSrc="(\w+)"/g, function(match, key) {
+            return 'src="' + (contextData[key] !== undefined ? contextData[key] : "") + '" data-nyanDoneSrc="' + key + '"';
+        });
+    },
+
+    setAlt: function(htmlSegment, contextData) {
+        return htmlSegment.replace(/data-nyanAlt="(\w+)"/g, function(match, key) {
+            return 'alt="' + (contextData[key] !== undefined ? contextData[key] : "") + '" data-nyanDoneAlt="' + key + '"';
+        });
+    },
+
+    // 共通で "data-nyanXxx" を "data-nyanDoneXxx" に変換
+    markAsDone: function(htmlSegment) {
+        var nyanAttrs = [
+            "nyanString", "nyanClass", "nyanStyle", "nyanHref", "nyanId",
+            "nyanChecked", "nyanSelected", "nyanDisabled", "nyanValue",
+            "nyanName", "nyanSrc", "nyanAlt"
+        ];
+        nyanAttrs.forEach(function(attr) {
+            var regex = new RegExp('(\\s)data-' + attr + '="([^"]*)"', 'gi');
+            htmlSegment = htmlSegment.replace(regex, function(_, space, key) {
+                return space + 'data-nyanDone' + attr.charAt(0).toUpperCase() + attr.slice(1) + '="' + key + '"';
+            });
+        });
+        return htmlSegment;
     }
 };
 
-// nyanPlate 関数
+// メイン実行関数
 function nyanPlate(data, htmlCode) {
     htmlCode = htmlCode || nyanHtmlCode;
 
@@ -154,6 +150,11 @@ function nyanPlate(data, htmlCode) {
     htmlCode = nyanPlateScript.setDisabled(htmlCode, data);
     htmlCode = nyanPlateScript.setValue(htmlCode, data);
     htmlCode = nyanPlateScript.setName(htmlCode, data);
+    htmlCode = nyanPlateScript.setSrc(htmlCode, data);
+    htmlCode = nyanPlateScript.setAlt(htmlCode, data);
+
+    // 最後に属性を変換済みに
+    htmlCode = nyanPlateScript.markAsDone(htmlCode);
 
     return htmlCode;
 }
