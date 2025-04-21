@@ -6,7 +6,7 @@ const nyanPlateScript = {
         return htmlSegment.replace(
             /(<\w+[^>]*data-nyanString="(\w+)"[^>]*>)(?:(<!--\s*([^<]+?)\s*-->)|([^<]*))(<\/\w+>)/g,
             function(match, openTag, key, commentWrapper, commentContent, plainText, closeTag) {
-                var replacement = contextData[key] !== undefined ? contextData[key] : (commentContent || plainText);
+                let replacement = contextData[key] !== undefined ? contextData[key] : (commentContent || plainText);
                 return openTag + replacement + closeTag;
             }
         );
@@ -17,11 +17,11 @@ const nyanPlateScript = {
         return htmlSegment.replace(
             /(<(\w+)[^>]*data-nyanLoop="(\w+)"[^>]*>)([\s\S]*?)(<\/\2>)/gi,
             function(match, openTag, tagName, loopKey, innerTemplate, closeTag) {
-                var items = contextData[loopKey];
+                let items = contextData[loopKey];
                 if (!items || !Array.isArray(items)) return match;
-                var loopResult = "";
+                let loopResult = "";
                 items.forEach(function(item) {
-                    var processed = innerTemplate;
+                    let processed = innerTemplate;
                     processed = nyanPlateScript.setString(processed, item);
                     processed = nyanPlateScript.setClass(processed, item);
                     processed = nyanPlateScript.setStyle(processed, item);
@@ -69,7 +69,7 @@ const nyanPlateScript = {
 
     setChecked: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanChecked="(\w+)"/g, function(match, key) {
-            var val = contextData[key];
+            let val = contextData[key];
             if (val === true || val === 'checked') return 'checked data-nyanDoneChecked="' + key + '"';
             return 'data-nyanDoneChecked="' + key + '"';
         });
@@ -77,7 +77,7 @@ const nyanPlateScript = {
 
     setSelected: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanSelected="(\w+)"/g, function(match, key) {
-            var val = contextData[key];
+            let val = contextData[key];
             if (val === true || val === 'selected') return 'selected data-nyanDoneSelected="' + key + '"';
             return 'data-nyanDoneSelected="' + key + '"';
         });
@@ -85,7 +85,7 @@ const nyanPlateScript = {
 
     setDisabled: function(htmlSegment, contextData) {
         return htmlSegment.replace(/data-nyanDisabled="(\w+)"/g, function(match, key) {
-            var val = contextData[key];
+            let val = contextData[key];
             if (val === true || val === 'disabled') return 'disabled data-nyanDoneDisabled="' + key + '"';
             return 'data-nyanDoneDisabled="' + key + '"';
         });
@@ -117,13 +117,13 @@ const nyanPlateScript = {
 
     // 共通で "data-nyanXxx" を "data-nyanDoneXxx" に変換
     markAsDone: function(htmlSegment) {
-        var nyanAttrs = [
+        let nyanAttrs = [
             "nyanString", "nyanClass", "nyanStyle", "nyanHref", "nyanId",
             "nyanChecked", "nyanSelected", "nyanDisabled", "nyanValue",
             "nyanName", "nyanSrc", "nyanAlt"
         ];
         nyanAttrs.forEach(function(attr) {
-            var regex = new RegExp('(\\s)data-' + attr + '="([^"]*)"', 'gi');
+            let regex = new RegExp('(\\s)data-' + attr + '="([^"]*)"', 'gi');
             htmlSegment = htmlSegment.replace(regex, function(_, space, key) {
                 return space + 'data-nyanDone' + attr.charAt(0).toUpperCase() + attr.slice(1) + '="' + key + '"';
             });
