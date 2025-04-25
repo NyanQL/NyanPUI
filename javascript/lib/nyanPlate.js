@@ -1,18 +1,20 @@
 console.log("loaded nyanPlate.js.");
 
-const nyanPlateScript = {
+let nyanPlateScript = {
     // 文字列の置換
     setString: function(htmlSegment, contextData) {
         return htmlSegment.replace(
-            /(<\w+[^>]*data-nyanString="(\w+)"[^>]*>)(?:(<!--\s*([^<]+?)\s*-->)|([^<]*))(<\/\w+>)/g,
+            /(<\w+[^>]*data-nyan(?:String|Html)="(\w+)"[^>]*>)(?:(<!--\s*([^<]+?)\s*-->)|([^<]*))(<\/\w+>)/g,
             function(match, openTag, key, commentWrapper, commentContent, plainText, closeTag) {
-                let replacement = contextData[key] !== undefined ? contextData[key] : (commentContent || plainText);
+                var replacement = contextData[key] !== undefined ? contextData[key] : (commentContent || plainText);
                 return openTag + replacement + closeTag;
             }
         );
     },
 
-    // ループ処理
+
+
+    // 再帰対応ループ処理（ネスト対応）
     processLoop: function(htmlSegment, contextData) {
         return htmlSegment.replace(
             /(<(\w+)[^>]*data-nyanLoop="(\w+)"[^>]*>)([\s\S]*?)(<\/\2>)/gi,
@@ -20,9 +22,16 @@ const nyanPlateScript = {
                 let items = contextData[loopKey];
                 if (!items || !Array.isArray(items)) return match;
                 let loopResult = "";
+
                 items.forEach(function(item) {
                     let processed = innerTemplate;
+
+                    // 🔁 再帰的にループを処理（ネスト対応）
+                    processed = nyanPlateScript.processLoop(processed, item);
+
+                    // 通常の属性処理
                     processed = nyanPlateScript.setString(processed, item);
+
                     processed = nyanPlateScript.setClass(processed, item);
                     processed = nyanPlateScript.setStyle(processed, item);
                     processed = nyanPlateScript.setHref(processed, item);
@@ -34,10 +43,12 @@ const nyanPlateScript = {
                     processed = nyanPlateScript.setName(processed, item);
                     processed = nyanPlateScript.setSrc(processed, item);
                     processed = nyanPlateScript.setAlt(processed, item);
-                    // data属性を "Done" に変更
+
                     processed = nyanPlateScript.markAsDone(processed);
+
                     loopResult += processed;
                 });
+
                 return openTag + loopResult + closeTag;
             }
         );
@@ -115,10 +126,10 @@ const nyanPlateScript = {
         });
     },
 
-    // 共通で "data-nyanXxx" を "data-nyanDoneXxx" に変換
+    // 属性を変換済みにする
     markAsDone: function(htmlSegment) {
         let nyanAttrs = [
-            "nyanString", "nyanClass", "nyanStyle", "nyanHref", "nyanId",
+            "nyanString", "nyanHtml", "nyanClass", "nyanStyle", "nyanHref", "nyanId",
             "nyanChecked", "nyanSelected", "nyanDisabled", "nyanValue",
             "nyanName", "nyanSrc", "nyanAlt"
         ];
@@ -132,15 +143,16 @@ const nyanPlateScript = {
     }
 };
 
-// メイン実行関数
+// 実行関数
 function nyanPlate(data, htmlCode) {
     htmlCode = htmlCode || nyanHtmlCode;
 
-    // ループ処理
+    // ループ処理（ネスト対応）
     htmlCode = nyanPlateScript.processLoop(htmlCode, data);
 
-    // グローバル処理
+    // 通常の属性置換
     htmlCode = nyanPlateScript.setString(htmlCode, data);
+
     htmlCode = nyanPlateScript.setClass(htmlCode, data);
     htmlCode = nyanPlateScript.setStyle(htmlCode, data);
     htmlCode = nyanPlateScript.setHref(htmlCode, data);
@@ -153,7 +165,6 @@ function nyanPlate(data, htmlCode) {
     htmlCode = nyanPlateScript.setSrc(htmlCode, data);
     htmlCode = nyanPlateScript.setAlt(htmlCode, data);
 
-    // 最後に属性を変換済みに
     htmlCode = nyanPlateScript.markAsDone(htmlCode);
 
     return htmlCode;
