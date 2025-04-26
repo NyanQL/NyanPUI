@@ -1,5 +1,22 @@
 console.log("loaded nyanPlate.js.");
 
+
+/*
+にゃんぷれーと
+使い方
+処理の実行は nyanPlate(data, htmlCode); //htmlCodeは省略可能 省略した場合にはnyanHtmlCodeを使用する。
+
+文字列の設置 data-nyanString="key"
+HTMLの設置 data-nyanHtml="key"
+Styleの設定 data-nyanStyle="key"
+CSSの設定 data-nyanClass="key"
+SRCの設定 data-nyanSrc="key"
+ALTの設定 data-nyanAlt="key"
+hrefの設定 data-nyanHref="key"
+selectedの設定 data-nyanSelected="key"
+checkedの設定 data-nyanChecked="key"
+disabledの設定 data-nyanDisabled="key"
+*/
 let nyanPlateScript = {
     // 文字列の置換
     setString: function(htmlSegment, contextData) {
