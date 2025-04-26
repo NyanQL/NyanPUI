@@ -183,18 +183,16 @@ localStorageの取得が可能です。
 nyanGetItem("nyanpui");
 ```
 
-## Ajaxの操作
-Ajaxの操作が可能です。
+## 外部APIの利用
+外部APIの利用が可能です。
 取得したデータはJSON.parseでパースしてください。
 
 getでの取得の場合
 
-
 ```javascript
-//apiのURL  apiURL
-//basic認証のID  apiUser
-//basic認証のパスワード apiPass
-//javascript内でデータとして扱う場合、JSON.parse()で文字列から変換をする必要があります。
+//apiURL: apiのURL
+//apiUser basic認証のID
+//apiPass basic認証のパスワード
 console.log(nyanGetAPI(apiURL,apiUser,apiPass));
 ```
 
@@ -220,6 +218,7 @@ const result = nyanJsonAPI(
     );
 const resultData = JSON.parse(result);
 ```
+
 
 ## HTMLファイルに書かれているコードの操作
 nyanHtmlCodeに格納されていますので、文字置き換えや連結等に利用してください。
@@ -264,6 +263,10 @@ let data = JSON.parse(text);
 ## 特徴
 ### 動的文字列置換
 要素内のテキスト（またはコメント内のテキスト）を `data-nyanString="key"` 属性に基づいて JSON データの該当キーの値に置き換えます。
+
+### HTML部品の動的挿入
+HTMLを `data-nyanHTML="key"` 属性に基づいて JSON データの該当キーの値に置き換えます。
+ファイルを読み込み、nyanPlateでHTMLを生成したものを設置する場合などに利用します。
 
 ### ループ処理
 `data-nyanLoop="key"` 属性を持つ要素内のテンプレート部分を、JSON 配列の各アイテムごとに展開します。
@@ -320,6 +323,54 @@ htmlCodeを省略すると、nyanHtmlCode (api.jsonで指定されたHTMLファ�
 const finalHtml = nyanPlate(data);
 console.log(finalHtml);
 ```
+
+## にゃんぷれ (NyanPlate) で作成されたHTMLのJSON化
+### 1. 関数を用意
+javascript/lib/nyanPlateToJson.jsをconfig.jsonの `javascript_include` で指定し、利用可能な状態にしてください。
+HTML文字列は nyanGetFile("ファイルのパス") や nyanGetAPIを使ってHTMLを取得することもできます。
+
+```javascript
+// HTML文字列を用意
+var html = '<html> ... あなたのHTML ... </html>';
+
+// nyanPlateToJsonを呼び出す
+var result = nyanPlateToJson(html);
+
+// JSONを表示
+console.log(JSON.stringify(result, null, 2));
+```
+
+(例) 
+入力HTML
+```html
+<h1 data-nyanDoneNyanString="title" style="color: blue;" data-nyanDoneStyle="title_style" class="orange" data-nyanDoneClass="className">タイトル</h1>
+<table data-nyanDoneNyanHtml="data">
+  <tbody data-nyanLoop="items">
+    <tr>
+      <td data-nyanDoneNyanString="name">りんご</td>
+    </tr>
+    <tr>
+      <td data-nyanDoneNyanString="name">バナナ</td>
+    </tr>
+  </tbody>
+</table>
+```
+出力されるJSON
+```json
+{
+  "title": "タイトル",
+  "title_style": "color: blue;",
+  "className": "orange",
+  "data": {
+    "items": [
+      { "name": "りんご" },
+      { "name": "バナナ" }
+    ]
+  }
+}
+```
+
+
 
 # NyanPUIでのWebSocketの使い方
 サンプルプログラムを用意しました。

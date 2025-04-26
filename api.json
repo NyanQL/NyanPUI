@@ -23,5 +23,10 @@
     "script": "./javascript/plate.js",
     "html": "./html/plateSample.html",
     "description": "nyanPlateのサンプルページ"
+  },
+  "plate_decode": {
+    "script": "./javascript/plateDecode.js",
+    "html": "./html/plateDecodeSample.html",
+    "description": "nyanPlateのHTMLからjsonを作成するサンプルページ"
   }
 }
