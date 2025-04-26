@@ -7,7 +7,8 @@
   "keyPath": "",
   "javascript_include": [
     "./javascript/base.js",
-    "./javascript/lib/nyanPlate.js"
+    "./javascript/lib/nyanPlate.js",
+    "./javascript/lib/nyanPlateToJson.js"
   ],
   "log": {
     "Filename": "./logs/nyanpui.log",
