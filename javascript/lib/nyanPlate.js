@@ -16,6 +16,9 @@ hrefの設定 data-nyanHref="key"
 selectedの設定 data-nyanSelected="key"
 checkedの設定 data-nyanChecked="key"
 disabledの設定 data-nyanDisabled="key"
+valueの設定 data-nyanValue="key"
+nameの設定 dana-nyanName="key"
+IDの設定 data-nyanId="key"
 */
 let nyanPlateScript = {
     // 文字列の置換
