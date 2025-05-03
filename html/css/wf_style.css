@@ -1,0 +1,175 @@
+body {
+    font-family: sans-serif;
+    background-color: #f9f9f9;
+    padding: 20px;
+    color: #333;
+}
+
+/*寄せ*/
+/**/
+.center {
+    text-align: center;
+}
+.right{
+    text-align: right;
+}
+.left{
+    text-align: left;
+}
+
+.wf-header, .wf-footer {
+    border: 2px solid #ccc;
+    background-color: #eee;
+    padding: 16px;
+    text-align: center;
+    font-weight: bold;
+    margin-bottom: 20px;
+}
+
+.wf-nav {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+}
+
+.wf-nav-item {
+    flex: 1;
+    border: 2px dashed #aaa;
+    background-color: #f0f0f0;
+    text-align: center;
+    padding: 10px;
+}
+
+.wf-hero {
+    margin-bottom: 20px;
+}
+
+.wf-image {
+    width: 100%;
+    height: 200px;
+    background-color: #ccc;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #666;
+    font-size: 1.2em;
+    margin-bottom: 10px;
+}
+
+.wf-text {
+    height: 1em;
+    background-color: #ddd;
+    margin: 8px 0;
+}
+
+.wf-text.short {
+    width: 60%;
+}
+
+.wf-content {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 30px;
+}
+
+.wf-box {
+    flex: 1;
+    border: 2px dashed #999;
+    background-color: #fff;
+    padding: 20px;
+    text-align: center;
+}
+
+.wf-form {
+    border: 2px solid #ccc;
+    background-color: #f2f2f2;
+    padding: 20px;
+    margin-bottom: 30px;
+}
+
+.wf-form-title {
+    font-size: 1.2em;
+    margin-bottom: 16px;
+    text-align: center;
+}
+
+.wf-text-input {
+    height: 2em;
+    background-color: #ddd;
+    margin: 10px 0;
+}
+
+.wf-textarea {
+    height: 5em;
+    background-color: #ddd;
+    margin: 10px 0;
+}
+
+.wf-button {
+    width: 100px;
+    background-color: #ccc;
+    text-align: center;
+    padding: 10px;
+    margin-top: 10px;
+    border: 1px dashed #999;
+    cursor: default;
+}
+
+/*button*/
+button.wf-button {
+    background-color: #ddd;
+    border: 1px solid #999;
+    color: #333;
+    padding: 10px 20px;
+    font-size: 1em;
+    cursor: default;
+    display: inline-block;
+    text-align: center;
+    width: 120px;
+    margin-top: 10px;
+}
+
+button.wf-button:hover {
+    background-color: #ccc;
+}
+
+/*input*/
+input[type="text"], input[type="email"] {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #999;
+    background-color: #eee;
+    color: #333;
+    margin-bottom: 10px;
+    font-size: 1em;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+    accent-color: #999; /* グレー調のチェックマーク */
+    margin-right: 8px;
+    transform: scale(1.2); /* 少し大きくして視認性をUP */
+}
+
+textarea {
+    width: 100%;
+    height: 120px;
+    padding: 8px;
+    border: 1px solid #999;
+    background-color: #eee;
+    color: #333;
+    font-size: 1em;
+    resize: vertical; /* ユーザーが縦方向にサイズ変更可能 */
+    margin-bottom: 10px;
+}
+
+/*margin*/
+.mt_32{
+    margin-top: 32px;
+}
+.mb_32{
+    margin-bottom: 32px;
+}
+m_32{
+    margin:32px;
+}
