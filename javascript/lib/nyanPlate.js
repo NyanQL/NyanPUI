@@ -19,7 +19,7 @@ data-nyanDisabled="key"     → disabled属性
 data-nyanValue="key"        → value属性
 data-nyanName="key"         → name属性
 data-nyanId="key"           → id属性
-data-nyanFor="key"          → for属性 ← 追加
+data-nyanFor="key"          → for属性
 */
 
 let nyanPlateScript = {
@@ -59,7 +59,7 @@ let nyanPlateScript = {
                     processed = nyanPlateScript.setName(processed, item);
                     processed = nyanPlateScript.setSrc(processed, item);
                     processed = nyanPlateScript.setAlt(processed, item);
-                    processed = nyanPlateScript.setFor(processed, item); // ← 追加
+                    processed = nyanPlateScript.setFor(processed, item);
 
                     processed = nyanPlateScript.markAsDone(processed);
 
@@ -153,7 +153,7 @@ let nyanPlateScript = {
         let nyanAttrs = [
             "nyanString", "nyanHtml", "nyanClass", "nyanStyle", "nyanHref", "nyanId",
             "nyanChecked", "nyanSelected", "nyanDisabled", "nyanValue",
-            "nyanName", "nyanSrc", "nyanAlt", "nyanFor" // ← ここに For を追加
+            "nyanName", "nyanSrc", "nyanAlt", "nyanFor"
         ];
         nyanAttrs.forEach(function(attr) {
             let regex = new RegExp('(\\s)data-' + attr + '="([^"]*)"', 'gi');
@@ -182,7 +182,7 @@ function nyanPlate(data, htmlCode) {
     htmlCode = nyanPlateScript.setName(htmlCode, data);
     htmlCode = nyanPlateScript.setSrc(htmlCode, data);
     htmlCode = nyanPlateScript.setAlt(htmlCode, data);
-    htmlCode = nyanPlateScript.setFor(htmlCode, data); // ← ここも忘れず追加
+    htmlCode = nyanPlateScript.setFor(htmlCode, data);
 
     htmlCode = nyanPlateScript.markAsDone(htmlCode);
 
