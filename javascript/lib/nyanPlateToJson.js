@@ -92,6 +92,7 @@ function nyanPlateToJson(htmlString) {
 
         if (node.attributes) {
             let attrs = node.attributes;
+
             if (attrs['data-nyanDoneNyanString']) {
                 result[attrs['data-nyanDoneNyanString']] = getText(node);
             }
@@ -115,6 +116,9 @@ function nyanPlateToJson(htmlString) {
                 }
                 result[attrs['data-nyanLoop']] = arr;
                 return result;
+            }
+            if (attrs['data-nyanDoneFor']) {
+                result[attrs['data-nyanDoneFor']] = attrs['for'] || '';
             }
         }
 
