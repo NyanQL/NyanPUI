@@ -117,6 +117,7 @@ body {
     margin-top: 10px;
     border: 1px dashed #999;
     cursor: default;
+    font-size:110%;
 }
 
 /*button*/
@@ -124,8 +125,7 @@ button.wf-button {
     background-color: #ddd;
     border: 1px solid #999;
     color: #333;
-    padding: 10px 20px;
-    font-size: 1em;
+    padding: 5px 10px;
     cursor: default;
     display: inline-block;
     text-align: center;
