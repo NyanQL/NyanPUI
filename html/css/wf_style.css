@@ -3,10 +3,13 @@ body {
     background-color: #f9f9f9;
     padding: 20px;
     color: #333;
+    font-size: 16px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", "Noto Sans", "Yu Gothic", "Meiryo",
+    sans-serif;
 }
 
-/*寄せ*/
-/**/
+/*文字寄せ*/
 .center {
     text-align: center;
 }
@@ -16,7 +19,7 @@ body {
 .left{
     text-align: left;
 }
-
+/*ワイヤーフレームデザイン系*/
 .wf-header, .wf-footer {
     border: 2px solid #ccc;
     background-color: #eee;
@@ -57,13 +60,14 @@ body {
 }
 
 .wf-text {
-    height: 1em;
+    line-height: 16px;
+    min-height: 20px;
     background-color: #ddd;
     margin: 8px 0;
 }
 
 .wf-text.short {
-    width: 60%;
+    width: 50%;
 }
 
 .wf-content {
@@ -172,4 +176,14 @@ textarea {
 }
 m_32{
     margin:32px;
+}
+
+.mt_16{
+    margin-top: 16px;
+}
+.mb_16{
+    margin-bottom: 16px;
+}
+m_16{
+    margin:16px;
 }

@@ -4,6 +4,10 @@
     "html": "./html/index.html",
     "description": "トップページです"
   },
+  "wf": {
+    "html": "./html/wf_html.html",
+    "description": "ワイヤーフレームCSSを当てたHTMLサンプルです。"
+  },
  "push/request": {
    "script": "./javascript/html.js",
    "html": "./html/push/request.html",
