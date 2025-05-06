@@ -241,3 +241,97 @@ w_100 {
 {
     background-color: #ccc;
 }
+
+/*upload*/
+.wf-upload {
+    text-align: center;
+    width:auto;
+    align-items: center;
+    margin-left:auto;
+    margin-right: auto;
+}
+
+input[type="file"] {
+    border: 2px dashed #999;
+    background-color: #eee;
+    padding: 6px;
+    font-size: 0.9em;
+    color: #333;
+}
+
+.wf-file-label {
+    font-size: 0.9em;
+    color: #333;
+    background-color: #ddd;
+    padding: 8px 12px;
+    border: 2px dashed #999;
+    cursor: pointer;
+}
+
+.wf-upload .wf-button {
+    padding: 8px 16px;
+    border: 2px dashed #999;
+    background-color: #ddd;
+    color: #333;
+    font-size: 1em;
+    cursor: pointer;
+}
+
+.wf-upload-box {
+    border: 2px solid #c0bebe; /* 実線の枠線 */
+    padding: 16px;
+    margin-bottom: 20px;
+    background-color: #f9f9f9;
+}
+
+/*pager*/
+.wf-pager {
+    display: flex;
+    gap: 6px;
+    justify-content: center;
+    margin: 20px 0;
+}
+
+.wf-page {
+    display: inline-block;
+    border: 2px solid #999;
+    background-color: #eee;
+    color: #333;
+    padding: 6px 12px;
+    font-size: 1em;
+    text-decoration: none;
+    min-width: 40px;
+    text-align: center;
+}
+
+.wf-page:hover {
+    background-color: #ddd;
+}
+
+/*table*/
+.wf-table-box {
+    border: 1px solid #999;
+    padding: 16px;
+    margin-bottom: 20px;
+    background-color: #f9f9f9;
+}
+
+.wf-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.95em;
+}
+
+.wf-table th,
+.wf-table td {
+    border: 1px solid #999;
+    padding: 8px;
+    text-align: left;
+    background-color: #fff;
+    color: #333;
+}
+
+.wf-table thead th {
+    background-color: #eee;
+    font-weight: bold;
+}
