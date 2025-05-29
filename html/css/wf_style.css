@@ -8,6 +8,19 @@ body {
     "Helvetica Neue", "Noto Sans", "Yu Gothic", "Meiryo",
     sans-serif;
 }
+/*文字色*/
+.black{
+    color:black;
+}
+.red{
+    color:red;
+}
+.blue {
+    color:blue;
+}
+.green {
+    color:green;
+}
 
 /*文字寄せ*/
 .center {
@@ -285,14 +298,14 @@ input[type="file"] {
 }
 
 /*pager*/
-.wf-pager {
+.pager {
     display: flex;
     gap: 6px;
     justify-content: center;
     margin: 20px 0;
 }
 
-.wf-page {
+a {
     display: inline-block;
     border: 2px solid #999;
     background-color: #eee;
@@ -316,14 +329,14 @@ input[type="file"] {
     background-color: #f9f9f9;
 }
 
-.wf-table {
+table {
     width: 100%;
     border-collapse: collapse;
     font-size: 0.95em;
 }
 
-.wf-table th,
-.wf-table td {
+table  th,
+table  td {
     border: 1px solid #999;
     padding: 8px;
     text-align: left;
@@ -331,7 +344,7 @@ input[type="file"] {
     color: #333;
 }
 
-.wf-table thead th {
+table thead th {
     background-color: #eee;
     font-weight: bold;
 }
