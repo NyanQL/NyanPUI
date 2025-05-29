@@ -1,7 +1,6 @@
 # NyanPUI
 
-NyanPUI(にゃんぷい)は、GoLangで作られたサーバーサイドレンダリングを行うプレゼンテーションフレームワークです。
-リクエストに対してJavaScriptを実行してHTMLを出力します。
+NyanPUI(にゃんぷい)は、GoLangで作られたサーバーサイドレンダリングを行うプレゼンテーションフレームワークです。 リクエストに対してJavaScriptを実行してHTMLを出力します。
 
 * **JavaScript エンジン**: Goja (ECMAScript 5.1 準拠) – [https://github.com/dop251/goja](https://github.com/dop251/goja)
 * **双方向通信**: gorilla/websocket による WebSocket
@@ -108,9 +107,7 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 ## アプリケーションの実行
 
 * `config.json` と `api.json` を編集後、実行ファイルを起動。
-* デフォルトで [http://localhost:8009/](http://localhost:8009/) にアクセスするとサンプルが表示されます。
-Windows MacOS Linuxで実行可能です。
-各自でビルドいただくか、[リリース](https://github.com/NyanQL/NyanPUI/releases)からダウンロードしてください
+* デフォルトで [http://localhost:8009/](http://localhost:8009/) にアクセスするとサンプルが表示されます。 Windows MacOS Linuxで実行可能です。 各自でビルドいただくか、[リリース](https://github.com/NyanQL/NyanPUI/releases)からダウンロードしてください。
 
 ## JavaScript 実行 (Goja)
 
@@ -130,14 +127,115 @@ Windows MacOS Linuxで実行可能です。
 ### 主なカスタム属性
 
 ```html
-<h1 data-nyanString="title" data-nyanStyle="title_style" data-nyanClass="className">Default</h1>
-<tbody data-nyanLoop="items">
-  <tr>
-    <td data-nyanString="name">Product</td>
-    <td data-nyanString="price">0</td>
-  </tr>
-</tbody>
+<html lang="ja">
+<head>
+    <title>NyanPUI Wireframe</title>
+    <link href="/css/wf_style.css" rel="stylesheet" />
+</head>
+<body>
+
+<header class="wf-header">Site Logo / Header</header>
+
+<div class="wf-search">
+    <input type="text" placeholder="キーワードを入力">
+    <button class="wf-button" type="button">検索</button>
+</div>
+
+<nav class="wf-nav">
+    <div class="wf-nav-item"><div class="wf-image">Image1</div>Nav 1</div>
+    <div class="wf-nav-item"><div class="wf-image">Image2</div>Nav 2</div>
+    <div class="wf-nav-item"><div class="wf-image">Image3</div>Nav 3</div>
+</nav>
+
+<section class="wf-hero">
+    <div class="wf-image">Hello Image</div>
+    <div class="wf-text"></div>
+    <div class="wf-text short"></div>
+</section>
+
+<section class="wf-content">
+    <div class="wf-box"><div class="wf-image">Image 1</div>Feature 1</div>
+    <div class="wf-box">Feature 2</div>
+    <div class="wf-box">Feature 3</div>
+</section>
+
+<section class="wf-form">
+    <h2 class="wf-form-title">お問い合わせフォーム</h2>
+    <input type="text" name="name" placeholder="お名前">
+    <input type="email" name="email" placeholder="メールアドレス">
+    <div><label class="checkbox"><input type="checkbox" name="subscribe"> チェックボックス</label></div>
+    <div><label class="radio"><input type="radio" name="gender" value="1"> 男性</label>
+         <label class="radio"><input type="radio" name="gender" value="2"> 女性</label></div>
+    <div class="mt_32"><textarea name="message" placeholder="ご意見・ご要望"></textarea></div>
+    <div class="right"><button class="wf-button">buttonタグのボタン</button></div>
+    <div class="right"><a href="#" class="wf-button">aタグのボタン</a></div>
+</section>
+
+<form>
+    <div class="wf-upload-box">
+        <div class="wf-upload">
+            <label for="fileUpload" class="wf-file-label">ファイルを選択</label>
+            <input type="file" id="fileUpload">
+            <a class="wf-button">アップロード</a>
+        </div>
+    </div>
+</form>
+
+<div class="wf-pager">
+    <a href="#" class="wf-page">前へ</a>
+    <a href="#" class="wf-page">1</a>
+    <a href="#" class="wf-page">2</a>
+    <a href="#" class="wf-page">3</a>
+    <a href="#" class="wf-page">次へ</a>
+</div>
+
+<div class="wf-table-box">
+    <table>
+        <thead>
+            <tr><th>項目1</th><th>項目2</th><th>項目3</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>xxxx</td><td>xxxxxx</td><td>xxxx</td></tr>
+            <tr><td>xxxx</td><td>xxxxxx</td><td>xxxx</td></tr>
+            <tr><td>xxxx</td><td>xxxxxx</td><td>xxxx</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<footer class="wf-footer">footer</footer>
+</body>
+</html>
 ```
+
+### ワイヤーフレーム表示の使い方
+
+1. **エンドポイントを追加**
+   `api.json` に以下のように `"wf"` エントリを追加してください：
+
+   ```json
+   {
+     "wf": {
+       "html": "./html/wf.html",
+       "description": "ワイヤーフレームプレビュー"
+     }
+   }
+   ```
+
+    * `wf.html` は上記サンプル HTML を保存したファイルです。
+
+2. **CSS を読み込む**
+   `wf.html` の `<head>` に以下を記述して、先ほど設置した `wf_style.css` を読み込みます：
+
+   ```html
+   <link href="/css/wf_style.css" rel="stylesheet" />
+   ```
+
+3. **ブラウザで確認**
+   サーバーを再起動した後、以下にアクセスして表示を確認できます：
+
+   > [http://localhost:8009/wf](http://localhost:8009/wf)
+
+以上で、ワイヤーフレームデザインのプレビュー機能が動作します。
 
 * **data-nyanString**: テキスト置換
 * **data-nyanHtml**: HTML 部品挿入
@@ -182,11 +280,20 @@ function nyanPlateToJson(htmlString) {
 }
 ```
 
-## サーバー情報取得
-
-* `/nyan`: サーバー情報
-* `/nyan/{API名}`: API 情報
-
 ## 予約語
 
 `nyanAllParams` に格納されたキー名は、`api`/`nyan` で始まる文字列を避けてください。
+
+---
+
+## ワイヤーフレームデザインプレビュー
+
+以下のファイルをプロジェクトに含めることで、ワイヤーフレーム用のプレビュー機能を利用できます：
+
+* **CSS**: `html/css/wf_style.css` にワイヤーフレーム用のスタイルを定義
+* **HTML**: `html/wf.html` にサンプルレイアウトを記述
+
+これらを配置した状態でサーバーを起動すると、デフォルトで以下の URL からプレビューが表示されます：
+
+> [http://localhost:8009/wf](http://localhost:8009/wf)
+
