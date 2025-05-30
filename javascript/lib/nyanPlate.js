@@ -1,27 +1,28 @@
 console.log("loaded nyanPlate.js.");
 
-
 /*
 にゃんぷれーと
-使い方
-処理の実行は nyanPlate(data, htmlCode); //htmlCodeは省略可能 省略した場合にはnyanHtmlCodeを使用する。
+使い方：
+nyanPlate(data, htmlCode); // htmlCodeは省略可能、省略時はグローバル変数 nyanHtmlCode を使用
 
-文字列の設置 data-nyanString="key"
-HTMLの設置 data-nyanHtml="key"
-Styleの設定 data-nyanStyle="key"
-CSSの設定 data-nyanClass="key"
-SRCの設定 data-nyanSrc="key"
-ALTの設定 data-nyanAlt="key"
-hrefの設定 data-nyanHref="key"
-selectedの設定 data-nyanSelected="key"
-checkedの設定 data-nyanChecked="key"
-disabledの設定 data-nyanDisabled="key"
-valueの設定 data-nyanValue="key"
-nameの設定 dana-nyanName="key"
-IDの設定 data-nyanId="key"
+対応属性：
+data-nyanString="key"       → テキスト内容
+data-nyanHtml="key"         → innerHTML
+data-nyanStyle="key"        → style属性
+data-nyanClass="key"        → class属性
+data-nyanSrc="key"          → src属性
+data-nyanAlt="key"          → alt属性
+data-nyanHref="key"         → href属性
+data-nyanSelected="key"     → selected属性
+data-nyanChecked="key"      → checked属性
+data-nyanDisabled="key"     → disabled属性
+data-nyanValue="key"        → value属性
+data-nyanName="key"         → name属性
+data-nyanId="key"           → id属性
+data-nyanFor="key"          → for属性
 */
+
 let nyanPlateScript = {
-    // 文字列の置換
     setString: function(htmlSegment, contextData) {
         return htmlSegment.replace(
             /(<\w+[^>]*data-nyan(?:String|Html)="(\w+)"[^>]*>)(?:(<!--\s*([^<]+?)\s*-->)|([^<]*))(<\/\w+>)/g,
@@ -32,9 +33,6 @@ let nyanPlateScript = {
         );
     },
 
-
-
-    // 再帰対応ループ処理（ネスト対応）
     processLoop: function(htmlSegment, contextData) {
         return htmlSegment.replace(
             /(<(\w+)[^>]*data-nyanLoop="(\w+)"[^>]*>)([\s\S]*?)(<\/\2>)/gi,
@@ -46,10 +44,8 @@ let nyanPlateScript = {
                 items.forEach(function(item) {
                     let processed = innerTemplate;
 
-                    // 🔁 再帰的にループを処理（ネスト対応）
+                    // ネスト対応
                     processed = nyanPlateScript.processLoop(processed, item);
-
-                    // 通常の属性処理
                     processed = nyanPlateScript.setString(processed, item);
 
                     processed = nyanPlateScript.setClass(processed, item);
@@ -63,6 +59,7 @@ let nyanPlateScript = {
                     processed = nyanPlateScript.setName(processed, item);
                     processed = nyanPlateScript.setSrc(processed, item);
                     processed = nyanPlateScript.setAlt(processed, item);
+                    processed = nyanPlateScript.setFor(processed, item);
 
                     processed = nyanPlateScript.markAsDone(processed);
 
@@ -146,12 +143,17 @@ let nyanPlateScript = {
         });
     },
 
-    // 属性を変換済みにする
+    setFor: function(htmlSegment, contextData) {
+        return htmlSegment.replace(/data-nyanFor="(\w+)"/g, function(match, key) {
+            return 'for="' + (contextData[key] !== undefined ? contextData[key] : "") + '" data-nyanDoneFor="' + key + '"';
+        });
+    },
+
     markAsDone: function(htmlSegment) {
         let nyanAttrs = [
             "nyanString", "nyanHtml", "nyanClass", "nyanStyle", "nyanHref", "nyanId",
             "nyanChecked", "nyanSelected", "nyanDisabled", "nyanValue",
-            "nyanName", "nyanSrc", "nyanAlt"
+            "nyanName", "nyanSrc", "nyanAlt", "nyanFor"
         ];
         nyanAttrs.forEach(function(attr) {
             let regex = new RegExp('(\\s)data-' + attr + '="([^"]*)"', 'gi');
@@ -163,16 +165,12 @@ let nyanPlateScript = {
     }
 };
 
-// 実行関数
 function nyanPlate(data, htmlCode) {
     htmlCode = htmlCode || nyanHtmlCode;
 
-    // ループ処理（ネスト対応）
     htmlCode = nyanPlateScript.processLoop(htmlCode, data);
 
-    // 通常の属性置換
     htmlCode = nyanPlateScript.setString(htmlCode, data);
-
     htmlCode = nyanPlateScript.setClass(htmlCode, data);
     htmlCode = nyanPlateScript.setStyle(htmlCode, data);
     htmlCode = nyanPlateScript.setHref(htmlCode, data);
@@ -184,6 +182,7 @@ function nyanPlate(data, htmlCode) {
     htmlCode = nyanPlateScript.setName(htmlCode, data);
     htmlCode = nyanPlateScript.setSrc(htmlCode, data);
     htmlCode = nyanPlateScript.setAlt(htmlCode, data);
+    htmlCode = nyanPlateScript.setFor(htmlCode, data);
 
     htmlCode = nyanPlateScript.markAsDone(htmlCode);
 
