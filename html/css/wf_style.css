@@ -112,13 +112,14 @@ body {
 
 .wf-text-input {
     height: 2em;
-    background-color: #ddd;
+    background-color: #FFF;
     margin: 10px 0;
+    border: 1px solid #999;
 }
 
 .wf-textarea {
     height: 5em;
-    background-color: #ddd;
+    background-color: #FFF;
     margin: 10px 0;
 }
 
