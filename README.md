@@ -109,168 +109,115 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 * `config.json` と `api.json` を編集後、実行ファイルを起動。
 * デフォルトで [http://localhost:8009/](http://localhost:8009/) にアクセスするとサンプルが表示されます。 Windows MacOS Linuxで実行可能です。 各自でビルドいただくか、[リリース](https://github.com/NyanQL/NyanPUI/releases)からダウンロードしてください。
 
-## JavaScript 実行 (Goja)
+## JavaScript 実行 (Goja) 環境で使用できる変数と関数
 
 * リクエストパラメータ: `nyanAllParams`
 * テンプレート HTML: `nyanHtmlCode`
-* コンソール出力: `console.log`
-* Cookie 操作: `nyanGetCookie` / `nyanSetCookie`
-* localStorage 操作: `nyanGetItem` / `nyanSetItem`
-* 外部 API: `nyanGetAPI` / `nyanJsonAPI`
-* ホストコマンド実行: `nyanHostExec`
-* ファイル読み込み: `nyanGetFile`
+* コンソール出力: `console.log()`
+* Cookie 操作: `nyanGetCookie()` / `nyanSetCookie()`
+* localStorage 操作: `nyanGetItem()` / `nyanSetItem()`
+* 外部 APIの呼び出し : `nyanGetAPI()` / `nyanJsonAPI()`
+* ホスト側でコマンドを実行し、結果を取得する: `nyanHostExec()`
+* ファイル読み込み: `nyanGetFile()`
 
-## NyanPlate (HTML テンプレート)
-
-テンプレート内に `data-nyan*` 属性を記述し、`nyanPlate(data, htmlCode)` で動的置換します。
-
-### 主なカスタム属性
-
-```html
-<html lang="ja">
-<head>
-    <title>NyanPUI Wireframe</title>
-    <link href="/css/wf_style.css" rel="stylesheet" />
-</head>
-<body>
-
-<header class="wf-header">Site Logo / Header</header>
-
-<div class="wf-search">
-    <input type="text" placeholder="キーワードを入力">
-    <button class="wf-button" type="button">検索</button>
-</div>
-
-<nav class="wf-nav">
-    <div class="wf-nav-item"><div class="wf-image">Image1</div>Nav 1</div>
-    <div class="wf-nav-item"><div class="wf-image">Image2</div>Nav 2</div>
-    <div class="wf-nav-item"><div class="wf-image">Image3</div>Nav 3</div>
-</nav>
-
-<section class="wf-hero">
-    <div class="wf-image">Hello Image</div>
-    <div class="wf-text"></div>
-    <div class="wf-text short"></div>
-</section>
-
-<section class="wf-content">
-    <div class="wf-box"><div class="wf-image">Image 1</div>Feature 1</div>
-    <div class="wf-box">Feature 2</div>
-    <div class="wf-box">Feature 3</div>
-</section>
-
-<section class="wf-form">
-    <h2 class="wf-form-title">お問い合わせフォーム</h2>
-    <input type="text" name="name" placeholder="お名前">
-    <input type="email" name="email" placeholder="メールアドレス">
-    <div><label class="checkbox"><input type="checkbox" name="subscribe"> チェックボックス</label></div>
-    <div><label class="radio"><input type="radio" name="gender" value="1"> 男性</label>
-         <label class="radio"><input type="radio" name="gender" value="2"> 女性</label></div>
-    <div class="mt_32"><textarea name="message" placeholder="ご意見・ご要望"></textarea></div>
-    <div class="right"><button class="wf-button">buttonタグのボタン</button></div>
-    <div class="right"><a href="#" class="wf-button">aタグのボタン</a></div>
-</section>
-
-<form>
-    <div class="wf-upload-box">
-        <div class="wf-upload">
-            <label for="fileUpload" class="wf-file-label">ファイルを選択</label>
-            <input type="file" id="fileUpload">
-            <a class="wf-button">アップロード</a>
-        </div>
-    </div>
-</form>
-
-<div class="wf-pager">
-    <a href="#" class="wf-page">前へ</a>
-    <a href="#" class="wf-page">1</a>
-    <a href="#" class="wf-page">2</a>
-    <a href="#" class="wf-page">3</a>
-    <a href="#" class="wf-page">次へ</a>
-</div>
-
-<div class="wf-table-box">
-    <table>
-        <thead>
-            <tr><th>項目1</th><th>項目2</th><th>項目3</th></tr>
-        </thead>
-        <tbody>
-            <tr><td>xxxx</td><td>xxxxxx</td><td>xxxx</td></tr>
-            <tr><td>xxxx</td><td>xxxxxx</td><td>xxxx</td></tr>
-            <tr><td>xxxx</td><td>xxxxxx</td><td>xxxx</td></tr>
-        </tbody>
-    </table>
-</div>
-
-<footer class="wf-footer">footer</footer>
-</body>
-</html>
+それぞれの使い方は次のとおりです。
+### 1. **nyanAllParams**
+GET/POST/JSON 受信パラメータをまとめたオブジェクトです。
+console.log で内容を確認できます。
+```javascript 
+console.log(nyanAllParams);
 ```
 
-### ワイヤーフレーム表示の使い方
+### 2. **nyanHtmlCode**
+nyanHtmlCode には `api.json` で指定した HTML ファイルの内容が文字列として格納されています。
+HTMLコードを加工して出力する場合にはこちらの変数を利用してください。
 
-1. **エンドポイントを追加**
-   `api.json` に以下のように `"wf"` エントリを追加してください：
-
-   ```json
-   {
-     "wf": {
-       "html": "./html/wf.html",
-       "description": "ワイヤーフレームプレビュー"
-     }
-   }
-   ```
-
-    * `wf.html` は上記サンプル HTML を保存したファイルです。
-
-2. **CSS を読み込む**
-   `wf.html` の `<head>` に以下を記述して、先ほど設置した `wf_style.css` を読み込みます：
-
-   ```html
-   <link href="/css/wf_style.css" rel="stylesheet" />
-   ```
-
-3. **ブラウザで確認**
-   サーバーを再起動した後、以下にアクセスして表示を確認できます：
-
-   > [http://localhost:8009/wf](http://localhost:8009/wf)
-
-以上で、ワイヤーフレームデザインのプレビュー機能が動作します。
-
-* **data-nyanString**: テキスト置換
-* **data-nyanHtml**: HTML 部品挿入
-* **data-nyanLoop**: 配列展開
-* **data-nyanClass** / **data-nyanStyle**: class/style 動的変更
-
-## HTML → JSON 変換: nyanPlateToJson
-
-`javascript/nyanPlateToJson.js` を `config.json` の `javascript_include` に追加してください。
-
+### 3. **console.log()**
+console.log はコンソールもしくはログファイルへ内容が出力されます。
+どちらに表示されるかは config.json の `log.EnableLogging` で制御します。
 ```javascript
-// HTML 文字列を取得
-var html = nyanGetFile("./output.html");
-// 変換実行
-var result = nyanPlateToJson(html);
-console.log(JSON.stringify(result, null, 2));
+console.log("Hello, NyanPUI!");
 ```
 
-### ES5.1 互換版サンプル
-
+### 4. **nyanGetCookie / nyanSetCookie**
+cookie の取得と設定ができます。
 ```javascript
-function nyanPlateToJson(htmlString) {
-  /*...（上で提供したES5版の全文をここにペースト）...*/
+// Cookie の取得
+var cookieValue = nyanGetCookie("cookieName");
+console.log("Cookie Value: " + cookieValue);
+// Cookie の設定
+nyanSetCookie("cookieName", "cookieValue");
+```
+### 5. **nyanGetItem / nyanSetItem**
+ローカルストレージを操作制御します。
+```javascript
+// ローカルストレージから値を取得
+var itemValue = nyanGetItem("itemKey");
+console.log("Item Value: " + itemValue);
+// ローカルストレージに値を設定
+nyanSetItem("itemKey", "itemValue");
+```
+
+### 6. **nyanGetAPI / nyanJsonAPI**
+外部 API を呼び出します。 GET リクエストは nyanGetAPI、 POST リクエストは nyanJsonAPI を使用します。
+引数はリクエスト先URL, 送信データ, Basic認証ユーザー名, Basic認証パスワードの順です。
+```javascript
+var sendData = { key: "value" };
+// GET リクエスト
+var response = nyanGetAPI("https://api.example.com/data", sendData, "nyan" , "password");
+console.log("GET Response: " + response);
+// JSONをPOSTして リクエスト
+var postData = { key: "value" };
+var jsonResponse = nyanJsonAPI("https://api.example.com/update", postData , "nyan" , "password");
+console.log("POST Response: " + jsonResponse);
+```
+
+headerを追加したい場合は、オプションを追加してください。
+```javascript
+const headers = {
+  "Content-Type": "application/json",
+  "X-Custom-Header": "CustomValue"
+};
+var response = nyanGetAPI("https://api.example.com/data", sendData, "nyan" , "password", headers);
+```
+
+### 7. **nyanHostExec**
+ホスト側でコマンドを実行し、結果を取得します。
+```javascript
+var result = nyanHostExec("ls -la");
+console.log("Command Result: " + result);
+```
+結果は次のようになります。上記例ですと、下記の stdoutにlsコマンドの結果が格納されます。
+```json
+{
+  "stdout": "コマンドの標準出力",
+  "stderr": "コマンドの標準エラー出力",
+  "exitCode": 0
 }
 ```
 
-## WebSocket サンプル
+### 8. **nyanGetFile**
+ファイルを読み込み、内容を文字列として取得します。
+ファイルのパスは実行ファイル(NyanPUI)からの相対パスでも指定できます。
+指定したファイルが存在しない場合はnullが返ります。
+```javascript
+var fileContent = nyanGetFile("./path/to/file.txt");
+console.log("File Content: " + fileContent);
+```
 
+###  9. **nyanPlate(data, htmlCode)**
+
+テンプレート内に `data-nyan*` 属性を記述し、`nyanPlate(data, htmlCode)` で動的置換します。
+詳細については [nyanPlate.js](javascript%2Flib%2FnyanPlate.js) の文頭にコメントで記載していますので
+そちらを参照してください。
+## WebSocket サンプル
+WebSocket による双方向通信とプッシュ通知のサンプルを同梱しています。
 * フロント: `http://localhost:8009/test`
 * プッシュ: `http://localhost:8009/push/request` → `ws://localhost:8009/push/receive`
 
 ## JSON-RPC 対応
-
-`/nyan-rpc` で JSON-RPC 2.0 API を提供（Batch は未実装）。
-
+JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
+/nyan-rpc エンドポイントに POST リクエストを送ると、JSON-RPC 形式でレスポンスが返ります。
 ```json
 {
   "jsonrpc": "2.0",
@@ -281,15 +228,12 @@ function nyanPlateToJson(htmlString) {
 ```
 
 ## 予約語
-
-`nyanAllParams` に格納されたキー名は、`api`/`nyan` で始まる文字列を避けてください。
+`api` と `nyan` で始まる文字列を避けてください。
 
 ---
 
-## ワイヤーフレームデザインプレビュー
-
+## ワイヤーフレームデザインプレビューについて
 以下のファイルをプロジェクトに含めることで、ワイヤーフレーム用のプレビュー機能を利用できます：
-
 * **CSS**: `html/css/wf_style.css` にワイヤーフレーム用のスタイルを定義
 * **HTML**: `html/wf.html` にサンプルレイアウトを記述
 
