@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Markdown プレビュー</title>
+    <style>
+        body {
+            display: flex;
+            gap: 20px;
+            font-family: sans-serif;
+        }
+        textarea {
+            width: 45%;
+            height: 400px;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 14px;
+        }
+        #preview {
+            width: 45%;
+            border: 1px solid #ccc;
+            padding: 10px;
+            overflow: auto;
+            background: #fafafa;
+        }
+        #preview table {
+            border-collapse: collapse;
+            margin: 10px 0;
+        }
+        #preview th, #preview td {
+            border: 1px solid #999;
+            padding: 6px 10px;
+        }
+        #preview th {
+            background: #eee;
+        }
+        img {
+            max-width: 100%;
+            height: auto;
+        }
+    </style>
+</head>
+<body>
+<textarea id="editor"># Markdown入力デモ
+
+ここにMarkdownを書いてください。
+
+- リスト1
+- リスト2
+
+| 左寄せ  | 中央寄せ  | 右寄せ  |
+|:--------|:---------:|--------:|
+| A       | B         | C       |
+| D       | E         | F       |
+
+
+  </textarea>
+
+<div id="preview"></div>
+
+<!-- JSをここで読み込む -->
+<script src="./js/markdownToHtml.js?time=2"></script>
+<script src="./js/markdown.js?time=2"></script>
+</body>
+</html>

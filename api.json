@@ -32,5 +32,9 @@
     "script": "./javascript/plateDecode.js",
     "html": "./html/plateDecodeSample.html",
     "description": "nyanPlateのHTMLからjsonを作成するサンプルページ"
+  },
+  "markdown": {
+    "html": "./html/markdown.html",
+    "description": "markdownサンプル"
   }
 }
