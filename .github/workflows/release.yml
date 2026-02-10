@@ -39,7 +39,13 @@ jobs:
             binary_name="${binary_name}.exe"
           fi
 
-          go build -o "${binary_name}" main.go
+          # Workaround for dyld aborting with "missing LC_UUID load command"
+          # on some macOS/Go toolchain combinations when using Go's internal linker.
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            go build -ldflags="-linkmode=external -X main.buildVersion=${{ github.ref_name }}" -o "${binary_name}" main.go
+          else
+            go build -ldflags="-X main.buildVersion=${{ github.ref_name }}" -o "${binary_name}" main.go
+          fi
 
           mkdir release_package
           cp "${binary_name}" release_package/

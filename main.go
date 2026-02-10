@@ -111,6 +111,9 @@ type JSONRPCError struct {
 // このシステムの設定
 var globalConfig Config
 
+// ビルド時に -ldflags "-X main.buildVersion=..." で上書き可能
+var buildVersion = "v0.0.9"
+
 // api.jsonから取得する設定
 var apiConfig APIConfig
 
@@ -168,6 +171,9 @@ func main() {
 		log.SetOutput(os.Stdout)
 		gin.DefaultWriter = os.Stdout
 	}
+
+	log.Printf("Binary version: %s", buildVersion)
+	log.Printf("Config version: %s", globalConfig.Version)
 
 	// API設定をロード
 	apiConfigPath := resolvePath(exeDir, "api.json")
