@@ -20,8 +20,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // Config は設定データを表します。
@@ -61,8 +63,10 @@ type ErrorData struct {
 
 // EndpointConfig はエンドポイントの設定を表します。
 type EndpointConfig struct {
+	Type        string `json:"type,omitempty"`
 	Script      string `json:"script"`
 	HTML        string `json:"html"`
+	ConnectURL  string `json:"connectURL,omitempty"`
 	Description string `json:"description"`
 	Push        string `json:"push,omitempty"`
 }
@@ -89,10 +93,10 @@ type ExecResult struct {
 }
 
 type JSONRPCResponse struct {
-	JSONRPC string           `json:"jsonrpc"`
-	Result  interface{}      `json:"result,omitempty"`
-	Error   *JSONRPCError    `json:"error,omitempty"`
-	ID      interface{}      `json:"id,omitempty"`
+	JSONRPC string        `json:"jsonrpc"`
+	Result  interface{}   `json:"result,omitempty"`
+	Error   *JSONRPCError `json:"error,omitempty"`
+	ID      interface{}   `json:"id,omitempty"`
 }
 
 type JSONRPCRequest struct {
@@ -181,6 +185,10 @@ func main() {
 		log.Fatal("Error loading API configuration:", err)
 	}
 
+	if err := startWebSocketClients(exeDir); err != nil {
+		log.Printf("Failed to start WebSocket clients: %v", err)
+	}
+
 	gin.DisableConsoleColor()
 	r := gin.Default()
 	r.SetTrustedProxies(nil)
@@ -196,6 +204,9 @@ func main() {
 	// 各APIエンドポイントを設定
 	for endpoint := range apiConfig {
 		config := apiConfig[endpoint] // ループ変数をローカル変数にコピー
+		if strings.TrimSpace(config.Type) == apiTypeWSClient {
+			continue
+		}
 		r.Any("/"+endpoint, func(c *gin.Context) {
 			handleAPIRequestOrWebSocket(c, config)
 		})
@@ -442,7 +453,6 @@ func handleWebSocket(c *gin.Context, config EndpointConfig) {
 	}
 }
 
-
 // sendWebSocketHTMLError はWebSocket接続にHTML形式のエラーメッセージを送信します。
 func sendWebSocketHTMLError(conn *websocket.Conn, messageType int, errorMessage string) {
 	errorHTML := fmt.Sprintf("<html><body><h1>Error</h1><p>%s</p></body></html>", errorMessage)
@@ -468,9 +478,8 @@ func runJavaScript(scriptPath string, htmlPath string, allParams map[string]inte
 	}
 	exeDir := filepath.Dir(exePath)
 
-	// スクリプトとHTMLファイルのパスを解決
+	// スクリプトのパスを解決
 	scriptPath = resolvePath(exeDir, scriptPath)
-	htmlPath = resolvePath(exeDir, htmlPath)
 
 	// goja ランタイムのセットアップ（リクエストごとに新しいランタイムを作る）
 	runtime := setupGojaRuntime()
@@ -487,14 +496,20 @@ func runJavaScript(scriptPath string, htmlPath string, allParams map[string]inte
 		jsLibCode += string(code) + "\n"
 	}
 
-	// HTMLファイルを読み込み
-	htmlCodeBytes, err := os.ReadFile(htmlPath)
-	if err != nil {
-		log.Printf("Failed to load HTML file at path: %s, error: %v", htmlPath, err)
-		return "", fmt.Errorf("failed to load HTML file: %v", err)
+	var htmlJS string
+	if strings.TrimSpace(htmlPath) == "" {
+		htmlJS = "const nyanHtmlCode = \"\";\n"
+	} else {
+		// HTMLファイルを読み込み
+		htmlPath = resolvePath(exeDir, htmlPath)
+		htmlCodeBytes, err := os.ReadFile(htmlPath)
+		if err != nil {
+			log.Printf("Failed to load HTML file at path: %s, error: %v", htmlPath, err)
+			return "", fmt.Errorf("failed to load HTML file: %v", err)
+		}
+		escapedHTML := strconv.Quote(string(htmlCodeBytes))
+		htmlJS = fmt.Sprintf("const nyanHtmlCode = %s;\n", escapedHTML)
 	}
-	escapedHTML := strconv.Quote(string(htmlCodeBytes))
-	htmlJS := fmt.Sprintf("const nyanHtmlCode = %s;\n", escapedHTML)
 
 	// リクエストパラメータをJSON文字列に変換してJavaScript変数として設定
 	allParamsJSON, err := json.Marshal(allParams)
@@ -520,6 +535,179 @@ func runJavaScript(scriptPath string, htmlPath string, allParams map[string]inte
 
 	// 結果を文字列として取得
 	return value.String(), nil
+}
+
+const apiTypeWSClient = "ws_client"
+
+type wsClientConfig struct {
+	name        string
+	scriptPath  string
+	connectURL  string
+	description string
+}
+
+// connectURL が env:XXXX 形式なら環境変数 XXXX で解決する。空や未設定はエラー。
+func resolveConnectURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("connectURL is empty")
+	}
+	if strings.HasPrefix(raw, "env:") {
+		key := strings.TrimPrefix(raw, "env:")
+		if key == "" {
+			return "", fmt.Errorf("connectURL env: prefix is empty")
+		}
+		val := os.Getenv(key)
+		if val == "" {
+			return "", fmt.Errorf("environment variable %s is empty", key)
+		}
+		return val, nil
+	}
+	return raw, nil
+}
+
+// startWebSocketClients は api.json に定義された ws_client を起動します。
+func startWebSocketClients(execDir string) error {
+	var firstErr error
+	for name, cfg := range apiConfig {
+		if strings.TrimSpace(cfg.Type) != apiTypeWSClient {
+			continue
+		}
+
+		scriptPath := strings.TrimSpace(cfg.Script)
+		connectURLRaw := strings.TrimSpace(cfg.ConnectURL)
+
+		if scriptPath == "" {
+			err := fmt.Errorf("ws_client %s: script is missing", name)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if connectURLRaw == "" {
+			err := fmt.Errorf("ws_client %s: connectURL is missing", name)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		connectURL, err := resolveConnectURL(connectURLRaw)
+		if err != nil {
+			log.Printf("ws_client %s: %v", name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		wsCfg := wsClientConfig{
+			name:        name,
+			scriptPath:  scriptPath,
+			connectURL:  connectURL,
+			description: cfg.Description,
+		}
+
+		log.Printf("Starting WebSocket client %s -> %s", wsCfg.name, wsCfg.connectURL)
+		go runWebSocketClient(wsCfg)
+	}
+
+	return firstErr
+}
+
+// 常時接続を維持し、切断時は指数バックオフで再接続します。
+func runWebSocketClient(cfg wsClientConfig) {
+	backoff := time.Second
+	for {
+		err := connectAndListenWebSocket(cfg)
+		if err != nil {
+			log.Printf("WebSocket client %s disconnected: %v", cfg.name, err)
+		}
+
+		time.Sleep(backoff)
+		if backoff < 30*time.Second {
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func connectAndListenWebSocket(cfg wsClientConfig) error {
+	conn, _, err := websocket.DefaultDialer.Dial(cfg.connectURL, nil)
+	if err != nil {
+		return fmt.Errorf("dial failed: %w", err)
+	}
+	defer conn.Close()
+
+	log.Printf("WebSocket client %s connected", cfg.name)
+
+	for {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read error: %w", err)
+		}
+		if msgType == websocket.CloseMessage {
+			return fmt.Errorf("close message received: %s", string(data))
+		}
+
+		log.Printf("ws_client %s received %s: %s", cfg.name, websocketMessageTypeLabel(msgType), string(data))
+
+		allParams := map[string]interface{}{
+			"api":             cfg.name,
+			"ws_client":       cfg.name,
+			"ws_message_type": websocketMessageTypeLabel(msgType),
+			"ws_message_text": string(data),
+			"ws_connect_url":  cfg.connectURL,
+			"ws_description":  cfg.description,
+		}
+
+		if msgType == websocket.BinaryMessage {
+			allParams["ws_message_base64"] = base64.StdEncoding.EncodeToString(data)
+		}
+
+		if msgType == websocket.TextMessage {
+			var decoded interface{}
+			if err := json.Unmarshal(data, &decoded); err == nil {
+				allParams["ws_message_json"] = decoded
+			}
+		}
+
+		result, err := runJavaScript(cfg.scriptPath, "", allParams)
+		if err != nil {
+			log.Printf("ws_client %s script error: %v", cfg.name, err)
+			continue
+		}
+
+		trimmed := strings.TrimSpace(result)
+		if trimmed == "" {
+			continue
+		}
+
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(trimmed)); err != nil {
+			return fmt.Errorf("send error: %w", err)
+		}
+	}
+}
+
+func websocketMessageTypeLabel(t int) string {
+	switch t {
+	case websocket.TextMessage:
+		return "text"
+	case websocket.BinaryMessage:
+		return "binary"
+	case websocket.CloseMessage:
+		return "close"
+	case websocket.PingMessage:
+		return "ping"
+	case websocket.PongMessage:
+		return "pong"
+	default:
+		return fmt.Sprintf("unknown(%d)", t)
+	}
 }
 
 func CORSMiddleware() gin.HandlerFunc {
@@ -846,7 +1034,6 @@ func runCommand(command string, args ...string) (*ExecResult, error) {
 	}
 	return result, nil
 }
-
 
 // cp932ToUTF8 は、CP932（Shift-JIS）でエンコードされたデータをUTF-8に変換します。
 func cp932ToUTF8(data []byte) (string, error) {

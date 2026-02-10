@@ -19,6 +19,12 @@
     "html": "./html/push/receive.html",
     "description": "websocketでここに接続しておくと、push/requestにリクエストがあるとpushを受信することができるよ"
   },
+  "ws_client/self_push_receive": {
+    "type": "ws_client",
+    "connectURL": "ws://127.0.0.1:8009/push/receive",
+    "script": "./javascript/ws/receiver_main.js",
+    "description": "NyanPUI自身のWebSocket(push/receive)に接続して受信ログを出すサンプル"
+  },
   "push/test": {
     "html": "./html/push/test.html",
     "description": "websocketを試すことができるページ"
