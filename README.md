@@ -251,7 +251,7 @@ console.log("File Content: " + fileContent);
 
 ### 9. **nyanReadFileB64**
 バイナリファイルをBase64文字列として取得します。
-ファイルのパスは実行ファイル(NyanPUI)からの相対パスでも指定できます。
+ファイルのパスはカレントディレクトリからの相対パスでも指定できます。
 ```javascript
 var b64 = nyanReadFileB64("./html/images/nyan.png");
 console.log(b64);

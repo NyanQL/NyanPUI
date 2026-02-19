@@ -1231,24 +1231,16 @@ func nyanReadFileB64(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
 			panic(vm.NewTypeError("nyanReadFileB64には1つの引数（ファイルパス）が必要です"))
 		}
-		relativePath := call.Arguments[0].String()
+		path := call.Arguments[0].String()
 
-		exePath, err := os.Executable()
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		exeDir := filepath.Dir(exePath)
-		fullPath := filepath.Join(exeDir, relativePath)
-
-		if fi, err := os.Stat(fullPath); err == nil && fi.IsDir() {
-			return goja.Null()
+		abs := path
+		if !filepath.IsAbs(path) {
+			wd, _ := os.Getwd()
+			abs = filepath.Join(wd, path)
 		}
 
-		content, err := os.ReadFile(fullPath)
+		content, err := os.ReadFile(abs)
 		if err != nil {
-			if os.IsNotExist(err) {
-				return goja.Null()
-			}
 			panic(vm.ToValue(err.Error()))
 		}
 
