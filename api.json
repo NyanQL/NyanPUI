@@ -38,5 +38,15 @@
     "script": "./javascript/plateDecode.js",
     "html": "./html/plateDecodeSample.html",
     "description": "nyanPlateのHTMLからjsonを作成するサンプルページ"
+  },
+  "sample/json": {
+    "script": "./javascript/sample_json.js",
+    "html": "",
+    "description": "JSONを返すサンプルAPI"
+  },
+  "sample/png": {
+    "script": "./javascript/sample_png.js",
+    "html": "",
+    "description": "nyan.pngをバイナリで返すサンプルAPI"
   }
 }
