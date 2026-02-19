@@ -279,9 +279,6 @@ JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
 }
 ```
 
-## 予約語
-`api` と `nyan` で始まる文字列を避けてください。
-
 ---
 
 ## JavaScriptのレスポンス形式（拡張）
@@ -324,3 +321,7 @@ const data = nyanReadFileB64("./html/images/nyan.png");
 これらを配置した状態でサーバーを起動すると、デフォルトで以下の URL からプレビューが表示されます：
 
 > [http://localhost:8009/wf](http://localhost:8009/wf)
+
+
+## 予約語
+`api` と `nyan` で始まる文字列を避けてください。
