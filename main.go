@@ -5,12 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/dop251/goja"
-	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
-	"github.com/natefinch/lumberjack"
-	"golang.org/x/text/encoding/japanese"
-	"golang.org/x/text/transform"
 	"io"
 	"io/ioutil"
 	"log"
@@ -24,6 +18,13 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/dop251/goja"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/natefinch/lumberjack"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/transform"
 )
 
 // Config は設定データを表します。
@@ -116,7 +117,7 @@ type JSONRPCError struct {
 var globalConfig Config
 
 // ビルド時に -ldflags "-X main.buildVersion=..." で上書き可能
-var buildVersion = "v0.0.9"
+var buildVersion = "v0.0.10"
 
 // api.jsonから取得する設定
 var apiConfig APIConfig
@@ -342,7 +343,10 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 
 	// スクリプトとHTMLファイルのパスを取得
 	scriptPath := resolvePath(exeDir, config.Script)
-	htmlPath := resolvePath(exeDir, config.HTML)
+	htmlPath := ""
+	if strings.TrimSpace(config.HTML) != "" {
+		htmlPath = resolvePath(exeDir, config.HTML)
+	}
 
 	// scriptが空の場合、HTMLファイルの内容をそのまま返す
 	if config.Script == "" {
@@ -356,14 +360,21 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 	}
 
 	// JavaScriptを実行し、結果を取得
-	result, err := runJavaScript(scriptPath, htmlPath, allParams)
+	resultValue, err := runJavaScriptValue(scriptPath, htmlPath, allParams)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
+	if handled, err := writeJSResponse(c, resultValue); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	} else if handled {
+		return
+	}
+
 	// HTML出力として結果を返す
-	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(result))
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(resultValue.String()))
 
 	// push 設定がある場合、対象のWebSocket接続に対してプッシュ
 	// API リクエスト完了後の push 処理
@@ -471,10 +482,18 @@ func sendHTMLErrorResponse(w http.ResponseWriter, errorMessage string) {
 
 // runJavaScript はJavaScriptを実行します。
 func runJavaScript(scriptPath string, htmlPath string, allParams map[string]interface{}) (string, error) {
+	value, err := runJavaScriptValue(scriptPath, htmlPath, allParams)
+	if err != nil {
+		return "", err
+	}
+	return value.String(), nil
+}
+
+func runJavaScriptValue(scriptPath string, htmlPath string, allParams map[string]interface{}) (goja.Value, error) {
 	// 実行ファイルのディレクトリを取得
 	exePath, err := os.Executable()
 	if err != nil {
-		return "", fmt.Errorf("Failed to get executable path: %v", err)
+		return nil, fmt.Errorf("Failed to get executable path: %v", err)
 	}
 	exeDir := filepath.Dir(exePath)
 
@@ -491,7 +510,7 @@ func runJavaScript(scriptPath string, htmlPath string, allParams map[string]inte
 		code, err := os.ReadFile(includePath)
 		log.Print("Include file:", includePath)
 		if err != nil {
-			return "", fmt.Errorf("failed to read included JS file %s: %v", includePath, err)
+			return nil, fmt.Errorf("failed to read included JS file %s: %v", includePath, err)
 		}
 		jsLibCode += string(code) + "\n"
 	}
@@ -505,7 +524,7 @@ func runJavaScript(scriptPath string, htmlPath string, allParams map[string]inte
 		htmlCodeBytes, err := os.ReadFile(htmlPath)
 		if err != nil {
 			log.Printf("Failed to load HTML file at path: %s, error: %v", htmlPath, err)
-			return "", fmt.Errorf("failed to load HTML file: %v", err)
+			return nil, fmt.Errorf("failed to load HTML file: %v", err)
 		}
 		escapedHTML := strconv.Quote(string(htmlCodeBytes))
 		htmlJS = fmt.Sprintf("const nyanHtmlCode = %s;\n", escapedHTML)
@@ -514,14 +533,14 @@ func runJavaScript(scriptPath string, htmlPath string, allParams map[string]inte
 	// リクエストパラメータをJSON文字列に変換してJavaScript変数として設定
 	allParamsJSON, err := json.Marshal(allParams)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	//変数に格納
 	paramsJS := fmt.Sprintf("const nyanAllParams = %s;\n", allParamsJSON)
 	// JavaScriptファイル本体を読み込み
 	jsCodeBytes, err := os.ReadFile(scriptPath)
 	if err != nil {
-		return "", fmt.Errorf("failed to read JavaScript file: %v", err)
+		return nil, fmt.Errorf("failed to read JavaScript file: %v", err)
 	}
 
 	// 全体の JavaScript コードを結合
@@ -530,11 +549,116 @@ func runJavaScript(scriptPath string, htmlPath string, allParams map[string]inte
 	// スクリプトを実行
 	value, err := runtime.RunString(fullJSCode)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	// 結果を文字列として取得
-	return value.String(), nil
+	return value, nil
+}
+
+func writeJSResponse(c *gin.Context, value goja.Value) (bool, error) {
+	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
+		return false, nil
+	}
+
+	exported := value.Export()
+	respMap, ok := exported.(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+
+	status := http.StatusOK
+	if rawStatus, ok := respMap["status"]; ok {
+		if parsed, ok := parseStatusCode(rawStatus); ok {
+			status = parsed
+		}
+	}
+
+	contentType := ""
+	if rawContentType, ok := respMap["contentType"]; ok {
+		if s, ok := rawContentType.(string); ok {
+			contentType = s
+		} else {
+			contentType = fmt.Sprint(rawContentType)
+		}
+	}
+
+	headers := map[string]string{}
+	if rawHeaders, ok := respMap["headers"]; ok {
+		if headerMap, ok := rawHeaders.(map[string]interface{}); ok {
+			for key, value := range headerMap {
+				headers[key] = fmt.Sprint(value)
+			}
+		}
+	}
+
+	bodyBytes, err := jsBodyToBytes(respMap["body"])
+	if err != nil {
+		return true, err
+	}
+
+	for key, value := range headers {
+		c.Writer.Header().Set(key, value)
+	}
+
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "text/html; charset=utf-8"
+	}
+
+	c.Data(status, contentType, bodyBytes)
+	return true, nil
+}
+
+func parseStatusCode(raw interface{}) (int, bool) {
+	switch v := raw.(type) {
+	case int:
+		return v, true
+	case int32:
+		return int(v), true
+	case int64:
+		return int(v), true
+	case float32:
+		return int(v), true
+	case float64:
+		return int(v), true
+	case json.Number:
+		parsed, err := v.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(parsed), true
+	default:
+		return 0, false
+	}
+}
+
+func jsBodyToBytes(body interface{}) ([]byte, error) {
+	if body == nil {
+		return []byte{}, nil
+	}
+
+	switch v := body.(type) {
+	case string:
+		return []byte(v), nil
+	case []byte:
+		return v, nil
+	case []interface{}:
+		return json.Marshal(v)
+	case map[string]interface{}:
+		if encoding, ok := v["encoding"].(string); ok && strings.EqualFold(encoding, "base64") {
+			data, _ := v["data"].(string)
+			if strings.TrimSpace(data) == "" {
+				return []byte{}, nil
+			}
+			decoded, err := base64.StdEncoding.DecodeString(data)
+			if err != nil {
+				return nil, fmt.Errorf("invalid base64 body: %w", err)
+			}
+			return decoded, nil
+		}
+		return json.Marshal(v)
+	default:
+		return []byte(fmt.Sprint(v)), nil
+	}
 }
 
 const apiTypeWSClient = "ws_client"
@@ -931,6 +1055,7 @@ func setupGojaRuntime() *goja.Runtime {
 	})
 
 	vm.Set("nyanGetFile", nyanGetFile(vm))
+	vm.Set("nyanReadFileB64", nyanReadFileB64(vm))
 
 	// console.log の登録
 	console := map[string]func(...interface{}){
@@ -1098,6 +1223,28 @@ func nyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 
 		// 読み込んだ内容を文字列で返す（バイナリは Base64 を使う nyanReadFileB64 を推奨）
 		return vm.ToValue(string(content))
+	}
+}
+
+func nyanReadFileB64(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.NewTypeError("nyanReadFileB64には1つの引数（ファイルパス）が必要です"))
+		}
+		path := call.Arguments[0].String()
+
+		abs := path
+		if !filepath.IsAbs(path) {
+			wd, _ := os.Getwd()
+			abs = filepath.Join(wd, path)
+		}
+
+		content, err := os.ReadFile(abs)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+
+		return vm.ToValue(base64.StdEncoding.EncodeToString(content))
 	}
 }
 
