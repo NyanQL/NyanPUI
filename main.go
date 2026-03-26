@@ -489,6 +489,64 @@ func runJavaScript(scriptPath string, htmlPath string, allParams map[string]inte
 	return value.String(), nil
 }
 
+// resolveCurrentAPINameFromContext は現在の HTTP リクエストから API 名を解決します。
+func resolveCurrentAPINameFromContext(c *gin.Context) string {
+	if c == nil || c.Request == nil || c.Request.URL == nil {
+		return ""
+	}
+
+	if apiName := strings.TrimSpace(c.Query("api")); apiName != "" {
+		return apiName
+	}
+
+	path := strings.TrimSpace(c.Request.URL.Path)
+	if path == "" || path == "/" {
+		return "html"
+	}
+	return strings.TrimPrefix(path, "/")
+}
+
+// callNyanAPIFromVM は、JavaScript(VM) から api.json 定義の API を内部実行します。
+func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (interface{}, error) {
+	if strings.TrimSpace(apiName) == "" {
+		return nil, fmt.Errorf("api name is required")
+	}
+
+	apiCfg, found := apiConfig[apiName]
+	if !found {
+		return nil, fmt.Errorf("API config not found: %s", apiName)
+	}
+	if strings.TrimSpace(apiCfg.Type) == apiTypeWSClient {
+		return nil, fmt.Errorf("API %s is ws_client and cannot be called by nyanCallMe", apiName)
+	}
+	if strings.TrimSpace(apiCfg.Script) == "" {
+		return nil, fmt.Errorf("script not found for API %s", apiName)
+	}
+
+	params := make(map[string]interface{}, len(allParams)+1)
+	for key, value := range allParams {
+		params[key] = value
+	}
+	params["api"] = apiName
+
+	resultValue, err := runJavaScriptValue(apiCfg.Script, apiCfg.HTML, params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to run API %s: %w", apiName, err)
+	}
+	if resultValue == nil || goja.IsUndefined(resultValue) || goja.IsNull(resultValue) {
+		return nil, nil
+	}
+
+	exported := resultValue.Export()
+	if asText, ok := exported.(string); ok {
+		var parsed interface{}
+		if json.Unmarshal([]byte(asText), &parsed) == nil {
+			return parsed, nil
+		}
+	}
+	return exported, nil
+}
+
 func runJavaScriptValue(scriptPath string, htmlPath string, allParams map[string]interface{}) (goja.Value, error) {
 	// 実行ファイルのディレクトリを取得
 	exePath, err := os.Executable()
@@ -1056,6 +1114,44 @@ func setupGojaRuntime() *goja.Runtime {
 
 	vm.Set("nyanGetFile", nyanGetFile(vm))
 	vm.Set("nyanReadFileB64", nyanReadFileB64(vm))
+	vm.Set("nyanCallMe", func(call goja.FunctionCall) goja.Value {
+		apiName := ""
+		params := map[string]interface{}{}
+
+		if len(call.Arguments) >= 1 {
+			raw := call.Argument(0).Export()
+			if raw != nil {
+				if asMap, ok := raw.(map[string]interface{}); ok {
+					params = asMap
+				} else if obj, ok := call.Argument(0).(*goja.Object); ok {
+					if exported, ok := obj.Export().(map[string]interface{}); ok {
+						params = exported
+					}
+				}
+			}
+		}
+
+		if apiValue, ok := params["api"]; ok {
+			if asText, ok := apiValue.(string); ok && strings.TrimSpace(asText) != "" {
+				apiName = asText
+			}
+		}
+		if strings.TrimSpace(apiName) == "" {
+			apiName = resolveCurrentAPINameFromContext(ginContext)
+		}
+		if strings.TrimSpace(apiName) == "" {
+			panic(vm.ToValue("nyanCallMe: api is required"))
+		}
+
+		result, err := callNyanAPIFromVM(apiName, params)
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		if result == nil {
+			return goja.Null()
+		}
+		return vm.ToValue(result)
+	})
 
 	// console.log の登録
 	console := map[string]func(...interface{}){
