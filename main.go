@@ -117,7 +117,7 @@ type JSONRPCError struct {
 var globalConfig Config
 
 // ビルド時に -ldflags "-X main.buildVersion=..." で上書き可能
-var buildVersion = "v0.0.10"
+var buildVersion = "v0.0.12"
 
 // api.jsonから取得する設定
 var apiConfig APIConfig
@@ -1023,7 +1023,7 @@ func setupGojaRuntime() *goja.Runtime {
 	})
 
 	// jsonAPI 関数の登録
-	vm.Set("nyanJsonAPI", func(call goja.FunctionCall) goja.Value {
+	jsonAPIFunc := func(call goja.FunctionCall) goja.Value {
 		url := call.Argument(0).String()
 		jsonData := call.Argument(1).String()
 		username := call.Argument(2).String()
@@ -1057,7 +1057,9 @@ func setupGojaRuntime() *goja.Runtime {
 			panic(vm.ToValue(err.Error()))
 		}
 		return vm.ToValue(result)
-	})
+	}
+	vm.Set("nyanJsonAPI", jsonAPIFunc)
+	vm.Set("nyanCallAPI", jsonAPIFunc)
 
 	// getCookie, setCookie, setItem, getItem も同様に登録する
 	vm.Set("nyanGetCookie", func(call goja.FunctionCall) goja.Value {

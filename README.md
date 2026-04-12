@@ -45,7 +45,7 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
   "certPath": "path/to/cert.crt",
   "keyPath": "path/to/key.key",
   "javascript_include": [
-    "javascript/nyanPlateToJson.js"
+    "javascript/lib/nyanPlateToJson.js"
   ],
   "log": {
     "Filename": "./logs/nyanpui.log",
@@ -159,7 +159,7 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 * コンソール出力: `console.log()`
 * Cookie 操作: `nyanGetCookie()` / `nyanSetCookie()`
 * localStorage 操作: `nyanGetItem()` / `nyanSetItem()`
-* 外部 APIの呼び出し : `nyanGetAPI()` / `nyanJsonAPI()`
+* 外部 APIの呼び出し : `nyanGetAPI()` / `nyanJsonAPI()` / `nyanCallAPI()`
 * ホスト側でコマンドを実行し、結果を取得する: `nyanHostExec()`
 * ファイル読み込み: `nyanGetFile()`
 * バイナリをBase64で取得: `nyanReadFileB64()`
@@ -203,27 +203,35 @@ console.log("Item Value: " + itemValue);
 nyanSetItem("itemKey", "itemValue");
 ```
 
-### 6. **nyanGetAPI / nyanJsonAPI**
-外部 API を呼び出します。 GET リクエストは nyanGetAPI、 POST リクエストは nyanJsonAPI を使用します。
-引数はリクエスト先URL, 送信データ, Basic認証ユーザー名, Basic認証パスワードの順です。
+### 6. **nyanGetAPI / nyanJsonAPI / nyanCallAPI**
+外部 API を呼び出します。
+
+* `nyanGetAPI(url, username, password)` は GET リクエストを送信します。
+* `nyanJsonAPI(url, jsonData, username, password, headers)` は JSON を POST します。
+* `nyanCallAPI(url, jsonData, username, password, headers)` は `nyanJsonAPI()` のラッパーで、引数と挙動は同じです。
+
+`jsonData` には JSON 文字列を渡してください。JavaScript オブジェクトを送る場合は `JSON.stringify()` してください。
+`headers` は省略可能で、オブジェクトまたは JSON 文字列で指定できます。
+
 ```javascript
-var sendData = { key: "value" };
 // GET リクエスト
-var response = nyanGetAPI("https://api.example.com/data", sendData, "nyan" , "password");
+var response = nyanGetAPI("https://api.example.com/data", "nyan", "password");
 console.log("GET Response: " + response);
+
 // JSONをPOSTして リクエスト
-var postData = { key: "value" };
-var jsonResponse = nyanJsonAPI("https://api.example.com/update", postData , "nyan" , "password");
+var postData = JSON.stringify({ key: "value" });
+var jsonResponse = nyanJsonAPI("https://api.example.com/update", postData, "nyan", "password");
+var jsonResponse2 = nyanCallAPI("https://api.example.com/update", postData, "nyan", "password");
 console.log("POST Response: " + jsonResponse);
 ```
 
-headerを追加したい場合は、オプションを追加してください。
+header を追加したい場合は第5引数に指定してください。
 ```javascript
 const headers = {
   "Content-Type": "application/json",
   "X-Custom-Header": "CustomValue"
 };
-var response = nyanGetAPI("https://api.example.com/data", sendData, "nyan" , "password", headers);
+var response = nyanCallAPI("https://api.example.com/data", postData, "nyan", "password", headers);
 ```
 
 ### 7. **nyanHostExec**
@@ -237,7 +245,7 @@ console.log("Command Result: " + result);
 {
   "stdout": "コマンドの標準出力",
   "stderr": "コマンドの標準エラー出力",
-  "exitCode": 0
+  "exit_code": 0
 }
 ```
 
@@ -282,7 +290,7 @@ console.log(result);
 そちらを参照してください。
 ## WebSocket サンプル
 WebSocket による双方向通信とプッシュ通知のサンプルを同梱しています。
-* フロント: `http://localhost:8009/test`
+* フロント: `http://localhost:8009/push/test`
 * プッシュ: `http://localhost:8009/push/request` → `ws://localhost:8009/push/receive`
 
 ## JSON-RPC 対応
@@ -292,7 +300,9 @@ JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
 {
   "jsonrpc": "2.0",
   "method": "api名",
-  "params": "生成された HTML",
+  "params": {
+    "foo": "bar"
+  },
   "id": 1
 }
 ```
@@ -334,7 +344,7 @@ const data = nyanReadFileB64("./html/images/nyan.png");
 ## ワイヤーフレームデザインプレビューについて
 以下のファイルをプロジェクトに含めることで、ワイヤーフレーム用のプレビュー機能を利用できます：
 * **CSS**: `html/css/wf_style.css` にワイヤーフレーム用のスタイルを定義
-* **HTML**: `html/wf.html` にサンプルレイアウトを記述
+* **HTML**: `html/wf_html.html` にサンプルレイアウトを記述
 
 これらを配置した状態でサーバーを起動すると、デフォルトで以下の URL からプレビューが表示されます：
 
