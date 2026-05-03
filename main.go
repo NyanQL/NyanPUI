@@ -117,7 +117,7 @@ type JSONRPCError struct {
 var globalConfig Config
 
 // ビルド時に -ldflags "-X main.buildVersion=..." で上書き可能
-var buildVersion = "v0.0.12"
+var buildVersion = "v0.0.13"
 
 // api.jsonから取得する設定
 var apiConfig APIConfig
