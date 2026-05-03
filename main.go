@@ -67,6 +67,7 @@ type EndpointConfig struct {
 	Type        string `json:"type,omitempty"`
 	Script      string `json:"script"`
 	HTML        string `json:"html"`
+	Path        string `json:"path,omitempty"`
 	ConnectURL  string `json:"connectURL,omitempty"`
 	Description string `json:"description"`
 	Push        string `json:"push,omitempty"`
@@ -205,7 +206,11 @@ func main() {
 	// 各APIエンドポイントを設定
 	for endpoint := range apiConfig {
 		config := apiConfig[endpoint] // ループ変数をローカル変数にコピー
-		if strings.TrimSpace(config.Type) == apiTypeWSClient {
+		switch strings.TrimSpace(config.Type) {
+		case apiTypeWSClient:
+			continue
+		case apiTypePublic:
+			registerPublicEndpoint(r, endpoint, config, exeDir)
 			continue
 		}
 		r.Any("/"+endpoint, func(c *gin.Context) {
@@ -719,7 +724,59 @@ func jsBodyToBytes(body interface{}) ([]byte, error) {
 	}
 }
 
-const apiTypeWSClient = "ws_client"
+const (
+	apiTypeWSClient = "ws_client"
+	apiTypePublic   = "public"
+)
+
+func registerPublicEndpoint(r *gin.Engine, endpoint string, config EndpointConfig, exeDir string) {
+	routePath := "/" + strings.Trim(strings.TrimSpace(endpoint), "/")
+	if routePath == "/" {
+		log.Printf("public endpoint %q is invalid: endpoint name must not be empty", endpoint)
+		return
+	}
+
+	publicPath := strings.TrimSpace(config.Path)
+	if publicPath == "" {
+		log.Printf("public endpoint %s: path is missing", endpoint)
+	}
+
+	basePath := resolvePath(exeDir, publicPath)
+	handler := func(c *gin.Context) {
+		if publicPath == "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "public path is missing"})
+			return
+		}
+
+		requestedPath := strings.TrimPrefix(c.Param("filepath"), "/")
+		if requestedPath == "" || !filepath.IsLocal(requestedPath) {
+			c.Status(http.StatusNotFound)
+			return
+		}
+
+		filePath := filepath.Join(basePath, requestedPath)
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read public file"})
+			return
+		}
+		if fileInfo.IsDir() {
+			c.Status(http.StatusNotFound)
+			return
+		}
+
+		c.File(filePath)
+	}
+
+	r.GET(routePath, handler)
+	r.HEAD(routePath, handler)
+	r.GET(routePath+"/*filepath", handler)
+	r.HEAD(routePath+"/*filepath", handler)
+}
 
 type wsClientConfig struct {
 	name        string

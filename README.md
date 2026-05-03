@@ -99,10 +99,27 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 
 * **script**: 実行する JavaScript ファイル（空文字列なら HTML のみ返却）
 * **html**: HTML ファイルパス
+* **path**: `type: "public"` で公開するフォルダパス
 * **description**: 説明文
 * **push**: WebSocket で配信するエンドポイント名
 
 省略可能なフィールド: `script`, `push`。
+
+### public フォルダ公開（`type: "public"`）
+
+`type: "public"` を指定すると、`path` のフォルダ配下にあるファイルをそのまま配信します。`path` は実行ファイルのあるディレクトリからの相対パス、または絶対パスで指定できます。
+
+```json
+{
+  "public": {
+    "type": "public",
+    "path": "./public",
+    "description": "public フォルダ"
+  }
+}
+```
+
+この例では `./public/app.js` を `http://localhost:8009/public/app.js` で取得できます。リクエスト先が実在するファイルではない場合は 404 を返します。フォルダへのアクセスでは `index.html` を探さず、ディレクトリ一覧も表示しません。
 
 ### WebSocket レシーバー（`type: "ws_client"`）
 
