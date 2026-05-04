@@ -68,9 +68,32 @@ type EndpointConfig struct {
 	Script      string `json:"script"`
 	HTML        string `json:"html"`
 	Path        string `json:"path,omitempty"`
+	ParamCheck  string `json:"paramCheck,omitempty"`
+	OutCheck    string `json:"outCheck,omitempty"`
 	ConnectURL  string `json:"connectURL,omitempty"`
 	Description string `json:"description"`
 	Push        string `json:"push,omitempty"`
+}
+
+func (e *EndpointConfig) UnmarshalJSON(data []byte) error {
+	type endpointConfigAlias EndpointConfig
+	var raw struct {
+		endpointConfigAlias
+		ParamCheckLower string `json:"paramcheck"`
+		OutCheckLower   string `json:"outcheck"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*e = EndpointConfig(raw.endpointConfigAlias)
+	if strings.TrimSpace(e.ParamCheck) == "" {
+		e.ParamCheck = raw.ParamCheckLower
+	}
+	if strings.TrimSpace(e.OutCheck) == "" {
+		e.OutCheck = raw.OutCheckLower
+	}
+	return nil
 }
 
 type APIConfig map[string]EndpointConfig
@@ -112,6 +135,19 @@ type JSONRPCError struct {
 	Code    int         `json:"code"`
 	Message string      `json:"message"`
 	Data    interface{} `json:"data,omitempty"`
+}
+
+type ParamCheckResponse struct {
+	Success bool        `json:"success"`
+	Status  int         `json:"status"`
+	Result  interface{} `json:"result"`
+}
+
+type APIResponse struct {
+	Status      int
+	ContentType string
+	Headers     map[string]string
+	Body        []byte
 }
 
 // このシステムの設定
@@ -313,37 +349,10 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 	ginContext = c
 	defer func() { ginContext = nil }()
 
-	// リクエストのコンテンツタイプを取得
-	contentType := c.ContentType()
-
-	// リクエストパラメータの収集
-	allParams := make(map[string]interface{})
-	if contentType == "application/json" {
-		var requestData map[string]interface{}
-		if err := c.BindJSON(&requestData); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON data"})
-			return
-		}
-		for k, v := range requestData {
-			allParams[k] = v
-		}
-	}
-
-	// URLクエリパラメータとPOSTフォームパラメータを追加
-	c.Request.ParseForm()
-	for k, v := range c.Request.PostForm {
-		allParams[k] = v[0]
-	}
-	for k, v := range c.Request.URL.Query() {
-		allParams[k] = v[0]
-	}
-
-	if allParams["api"] == nil {
-		if c.Request.URL.Path != "/" {
-			allParams["api"] = c.Request.URL.Path
-		} else {
-			allParams["api"] = "html"
-		}
+	allParams, err := collectRequestParams(c, "")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON data"})
+		return
 	}
 
 	// スクリプトとHTMLファイルのパスを取得
@@ -353,6 +362,12 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 		htmlPath = resolvePath(exeDir, config.HTML)
 	}
 
+	if allowed, handled := runParamCheck(c, config, exeDir, htmlPath, allParams); handled {
+		return
+	} else if !allowed {
+		return
+	}
+
 	// scriptが空の場合、HTMLファイルの内容をそのまま返す
 	if config.Script == "" {
 		htmlContent, err := os.ReadFile(htmlPath)
@@ -360,7 +375,16 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load HTML file"})
 			return
 		}
-		c.Data(http.StatusOK, "text/html; charset=utf-8", htmlContent)
+		response := APIResponse{
+			Status:      http.StatusOK,
+			ContentType: "text/html; charset=utf-8",
+			Headers:     map[string]string{},
+			Body:        htmlContent,
+		}
+		if handled := runOutCheck(c, config, exeDir, htmlPath, allParams, response); handled {
+			return
+		}
+		writeAPIResponse(c, response)
 		return
 	}
 
@@ -371,15 +395,20 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 		return
 	}
 
-	if handled, err := writeJSResponse(c, resultValue); err != nil {
+	response, handledJSResponse, err := responseFromJSValue(resultValue)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	} else if handled {
 		return
 	}
 
-	// HTML出力として結果を返す
-	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(resultValue.String()))
+	if handled := runOutCheck(c, config, exeDir, htmlPath, allParams, response); handled {
+		return
+	}
+
+	writeAPIResponse(c, response)
+	if handledJSResponse {
+		return
+	}
 
 	// push 設定がある場合、対象のWebSocket接続に対してプッシュ
 	// API リクエスト完了後の push 処理
@@ -618,57 +647,253 @@ func runJavaScriptValue(scriptPath string, htmlPath string, allParams map[string
 	return value, nil
 }
 
-func writeJSResponse(c *gin.Context, value goja.Value) (bool, error) {
+func collectRequestParams(c *gin.Context, defaultAPI string) (map[string]interface{}, error) {
+	allParams := make(map[string]interface{})
+	if c.ContentType() == "application/json" {
+		var requestData map[string]interface{}
+		if err := c.ShouldBindJSON(&requestData); err != nil {
+			return nil, err
+		}
+		for key, value := range requestData {
+			allParams[key] = value
+		}
+	}
+
+	c.Request.ParseForm()
+	for key, value := range c.Request.PostForm {
+		allParams[key] = value[0]
+	}
+	for key, value := range c.Request.URL.Query() {
+		allParams[key] = value[0]
+	}
+
+	if allParams["api"] == nil {
+		if strings.TrimSpace(defaultAPI) != "" {
+			allParams["api"] = defaultAPI
+		} else if c.Request.URL.Path != "/" {
+			allParams["api"] = c.Request.URL.Path
+		} else {
+			allParams["api"] = "html"
+		}
+	}
+
+	return allParams, nil
+}
+
+func runParamCheck(c *gin.Context, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}) (bool, bool) {
+	checkOnly := isCheckOnlyMode(allParams)
+	paramCheckPath := strings.TrimSpace(config.ParamCheck)
+	if paramCheckPath == "" {
+		if checkOnly {
+			writeParamCheckResponse(c, ParamCheckResponse{
+				Success: true,
+				Status:  http.StatusOK,
+				Result:  nil,
+			})
+			return false, true
+		}
+		return true, false
+	}
+
+	c.Writer.Header().Set("Cache-Control", "no-store")
+	c.Writer.Header().Set("Pragma", "no-cache")
+
+	resultValue, err := runJavaScriptValue(resolvePath(exeDir, paramCheckPath), htmlPath, allParams)
+	if err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
+		return false, true
+	}
+
+	checkResponse, err := parseCheckResponse(resultValue, "paramCheck")
+	if err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
+		return false, true
+	}
+
+	allowed := checkResponse.Success && checkResponse.Status == http.StatusOK
+	if checkOnly || !allowed {
+		writeParamCheckResponse(c, checkResponse)
+		return allowed, true
+	}
+
+	return true, false
+}
+
+func isCheckOnlyMode(allParams map[string]interface{}) bool {
+	if allParams == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(allParams["nyan_mode"])), "checkOnly")
+}
+
+func runOutCheck(c *gin.Context, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}, response APIResponse) bool {
+	outCheckPath := strings.TrimSpace(config.OutCheck)
+	if outCheckPath == "" {
+		return false
+	}
+
+	checkParams := cloneParams(allParams)
+	checkParams["nyan_output"] = map[string]interface{}{
+		"status":          response.Status,
+		"contentType":     response.ContentType,
+		"headers":         response.Headers,
+		"body":            string(response.Body),
+		"bodyBase64":      base64.StdEncoding.EncodeToString(response.Body),
+		"bodyLength":      len(response.Body),
+		"bodyLengthBytes": len(response.Body),
+	}
+	checkParams["nyan_output_status"] = response.Status
+	checkParams["nyan_output_content_type"] = response.ContentType
+	checkParams["nyan_output_body"] = string(response.Body)
+	checkParams["nyan_output_body_base64"] = base64.StdEncoding.EncodeToString(response.Body)
+
+	resultValue, err := runJavaScriptValue(resolvePath(exeDir, outCheckPath), htmlPath, checkParams)
+	if err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
+		return true
+	}
+
+	checkResponse, err := parseCheckResponse(resultValue, "outCheck")
+	if err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
+		return true
+	}
+
+	if checkResponse.Success && checkResponse.Status == http.StatusOK {
+		return false
+	}
+
+	writeParamCheckResponse(c, checkResponse)
+	return true
+}
+
+func cloneParams(params map[string]interface{}) map[string]interface{} {
+	cloned := make(map[string]interface{}, len(params))
+	for key, value := range params {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func parseCheckResponse(value goja.Value, checkName string) (ParamCheckResponse, error) {
 	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
-		return false, nil
+		return ParamCheckResponse{}, fmt.Errorf("%s must return an object", checkName)
 	}
 
 	exported := value.Export()
 	respMap, ok := exported.(map[string]interface{})
 	if !ok {
-		return false, nil
+		if text, ok := exported.(string); ok {
+			if err := json.Unmarshal([]byte(text), &respMap); err != nil {
+				return ParamCheckResponse{}, fmt.Errorf("%s string response must be JSON: %w", checkName, err)
+			}
+		} else {
+			return ParamCheckResponse{}, fmt.Errorf("%s must return an object", checkName)
+		}
 	}
 
-	status := http.StatusOK
+	success, ok := respMap["success"].(bool)
+	if !ok {
+		return ParamCheckResponse{}, fmt.Errorf("%s response success must be boolean", checkName)
+	}
+
+	status, ok := parseStatusCode(respMap["status"])
+	if !ok {
+		return ParamCheckResponse{}, fmt.Errorf("%s response status must be a number", checkName)
+	}
+	if status < 100 || status > 599 {
+		return ParamCheckResponse{}, fmt.Errorf("%s response status is out of range: %d", checkName, status)
+	}
+
+	return ParamCheckResponse{
+		Success: success,
+		Status:  status,
+		Result:  respMap["result"],
+	}, nil
+}
+
+func newParamCheckError(status int, message string) ParamCheckResponse {
+	return ParamCheckResponse{
+		Success: false,
+		Status:  status,
+		Result: map[string]interface{}{
+			"message": message,
+		},
+	}
+}
+
+func writeParamCheckResponse(c *gin.Context, resp ParamCheckResponse) {
+	status := resp.Status
+	if status < 100 || status > 599 {
+		status = http.StatusInternalServerError
+		resp.Status = status
+	}
+	c.JSON(status, resp)
+}
+
+func responseFromJSValue(value goja.Value) (APIResponse, bool, error) {
+	response := APIResponse{
+		Status:      http.StatusOK,
+		ContentType: "text/html; charset=utf-8",
+		Headers:     map[string]string{},
+		Body:        []byte{},
+	}
+
+	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
+		return response, false, nil
+	}
+
+	exported := value.Export()
+	respMap, ok := exported.(map[string]interface{})
+	if !ok {
+		response.Body = []byte(value.String())
+		return response, false, nil
+	}
+
 	if rawStatus, ok := respMap["status"]; ok {
 		if parsed, ok := parseStatusCode(rawStatus); ok {
-			status = parsed
+			response.Status = parsed
 		}
 	}
 
-	contentType := ""
 	if rawContentType, ok := respMap["contentType"]; ok {
 		if s, ok := rawContentType.(string); ok {
-			contentType = s
+			response.ContentType = s
 		} else {
-			contentType = fmt.Sprint(rawContentType)
+			response.ContentType = fmt.Sprint(rawContentType)
 		}
 	}
 
-	headers := map[string]string{}
 	if rawHeaders, ok := respMap["headers"]; ok {
 		if headerMap, ok := rawHeaders.(map[string]interface{}); ok {
 			for key, value := range headerMap {
-				headers[key] = fmt.Sprint(value)
+				response.Headers[key] = fmt.Sprint(value)
 			}
 		}
 	}
 
 	bodyBytes, err := jsBodyToBytes(respMap["body"])
 	if err != nil {
-		return true, err
+		return response, true, err
 	}
+	response.Body = bodyBytes
+	return response, true, nil
+}
 
-	for key, value := range headers {
+func writeAPIResponse(c *gin.Context, response APIResponse) {
+	for key, value := range response.Headers {
 		c.Writer.Header().Set(key, value)
 	}
 
-	if strings.TrimSpace(contentType) == "" {
-		contentType = "text/html; charset=utf-8"
+	if strings.TrimSpace(response.ContentType) == "" {
+		response.ContentType = "text/html; charset=utf-8"
 	}
 
-	c.Data(status, contentType, bodyBytes)
-	return true, nil
+	if response.Status < 100 || response.Status > 599 {
+		response.Status = http.StatusInternalServerError
+	}
+
+	c.Data(response.Status, response.ContentType, response.Body)
 }
 
 func parseStatusCode(raw interface{}) (int, bool) {
@@ -749,6 +974,23 @@ func registerPublicEndpoint(r *gin.Engine, endpoint string, config EndpointConfi
 		}
 
 		requestedPath := strings.TrimPrefix(c.Param("filepath"), "/")
+		allParams, err := collectRequestParams(c, endpoint)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON data"})
+			return
+		}
+		allParams["nyan_public_endpoint"] = endpoint
+		allParams["nyan_public_path"] = requestedPath
+
+		ginContext = c
+		defer func() { ginContext = nil }()
+
+		if allowed, handled := runParamCheck(c, config, exeDir, "", allParams); handled {
+			return
+		} else if !allowed {
+			return
+		}
+
 		if requestedPath == "" || !filepath.IsLocal(requestedPath) {
 			c.Status(http.StatusNotFound)
 			return
@@ -767,6 +1009,23 @@ func registerPublicEndpoint(r *gin.Engine, endpoint string, config EndpointConfi
 		if fileInfo.IsDir() {
 			c.Status(http.StatusNotFound)
 			return
+		}
+
+		if strings.TrimSpace(config.OutCheck) != "" {
+			fileContent, err := os.ReadFile(filePath)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read public file"})
+				return
+			}
+			response := APIResponse{
+				Status:      http.StatusOK,
+				ContentType: http.DetectContentType(fileContent),
+				Headers:     map[string]string{},
+				Body:        fileContent,
+			}
+			if handled := runOutCheck(c, config, exeDir, "", allParams, response); handled {
+				return
+			}
 		}
 
 		c.File(filePath)
@@ -1405,6 +1664,9 @@ func nyanReadFileB64(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 
 func handleJSONRPC(c *gin.Context) {
 	log.Print("handleJSONRPC called")
+	ginContext = c
+	defer func() { ginContext = nil }()
+
 	// 1) リクエストボディを読み込み、JSONRPCRequest にパース
 	var rpcReq JSONRPCRequest
 	if err := c.ShouldBindJSON(&rpcReq); err != nil {
@@ -1463,6 +1725,12 @@ func handleJSONRPC(c *gin.Context) {
 	htmlPath := ""
 	if config.HTML != "" {
 		htmlPath = resolvePath(exeDir, config.HTML)
+	}
+
+	if allowed, handled := runParamCheck(c, config, exeDir, htmlPath, allParams); handled {
+		return
+	} else if !allowed {
+		return
 	}
 
 	// 7) メインのスクリプト実行（runJavaScript は既存関数）
