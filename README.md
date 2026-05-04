@@ -100,10 +100,14 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 * **script**: 実行する JavaScript ファイル（空文字列なら HTML のみ返却）
 * **html**: HTML ファイルパス
 * **path**: `type: "public"` で公開するフォルダパス
+* **paramCheck**: API 実行前に実行する JavaScript ファイル
+* **outCheck**: API 出力前に実行する JavaScript ファイル
 * **description**: 説明文
 * **push**: WebSocket で配信するエンドポイント名
 
-省略可能なフィールド: `script`, `push`。
+省略可能なフィールド: `script`, `paramCheck`, `outCheck`, `push`。
+
+`paramCheck` は `paramcheck`、`outCheck` は `outcheck` の小文字表記でも読み込めます。README では `paramCheck` / `outCheck` を推奨表記とします。
 
 ### public フォルダ公開（`type: "public"`）
 
@@ -120,6 +124,160 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 ```
 
 この例では `./public/app.js` を `http://localhost:8009/public/app.js` で取得できます。リクエスト先が実在するファイルではない場合は 404 を返します。フォルダへのアクセスでは `index.html` を探さず、ディレクトリ一覧も表示しません。
+
+### 実行前チェック（`paramCheck`）
+
+`paramCheck` を指定すると、通常 API の `script` 実行前、または `type: "public"` のファイル配信前に JavaScript を実行できます。
+
+```json
+{
+  "private-files": {
+    "type": "public",
+    "path": "./public/private",
+    "paramCheck": "./javascript/check_login.js",
+    "description": "認証付きファイル"
+  }
+}
+```
+
+通常 API にも同じように指定できます。
+
+```json
+{
+  "private-api": {
+    "script": "./javascript/private_api.js",
+    "html": "./html/private.html",
+    "paramCheck": "./javascript/check_login.js",
+    "description": "認証付きAPI"
+  }
+}
+```
+
+`paramCheck` は次の JSON 形式を返します。
+
+```js
+return {
+  success: true,
+  status: 200,
+  result: {}
+};
+```
+
+`success: true` かつ `status: 200` の場合だけ次の処理へ進みます。それ以外は `paramCheck` の結果を JSON として返します。HTTP ステータスも `status` の値になります。
+
+```js
+return {
+  success: false,
+  status: 401,
+  result: {
+    message: "login required"
+  }
+};
+```
+
+`nyan_mode=checkOnly` を指定した場合は `paramCheck` だけを実行し、成功時も本処理へ進まずチェック結果を返します。`paramCheck` 未設定の場合は次を返します。
+
+```json
+{
+  "success": true,
+  "status": 200,
+  "result": null
+}
+```
+
+`type: "public"` の `paramCheck` では、リクエストされた公開ファイルの情報を参照できます。
+
+```js
+var endpoint = nyanAllParams.nyan_public_endpoint; // 例: "public"
+var path = nyanAllParams.nyan_public_path;         // 例: "docs/a.txt"
+```
+
+絶対パスは渡しません。認証・認可判定には公開フォルダ内の相対パスを使ってください。
+
+### 出力前チェック（`outCheck`）
+
+`outCheck` を指定すると、通常 API の本体実行後、または `type: "public"` のファイル送信前に JavaScript を実行できます。`outCheck` が成功した場合は本体の実行結果をそのまま出力し、失敗した場合は `outCheck` の結果を JSON として出力します。
+
+```json
+{
+  "checked-api": {
+    "script": "./javascript/main.js",
+    "outCheck": "./javascript/out_check.js",
+    "description": "出力前チェック付きAPI"
+  }
+}
+```
+
+`type: "public"` にも指定できます。この場合、ファイル送信前にファイル内容を `outCheck` へ渡して検査します。
+
+```json
+{
+  "public": {
+    "type": "public",
+    "path": "./public",
+    "paramCheck": "./javascript/check_login.js",
+    "outCheck": "./javascript/out_check.js",
+    "description": "チェック付き public フォルダ"
+  }
+}
+```
+
+`outCheck` は `paramCheck` と同じ JSON 形式を返します。
+
+```js
+return {
+  success: true,
+  status: 200,
+  result: {}
+};
+```
+
+`success: true` かつ `status: 200` の場合だけ本体の実行結果をそのまま出力します。それ以外は `outCheck` の結果を JSON として返します。HTTP ステータスも `status` の値になります。
+
+本体の実行結果は `nyanAllParams.nyan_output` で参照できます。
+
+```js
+if (nyanAllParams.nyan_output.body.indexOf("expected") >= 0) {
+  return {
+    success: true,
+    status: 200,
+    result: {}
+  };
+}
+
+return {
+  success: false,
+  status: 409,
+  result: {
+    message: "output mismatch"
+  }
+};
+```
+
+`nyan_output` には `status`, `contentType`, `headers`, `body`, `bodyBase64`, `bodyLength` が入ります。互換用に `nyan_output_status`, `nyan_output_content_type`, `nyan_output_body`, `nyan_output_body_base64` も利用できます。
+
+`type: "public"` の `outCheck` でも、リクエストされた公開ファイル名を参照できます。
+
+```js
+var path = nyanAllParams.nyan_public_path;
+
+if (path === "test.txt" && nyanAllParams.nyan_output.body === "expected") {
+  return {
+    success: true,
+    status: 200,
+    result: {}
+  };
+}
+
+return {
+  success: false,
+  status: 409,
+  result: {
+    message: "file output mismatch",
+    path: path
+  }
+};
+```
 
 ### WebSocket レシーバー（`type: "ws_client"`）
 

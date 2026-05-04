@@ -2,7 +2,8 @@
   "html": {
     "script": "./javascript/html.js",
     "html": "./html/index.html",
-    "description": "トップページです"
+    "description": "トップページです",
+    "outcheck": "./javascript/sample_outcheck.js"
   },
   "wf": {
     "html": "./html/wf_html.html",
