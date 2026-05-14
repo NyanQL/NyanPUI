@@ -64,15 +64,21 @@ type ErrorData struct {
 
 // EndpointConfig はエンドポイントの設定を表します。
 type EndpointConfig struct {
-	Type        string `json:"type,omitempty"`
-	Script      string `json:"script"`
-	HTML        string `json:"html"`
-	Path        string `json:"path,omitempty"`
-	ParamCheck  string `json:"paramCheck,omitempty"`
-	OutCheck    string `json:"outCheck,omitempty"`
-	ConnectURL  string `json:"connectURL,omitempty"`
-	Description string `json:"description"`
-	Push        string `json:"push,omitempty"`
+	Type        string        `json:"type,omitempty"`
+	Script      string        `json:"script"`
+	HTML        string        `json:"html"`
+	Path        string        `json:"path,omitempty"`
+	ParamCheck  string        `json:"paramCheck,omitempty"`
+	OutCheck    string        `json:"outCheck,omitempty"`
+	ConnectURL  string        `json:"connectURL,omitempty"`
+	Trigger     TriggerConfig `json:"trigger,omitempty"`
+	Description string        `json:"description"`
+	Push        string        `json:"push,omitempty"`
+}
+
+type TriggerConfig struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
 }
 
 func (e *EndpointConfig) UnmarshalJSON(data []byte) error {
@@ -226,6 +232,9 @@ func main() {
 	if err := startWebSocketClients(exeDir); err != nil {
 		log.Printf("Failed to start WebSocket clients: %v", err)
 	}
+	if err := startScheduleJobs(exeDir); err != nil {
+		log.Printf("Failed to start schedule jobs: %v", err)
+	}
 
 	gin.DisableConsoleColor()
 	r := gin.Default()
@@ -245,6 +254,8 @@ func main() {
 		switch strings.TrimSpace(config.Type) {
 		case apiTypeWSClient:
 			continue
+		case apiTypeSchedule:
+			continue
 		case apiTypePublic:
 			registerPublicEndpoint(r, endpoint, config, exeDir)
 			continue
@@ -259,6 +270,10 @@ func main() {
 		apiName := c.Query("api")
 		if apiName != "" {
 			if config, ok := apiConfig[apiName]; ok {
+				if strings.TrimSpace(config.Type) == apiTypeSchedule {
+					c.JSON(http.StatusNotFound, gin.H{"error": "API not found"})
+					return
+				}
 				handleAPIRequestOrWebSocket(c, config)
 				return
 			} else {
@@ -552,6 +567,9 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (interf
 	}
 	if strings.TrimSpace(apiCfg.Type) == apiTypeWSClient {
 		return nil, fmt.Errorf("API %s is ws_client and cannot be called by nyanCallMe", apiName)
+	}
+	if strings.TrimSpace(apiCfg.Type) == apiTypeSchedule {
+		return nil, fmt.Errorf("API %s is schedule and cannot be called by nyanCallMe", apiName)
 	}
 	if strings.TrimSpace(apiCfg.Script) == "" {
 		return nil, fmt.Errorf("script not found for API %s", apiName)
@@ -952,6 +970,7 @@ func jsBodyToBytes(body interface{}) ([]byte, error) {
 const (
 	apiTypeWSClient = "ws_client"
 	apiTypePublic   = "public"
+	apiTypeSchedule = "schedule"
 )
 
 func registerPublicEndpoint(r *gin.Engine, endpoint string, config EndpointConfig, exeDir string) {
@@ -1042,6 +1061,252 @@ type wsClientConfig struct {
 	scriptPath  string
 	connectURL  string
 	description string
+}
+
+type scheduleJobConfig struct {
+	name        string
+	scriptPath  string
+	trigger     TriggerConfig
+	description string
+	schedule    cronSchedule
+}
+
+type cronSchedule struct {
+	minutes     cronField
+	hours       cronField
+	days        cronField
+	months      cronField
+	weekdays    cronField
+	dayStar     bool
+	weekdayStar bool
+}
+
+type cronField map[int]bool
+
+func parseCronSchedule(expr string) (cronSchedule, error) {
+	fields := strings.Fields(expr)
+	if len(fields) != 5 {
+		return cronSchedule{}, fmt.Errorf("cron expression must have 5 fields")
+	}
+
+	minutes, _, err := parseCronField(fields[0], 0, 59, false)
+	if err != nil {
+		return cronSchedule{}, fmt.Errorf("minute field: %w", err)
+	}
+	hours, _, err := parseCronField(fields[1], 0, 23, false)
+	if err != nil {
+		return cronSchedule{}, fmt.Errorf("hour field: %w", err)
+	}
+	days, dayStar, err := parseCronField(fields[2], 1, 31, false)
+	if err != nil {
+		return cronSchedule{}, fmt.Errorf("day field: %w", err)
+	}
+	months, _, err := parseCronField(fields[3], 1, 12, false)
+	if err != nil {
+		return cronSchedule{}, fmt.Errorf("month field: %w", err)
+	}
+	weekdays, weekdayStar, err := parseCronField(fields[4], 0, 7, true)
+	if err != nil {
+		return cronSchedule{}, fmt.Errorf("weekday field: %w", err)
+	}
+
+	return cronSchedule{
+		minutes:     minutes,
+		hours:       hours,
+		days:        days,
+		months:      months,
+		weekdays:    weekdays,
+		dayStar:     dayStar,
+		weekdayStar: weekdayStar,
+	}, nil
+}
+
+func parseCronField(field string, minValue, maxValue int, normalizeSunday bool) (cronField, bool, error) {
+	values := make(cronField)
+	isStar := field == "*"
+	for _, part := range strings.Split(field, ",") {
+		if part == "" {
+			return nil, false, fmt.Errorf("empty list item")
+		}
+
+		step := 1
+		base := part
+		if strings.Contains(part, "/") {
+			stepParts := strings.Split(part, "/")
+			if len(stepParts) != 2 || stepParts[0] == "" || stepParts[1] == "" {
+				return nil, false, fmt.Errorf("invalid step %q", part)
+			}
+			base = stepParts[0]
+			parsedStep, err := strconv.Atoi(stepParts[1])
+			if err != nil || parsedStep <= 0 {
+				return nil, false, fmt.Errorf("invalid step %q", part)
+			}
+			step = parsedStep
+		}
+
+		start, end, err := cronRange(base, minValue, maxValue)
+		if err != nil {
+			return nil, false, err
+		}
+		for value := start; value <= end; value += step {
+			normalized := value
+			if normalizeSunday && normalized == 7 {
+				normalized = 0
+			}
+			values[normalized] = true
+		}
+	}
+
+	return values, isStar, nil
+}
+
+func cronRange(base string, minValue, maxValue int) (int, int, error) {
+	if base == "*" {
+		return minValue, maxValue, nil
+	}
+	if strings.Contains(base, "-") {
+		rangeParts := strings.Split(base, "-")
+		if len(rangeParts) != 2 || rangeParts[0] == "" || rangeParts[1] == "" {
+			return 0, 0, fmt.Errorf("invalid range %q", base)
+		}
+		start, err := strconv.Atoi(rangeParts[0])
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid range start %q", base)
+		}
+		end, err := strconv.Atoi(rangeParts[1])
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid range end %q", base)
+		}
+		if start > end {
+			return 0, 0, fmt.Errorf("range start is greater than end %q", base)
+		}
+		if start < minValue || end > maxValue {
+			return 0, 0, fmt.Errorf("range %q is out of bounds %d-%d", base, minValue, maxValue)
+		}
+		return start, end, nil
+	}
+
+	value, err := strconv.Atoi(base)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid value %q", base)
+	}
+	if value < minValue || value > maxValue {
+		return 0, 0, fmt.Errorf("value %q is out of bounds %d-%d", base, minValue, maxValue)
+	}
+	return value, value, nil
+}
+
+func (s cronSchedule) next(after time.Time) time.Time {
+	next := after.Truncate(time.Minute).Add(time.Minute)
+	limit := next.AddDate(5, 0, 0)
+	for next.Before(limit) {
+		if s.matches(next) {
+			return next
+		}
+		next = next.Add(time.Minute)
+	}
+	return time.Time{}
+}
+
+func (s cronSchedule) matches(t time.Time) bool {
+	weekday := int(t.Weekday())
+	dayMatches := s.days[t.Day()]
+	weekdayMatches := s.weekdays[weekday]
+	switch {
+	case !s.dayStar && !s.weekdayStar:
+		if !dayMatches && !weekdayMatches {
+			return false
+		}
+	case !dayMatches || !weekdayMatches:
+		return false
+	}
+
+	return s.minutes[t.Minute()] &&
+		s.hours[t.Hour()] &&
+		s.months[int(t.Month())]
+}
+
+func startScheduleJobs(execDir string) error {
+	var firstErr error
+	for name, cfg := range apiConfig {
+		if strings.TrimSpace(cfg.Type) != apiTypeSchedule {
+			continue
+		}
+
+		scriptPath := strings.TrimSpace(cfg.Script)
+		trigger := cfg.Trigger
+		trigger.Type = strings.TrimSpace(trigger.Type)
+		trigger.Value = strings.TrimSpace(trigger.Value)
+
+		if scriptPath == "" {
+			err := fmt.Errorf("schedule %s: script is missing", name)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if trigger.Type != "cron" {
+			err := fmt.Errorf("schedule %s: unsupported trigger type %q", name, trigger.Type)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		schedule, err := parseCronSchedule(trigger.Value)
+		if err != nil {
+			err = fmt.Errorf("schedule %s: invalid cron trigger %q: %w", name, trigger.Value, err)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		jobCfg := scheduleJobConfig{
+			name:        name,
+			scriptPath:  resolvePath(execDir, scriptPath),
+			trigger:     trigger,
+			description: cfg.Description,
+			schedule:    schedule,
+		}
+
+		log.Printf("Starting schedule job %s with cron %q", jobCfg.name, jobCfg.trigger.Value)
+		go runScheduleJob(jobCfg)
+	}
+
+	return firstErr
+}
+
+func runScheduleJob(cfg scheduleJobConfig) {
+	for {
+		next := cfg.schedule.next(time.Now())
+		if next.IsZero() {
+			log.Printf("Schedule job %s has no next run time", cfg.name)
+			return
+		}
+
+		log.Printf("Schedule job %s next run at %s", cfg.name, next.Format(time.RFC3339))
+		timer := time.NewTimer(time.Until(next))
+		<-timer.C
+
+		allParams := map[string]interface{}{
+			"api":                        cfg.name,
+			"nyan_job_name":              cfg.name,
+			"nyan_schedule_trigger_type": cfg.trigger.Type,
+			"nyan_schedule_trigger":      cfg.trigger.Value,
+			"nyan_schedule_time":         next.Format(time.RFC3339),
+			"nyan_schedule_description":  cfg.description,
+		}
+		result, err := runJavaScript(cfg.scriptPath, "", allParams)
+		if err != nil {
+			log.Printf("Schedule job %s failed: %v", cfg.name, err)
+			continue
+		}
+		log.Printf("Schedule job %s completed: %s", cfg.name, result)
+	}
 }
 
 // connectURL が env:XXXX 形式なら環境変数 XXXX で解決する。空や未設定はエラー。
@@ -1588,6 +1853,9 @@ func cp932ToUTF8(data []byte) (string, error) {
 func handleNyan(c *gin.Context) {
 	apis := make(map[string]ApiData)
 	for apiName, cfg := range apiConfig {
+		if strings.TrimSpace(cfg.Type) == apiTypeSchedule {
+			continue
+		}
 		apis[apiName] = ApiData{
 			Description: cfg.Description,
 			Push:        cfg.Push,
@@ -1695,6 +1963,10 @@ func handleJSONRPC(c *gin.Context) {
 	// 3) api.json から、リクエストされたAPI設定を取得
 	config, exists := apiConfig[rpcReq.Method]
 	if !exists {
+		respondJSONRPCError(c, rpcReq.ID, -32601, fmt.Sprintf("API not found: %s", rpcReq.Method), nil)
+		return
+	}
+	if strings.TrimSpace(config.Type) == apiTypeSchedule {
 		respondJSONRPCError(c, rpcReq.ID, -32601, fmt.Sprintf("API not found: %s", rpcReq.Method), nil)
 		return
 	}
