@@ -64,12 +64,42 @@ type ErrorData struct {
 
 // EndpointConfig はエンドポイントの設定を表します。
 type EndpointConfig struct {
-	Type        string `json:"type,omitempty"`
-	Script      string `json:"script"`
-	HTML        string `json:"html"`
-	ConnectURL  string `json:"connectURL,omitempty"`
-	Description string `json:"description"`
-	Push        string `json:"push,omitempty"`
+	Type        string        `json:"type,omitempty"`
+	Script      string        `json:"script"`
+	HTML        string        `json:"html"`
+	Path        string        `json:"path,omitempty"`
+	ParamCheck  string        `json:"paramCheck,omitempty"`
+	OutCheck    string        `json:"outCheck,omitempty"`
+	ConnectURL  string        `json:"connectURL,omitempty"`
+	Trigger     TriggerConfig `json:"trigger,omitempty"`
+	Description string        `json:"description"`
+	Push        string        `json:"push,omitempty"`
+}
+
+type TriggerConfig struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
+}
+
+func (e *EndpointConfig) UnmarshalJSON(data []byte) error {
+	type endpointConfigAlias EndpointConfig
+	var raw struct {
+		endpointConfigAlias
+		ParamCheckLower string `json:"paramcheck"`
+		OutCheckLower   string `json:"outcheck"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	*e = EndpointConfig(raw.endpointConfigAlias)
+	if strings.TrimSpace(e.ParamCheck) == "" {
+		e.ParamCheck = raw.ParamCheckLower
+	}
+	if strings.TrimSpace(e.OutCheck) == "" {
+		e.OutCheck = raw.OutCheckLower
+	}
+	return nil
 }
 
 type APIConfig map[string]EndpointConfig
@@ -113,11 +143,24 @@ type JSONRPCError struct {
 	Data    interface{} `json:"data,omitempty"`
 }
 
+type ParamCheckResponse struct {
+	Success bool        `json:"success"`
+	Status  int         `json:"status"`
+	Result  interface{} `json:"result"`
+}
+
+type APIResponse struct {
+	Status      int
+	ContentType string
+	Headers     map[string]string
+	Body        []byte
+}
+
 // このシステムの設定
 var globalConfig Config
 
 // ビルド時に -ldflags "-X main.buildVersion=..." で上書き可能
-var buildVersion = "v0.0.12"
+var buildVersion = "v0.0.13"
 
 // api.jsonから取得する設定
 var apiConfig APIConfig
@@ -189,6 +232,9 @@ func main() {
 	if err := startWebSocketClients(exeDir); err != nil {
 		log.Printf("Failed to start WebSocket clients: %v", err)
 	}
+	if err := startScheduleJobs(exeDir); err != nil {
+		log.Printf("Failed to start schedule jobs: %v", err)
+	}
 
 	gin.DisableConsoleColor()
 	r := gin.Default()
@@ -205,7 +251,13 @@ func main() {
 	// 各APIエンドポイントを設定
 	for endpoint := range apiConfig {
 		config := apiConfig[endpoint] // ループ変数をローカル変数にコピー
-		if strings.TrimSpace(config.Type) == apiTypeWSClient {
+		switch strings.TrimSpace(config.Type) {
+		case apiTypeWSClient:
+			continue
+		case apiTypeSchedule:
+			continue
+		case apiTypePublic:
+			registerPublicEndpoint(r, endpoint, config, exeDir)
 			continue
 		}
 		r.Any("/"+endpoint, func(c *gin.Context) {
@@ -218,6 +270,10 @@ func main() {
 		apiName := c.Query("api")
 		if apiName != "" {
 			if config, ok := apiConfig[apiName]; ok {
+				if strings.TrimSpace(config.Type) == apiTypeSchedule {
+					c.JSON(http.StatusNotFound, gin.H{"error": "API not found"})
+					return
+				}
 				handleAPIRequestOrWebSocket(c, config)
 				return
 			} else {
@@ -308,37 +364,10 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 	ginContext = c
 	defer func() { ginContext = nil }()
 
-	// リクエストのコンテンツタイプを取得
-	contentType := c.ContentType()
-
-	// リクエストパラメータの収集
-	allParams := make(map[string]interface{})
-	if contentType == "application/json" {
-		var requestData map[string]interface{}
-		if err := c.BindJSON(&requestData); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON data"})
-			return
-		}
-		for k, v := range requestData {
-			allParams[k] = v
-		}
-	}
-
-	// URLクエリパラメータとPOSTフォームパラメータを追加
-	c.Request.ParseForm()
-	for k, v := range c.Request.PostForm {
-		allParams[k] = v[0]
-	}
-	for k, v := range c.Request.URL.Query() {
-		allParams[k] = v[0]
-	}
-
-	if allParams["api"] == nil {
-		if c.Request.URL.Path != "/" {
-			allParams["api"] = c.Request.URL.Path
-		} else {
-			allParams["api"] = "html"
-		}
+	allParams, err := collectRequestParams(c, "")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON data"})
+		return
 	}
 
 	// スクリプトとHTMLファイルのパスを取得
@@ -348,6 +377,12 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 		htmlPath = resolvePath(exeDir, config.HTML)
 	}
 
+	if allowed, handled := runParamCheck(c, config, exeDir, htmlPath, allParams); handled {
+		return
+	} else if !allowed {
+		return
+	}
+
 	// scriptが空の場合、HTMLファイルの内容をそのまま返す
 	if config.Script == "" {
 		htmlContent, err := os.ReadFile(htmlPath)
@@ -355,7 +390,16 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load HTML file"})
 			return
 		}
-		c.Data(http.StatusOK, "text/html; charset=utf-8", htmlContent)
+		response := APIResponse{
+			Status:      http.StatusOK,
+			ContentType: "text/html; charset=utf-8",
+			Headers:     map[string]string{},
+			Body:        htmlContent,
+		}
+		if handled := runOutCheck(c, config, exeDir, htmlPath, allParams, response); handled {
+			return
+		}
+		writeAPIResponse(c, response)
 		return
 	}
 
@@ -366,15 +410,20 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 		return
 	}
 
-	if handled, err := writeJSResponse(c, resultValue); err != nil {
+	response, handledJSResponse, err := responseFromJSValue(resultValue)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	} else if handled {
 		return
 	}
 
-	// HTML出力として結果を返す
-	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(resultValue.String()))
+	if handled := runOutCheck(c, config, exeDir, htmlPath, allParams, response); handled {
+		return
+	}
+
+	writeAPIResponse(c, response)
+	if handledJSResponse {
+		return
+	}
 
 	// push 設定がある場合、対象のWebSocket接続に対してプッシュ
 	// API リクエスト完了後の push 処理
@@ -519,6 +568,9 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (interf
 	if strings.TrimSpace(apiCfg.Type) == apiTypeWSClient {
 		return nil, fmt.Errorf("API %s is ws_client and cannot be called by nyanCallMe", apiName)
 	}
+	if strings.TrimSpace(apiCfg.Type) == apiTypeSchedule {
+		return nil, fmt.Errorf("API %s is schedule and cannot be called by nyanCallMe", apiName)
+	}
 	if strings.TrimSpace(apiCfg.Script) == "" {
 		return nil, fmt.Errorf("script not found for API %s", apiName)
 	}
@@ -613,57 +665,253 @@ func runJavaScriptValue(scriptPath string, htmlPath string, allParams map[string
 	return value, nil
 }
 
-func writeJSResponse(c *gin.Context, value goja.Value) (bool, error) {
+func collectRequestParams(c *gin.Context, defaultAPI string) (map[string]interface{}, error) {
+	allParams := make(map[string]interface{})
+	if c.ContentType() == "application/json" {
+		var requestData map[string]interface{}
+		if err := c.ShouldBindJSON(&requestData); err != nil {
+			return nil, err
+		}
+		for key, value := range requestData {
+			allParams[key] = value
+		}
+	}
+
+	c.Request.ParseForm()
+	for key, value := range c.Request.PostForm {
+		allParams[key] = value[0]
+	}
+	for key, value := range c.Request.URL.Query() {
+		allParams[key] = value[0]
+	}
+
+	if allParams["api"] == nil {
+		if strings.TrimSpace(defaultAPI) != "" {
+			allParams["api"] = defaultAPI
+		} else if c.Request.URL.Path != "/" {
+			allParams["api"] = c.Request.URL.Path
+		} else {
+			allParams["api"] = "html"
+		}
+	}
+
+	return allParams, nil
+}
+
+func runParamCheck(c *gin.Context, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}) (bool, bool) {
+	checkOnly := isCheckOnlyMode(allParams)
+	paramCheckPath := strings.TrimSpace(config.ParamCheck)
+	if paramCheckPath == "" {
+		if checkOnly {
+			writeParamCheckResponse(c, ParamCheckResponse{
+				Success: true,
+				Status:  http.StatusOK,
+				Result:  nil,
+			})
+			return false, true
+		}
+		return true, false
+	}
+
+	c.Writer.Header().Set("Cache-Control", "no-store")
+	c.Writer.Header().Set("Pragma", "no-cache")
+
+	resultValue, err := runJavaScriptValue(resolvePath(exeDir, paramCheckPath), htmlPath, allParams)
+	if err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
+		return false, true
+	}
+
+	checkResponse, err := parseCheckResponse(resultValue, "paramCheck")
+	if err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
+		return false, true
+	}
+
+	allowed := checkResponse.Success && checkResponse.Status == http.StatusOK
+	if checkOnly || !allowed {
+		writeParamCheckResponse(c, checkResponse)
+		return allowed, true
+	}
+
+	return true, false
+}
+
+func isCheckOnlyMode(allParams map[string]interface{}) bool {
+	if allParams == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(allParams["nyan_mode"])), "checkOnly")
+}
+
+func runOutCheck(c *gin.Context, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}, response APIResponse) bool {
+	outCheckPath := strings.TrimSpace(config.OutCheck)
+	if outCheckPath == "" {
+		return false
+	}
+
+	checkParams := cloneParams(allParams)
+	checkParams["nyan_output"] = map[string]interface{}{
+		"status":          response.Status,
+		"contentType":     response.ContentType,
+		"headers":         response.Headers,
+		"body":            string(response.Body),
+		"bodyBase64":      base64.StdEncoding.EncodeToString(response.Body),
+		"bodyLength":      len(response.Body),
+		"bodyLengthBytes": len(response.Body),
+	}
+	checkParams["nyan_output_status"] = response.Status
+	checkParams["nyan_output_content_type"] = response.ContentType
+	checkParams["nyan_output_body"] = string(response.Body)
+	checkParams["nyan_output_body_base64"] = base64.StdEncoding.EncodeToString(response.Body)
+
+	resultValue, err := runJavaScriptValue(resolvePath(exeDir, outCheckPath), htmlPath, checkParams)
+	if err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
+		return true
+	}
+
+	checkResponse, err := parseCheckResponse(resultValue, "outCheck")
+	if err != nil {
+		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
+		return true
+	}
+
+	if checkResponse.Success && checkResponse.Status == http.StatusOK {
+		return false
+	}
+
+	writeParamCheckResponse(c, checkResponse)
+	return true
+}
+
+func cloneParams(params map[string]interface{}) map[string]interface{} {
+	cloned := make(map[string]interface{}, len(params))
+	for key, value := range params {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func parseCheckResponse(value goja.Value, checkName string) (ParamCheckResponse, error) {
 	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
-		return false, nil
+		return ParamCheckResponse{}, fmt.Errorf("%s must return an object", checkName)
 	}
 
 	exported := value.Export()
 	respMap, ok := exported.(map[string]interface{})
 	if !ok {
-		return false, nil
+		if text, ok := exported.(string); ok {
+			if err := json.Unmarshal([]byte(text), &respMap); err != nil {
+				return ParamCheckResponse{}, fmt.Errorf("%s string response must be JSON: %w", checkName, err)
+			}
+		} else {
+			return ParamCheckResponse{}, fmt.Errorf("%s must return an object", checkName)
+		}
 	}
 
-	status := http.StatusOK
+	success, ok := respMap["success"].(bool)
+	if !ok {
+		return ParamCheckResponse{}, fmt.Errorf("%s response success must be boolean", checkName)
+	}
+
+	status, ok := parseStatusCode(respMap["status"])
+	if !ok {
+		return ParamCheckResponse{}, fmt.Errorf("%s response status must be a number", checkName)
+	}
+	if status < 100 || status > 599 {
+		return ParamCheckResponse{}, fmt.Errorf("%s response status is out of range: %d", checkName, status)
+	}
+
+	return ParamCheckResponse{
+		Success: success,
+		Status:  status,
+		Result:  respMap["result"],
+	}, nil
+}
+
+func newParamCheckError(status int, message string) ParamCheckResponse {
+	return ParamCheckResponse{
+		Success: false,
+		Status:  status,
+		Result: map[string]interface{}{
+			"message": message,
+		},
+	}
+}
+
+func writeParamCheckResponse(c *gin.Context, resp ParamCheckResponse) {
+	status := resp.Status
+	if status < 100 || status > 599 {
+		status = http.StatusInternalServerError
+		resp.Status = status
+	}
+	c.JSON(status, resp)
+}
+
+func responseFromJSValue(value goja.Value) (APIResponse, bool, error) {
+	response := APIResponse{
+		Status:      http.StatusOK,
+		ContentType: "text/html; charset=utf-8",
+		Headers:     map[string]string{},
+		Body:        []byte{},
+	}
+
+	if value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
+		return response, false, nil
+	}
+
+	exported := value.Export()
+	respMap, ok := exported.(map[string]interface{})
+	if !ok {
+		response.Body = []byte(value.String())
+		return response, false, nil
+	}
+
 	if rawStatus, ok := respMap["status"]; ok {
 		if parsed, ok := parseStatusCode(rawStatus); ok {
-			status = parsed
+			response.Status = parsed
 		}
 	}
 
-	contentType := ""
 	if rawContentType, ok := respMap["contentType"]; ok {
 		if s, ok := rawContentType.(string); ok {
-			contentType = s
+			response.ContentType = s
 		} else {
-			contentType = fmt.Sprint(rawContentType)
+			response.ContentType = fmt.Sprint(rawContentType)
 		}
 	}
 
-	headers := map[string]string{}
 	if rawHeaders, ok := respMap["headers"]; ok {
 		if headerMap, ok := rawHeaders.(map[string]interface{}); ok {
 			for key, value := range headerMap {
-				headers[key] = fmt.Sprint(value)
+				response.Headers[key] = fmt.Sprint(value)
 			}
 		}
 	}
 
 	bodyBytes, err := jsBodyToBytes(respMap["body"])
 	if err != nil {
-		return true, err
+		return response, true, err
 	}
+	response.Body = bodyBytes
+	return response, true, nil
+}
 
-	for key, value := range headers {
+func writeAPIResponse(c *gin.Context, response APIResponse) {
+	for key, value := range response.Headers {
 		c.Writer.Header().Set(key, value)
 	}
 
-	if strings.TrimSpace(contentType) == "" {
-		contentType = "text/html; charset=utf-8"
+	if strings.TrimSpace(response.ContentType) == "" {
+		response.ContentType = "text/html; charset=utf-8"
 	}
 
-	c.Data(status, contentType, bodyBytes)
-	return true, nil
+	if response.Status < 100 || response.Status > 599 {
+		response.Status = http.StatusInternalServerError
+	}
+
+	c.Data(response.Status, response.ContentType, response.Body)
 }
 
 func parseStatusCode(raw interface{}) (int, bool) {
@@ -719,13 +967,346 @@ func jsBodyToBytes(body interface{}) ([]byte, error) {
 	}
 }
 
-const apiTypeWSClient = "ws_client"
+const (
+	apiTypeWSClient = "ws_client"
+	apiTypePublic   = "public"
+	apiTypeSchedule = "schedule"
+)
+
+func registerPublicEndpoint(r *gin.Engine, endpoint string, config EndpointConfig, exeDir string) {
+	routePath := "/" + strings.Trim(strings.TrimSpace(endpoint), "/")
+	if routePath == "/" {
+		log.Printf("public endpoint %q is invalid: endpoint name must not be empty", endpoint)
+		return
+	}
+
+	publicPath := strings.TrimSpace(config.Path)
+	if publicPath == "" {
+		log.Printf("public endpoint %s: path is missing", endpoint)
+	}
+
+	basePath := resolvePath(exeDir, publicPath)
+	handler := func(c *gin.Context) {
+		if publicPath == "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "public path is missing"})
+			return
+		}
+
+		requestedPath := strings.TrimPrefix(c.Param("filepath"), "/")
+		allParams, err := collectRequestParams(c, endpoint)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON data"})
+			return
+		}
+		allParams["nyan_public_endpoint"] = endpoint
+		allParams["nyan_public_path"] = requestedPath
+
+		ginContext = c
+		defer func() { ginContext = nil }()
+
+		if allowed, handled := runParamCheck(c, config, exeDir, "", allParams); handled {
+			return
+		} else if !allowed {
+			return
+		}
+
+		if requestedPath == "" || !filepath.IsLocal(requestedPath) {
+			c.Status(http.StatusNotFound)
+			return
+		}
+
+		filePath := filepath.Join(basePath, requestedPath)
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read public file"})
+			return
+		}
+		if fileInfo.IsDir() {
+			c.Status(http.StatusNotFound)
+			return
+		}
+
+		if strings.TrimSpace(config.OutCheck) != "" {
+			fileContent, err := os.ReadFile(filePath)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read public file"})
+				return
+			}
+			response := APIResponse{
+				Status:      http.StatusOK,
+				ContentType: http.DetectContentType(fileContent),
+				Headers:     map[string]string{},
+				Body:        fileContent,
+			}
+			if handled := runOutCheck(c, config, exeDir, "", allParams, response); handled {
+				return
+			}
+		}
+
+		c.File(filePath)
+	}
+
+	r.GET(routePath, handler)
+	r.HEAD(routePath, handler)
+	r.GET(routePath+"/*filepath", handler)
+	r.HEAD(routePath+"/*filepath", handler)
+}
 
 type wsClientConfig struct {
 	name        string
 	scriptPath  string
 	connectURL  string
 	description string
+}
+
+type scheduleJobConfig struct {
+	name        string
+	scriptPath  string
+	trigger     TriggerConfig
+	description string
+	schedule    cronSchedule
+}
+
+type cronSchedule struct {
+	minutes     cronField
+	hours       cronField
+	days        cronField
+	months      cronField
+	weekdays    cronField
+	dayStar     bool
+	weekdayStar bool
+}
+
+type cronField map[int]bool
+
+func parseCronSchedule(expr string) (cronSchedule, error) {
+	fields := strings.Fields(expr)
+	if len(fields) != 5 {
+		return cronSchedule{}, fmt.Errorf("cron expression must have 5 fields")
+	}
+
+	minutes, _, err := parseCronField(fields[0], 0, 59, false)
+	if err != nil {
+		return cronSchedule{}, fmt.Errorf("minute field: %w", err)
+	}
+	hours, _, err := parseCronField(fields[1], 0, 23, false)
+	if err != nil {
+		return cronSchedule{}, fmt.Errorf("hour field: %w", err)
+	}
+	days, dayStar, err := parseCronField(fields[2], 1, 31, false)
+	if err != nil {
+		return cronSchedule{}, fmt.Errorf("day field: %w", err)
+	}
+	months, _, err := parseCronField(fields[3], 1, 12, false)
+	if err != nil {
+		return cronSchedule{}, fmt.Errorf("month field: %w", err)
+	}
+	weekdays, weekdayStar, err := parseCronField(fields[4], 0, 7, true)
+	if err != nil {
+		return cronSchedule{}, fmt.Errorf("weekday field: %w", err)
+	}
+
+	return cronSchedule{
+		minutes:     minutes,
+		hours:       hours,
+		days:        days,
+		months:      months,
+		weekdays:    weekdays,
+		dayStar:     dayStar,
+		weekdayStar: weekdayStar,
+	}, nil
+}
+
+func parseCronField(field string, minValue, maxValue int, normalizeSunday bool) (cronField, bool, error) {
+	values := make(cronField)
+	isStar := field == "*"
+	for _, part := range strings.Split(field, ",") {
+		if part == "" {
+			return nil, false, fmt.Errorf("empty list item")
+		}
+
+		step := 1
+		base := part
+		if strings.Contains(part, "/") {
+			stepParts := strings.Split(part, "/")
+			if len(stepParts) != 2 || stepParts[0] == "" || stepParts[1] == "" {
+				return nil, false, fmt.Errorf("invalid step %q", part)
+			}
+			base = stepParts[0]
+			parsedStep, err := strconv.Atoi(stepParts[1])
+			if err != nil || parsedStep <= 0 {
+				return nil, false, fmt.Errorf("invalid step %q", part)
+			}
+			step = parsedStep
+		}
+
+		start, end, err := cronRange(base, minValue, maxValue)
+		if err != nil {
+			return nil, false, err
+		}
+		for value := start; value <= end; value += step {
+			normalized := value
+			if normalizeSunday && normalized == 7 {
+				normalized = 0
+			}
+			values[normalized] = true
+		}
+	}
+
+	return values, isStar, nil
+}
+
+func cronRange(base string, minValue, maxValue int) (int, int, error) {
+	if base == "*" {
+		return minValue, maxValue, nil
+	}
+	if strings.Contains(base, "-") {
+		rangeParts := strings.Split(base, "-")
+		if len(rangeParts) != 2 || rangeParts[0] == "" || rangeParts[1] == "" {
+			return 0, 0, fmt.Errorf("invalid range %q", base)
+		}
+		start, err := strconv.Atoi(rangeParts[0])
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid range start %q", base)
+		}
+		end, err := strconv.Atoi(rangeParts[1])
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid range end %q", base)
+		}
+		if start > end {
+			return 0, 0, fmt.Errorf("range start is greater than end %q", base)
+		}
+		if start < minValue || end > maxValue {
+			return 0, 0, fmt.Errorf("range %q is out of bounds %d-%d", base, minValue, maxValue)
+		}
+		return start, end, nil
+	}
+
+	value, err := strconv.Atoi(base)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid value %q", base)
+	}
+	if value < minValue || value > maxValue {
+		return 0, 0, fmt.Errorf("value %q is out of bounds %d-%d", base, minValue, maxValue)
+	}
+	return value, value, nil
+}
+
+func (s cronSchedule) next(after time.Time) time.Time {
+	next := after.Truncate(time.Minute).Add(time.Minute)
+	limit := next.AddDate(5, 0, 0)
+	for next.Before(limit) {
+		if s.matches(next) {
+			return next
+		}
+		next = next.Add(time.Minute)
+	}
+	return time.Time{}
+}
+
+func (s cronSchedule) matches(t time.Time) bool {
+	weekday := int(t.Weekday())
+	dayMatches := s.days[t.Day()]
+	weekdayMatches := s.weekdays[weekday]
+	switch {
+	case !s.dayStar && !s.weekdayStar:
+		if !dayMatches && !weekdayMatches {
+			return false
+		}
+	case !dayMatches || !weekdayMatches:
+		return false
+	}
+
+	return s.minutes[t.Minute()] &&
+		s.hours[t.Hour()] &&
+		s.months[int(t.Month())]
+}
+
+func startScheduleJobs(execDir string) error {
+	var firstErr error
+	for name, cfg := range apiConfig {
+		if strings.TrimSpace(cfg.Type) != apiTypeSchedule {
+			continue
+		}
+
+		scriptPath := strings.TrimSpace(cfg.Script)
+		trigger := cfg.Trigger
+		trigger.Type = strings.TrimSpace(trigger.Type)
+		trigger.Value = strings.TrimSpace(trigger.Value)
+
+		if scriptPath == "" {
+			err := fmt.Errorf("schedule %s: script is missing", name)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if trigger.Type != "cron" {
+			err := fmt.Errorf("schedule %s: unsupported trigger type %q", name, trigger.Type)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		schedule, err := parseCronSchedule(trigger.Value)
+		if err != nil {
+			err = fmt.Errorf("schedule %s: invalid cron trigger %q: %w", name, trigger.Value, err)
+			log.Print(err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		jobCfg := scheduleJobConfig{
+			name:        name,
+			scriptPath:  resolvePath(execDir, scriptPath),
+			trigger:     trigger,
+			description: cfg.Description,
+			schedule:    schedule,
+		}
+
+		log.Printf("Starting schedule job %s with cron %q", jobCfg.name, jobCfg.trigger.Value)
+		go runScheduleJob(jobCfg)
+	}
+
+	return firstErr
+}
+
+func runScheduleJob(cfg scheduleJobConfig) {
+	for {
+		next := cfg.schedule.next(time.Now())
+		if next.IsZero() {
+			log.Printf("Schedule job %s has no next run time", cfg.name)
+			return
+		}
+
+		log.Printf("Schedule job %s next run at %s", cfg.name, next.Format(time.RFC3339))
+		timer := time.NewTimer(time.Until(next))
+		<-timer.C
+
+		allParams := map[string]interface{}{
+			"api":                        cfg.name,
+			"nyan_job_name":              cfg.name,
+			"nyan_schedule_trigger_type": cfg.trigger.Type,
+			"nyan_schedule_trigger":      cfg.trigger.Value,
+			"nyan_schedule_time":         next.Format(time.RFC3339),
+			"nyan_schedule_description":  cfg.description,
+		}
+		result, err := runJavaScript(cfg.scriptPath, "", allParams)
+		if err != nil {
+			log.Printf("Schedule job %s failed: %v", cfg.name, err)
+			continue
+		}
+		log.Printf("Schedule job %s completed: %s", cfg.name, result)
+	}
 }
 
 // connectURL が env:XXXX 形式なら環境変数 XXXX で解決する。空や未設定はエラー。
@@ -1272,6 +1853,9 @@ func cp932ToUTF8(data []byte) (string, error) {
 func handleNyan(c *gin.Context) {
 	apis := make(map[string]ApiData)
 	for apiName, cfg := range apiConfig {
+		if strings.TrimSpace(cfg.Type) == apiTypeSchedule {
+			continue
+		}
 		apis[apiName] = ApiData{
 			Description: cfg.Description,
 			Push:        cfg.Push,
@@ -1348,6 +1932,9 @@ func nyanReadFileB64(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 
 func handleJSONRPC(c *gin.Context) {
 	log.Print("handleJSONRPC called")
+	ginContext = c
+	defer func() { ginContext = nil }()
+
 	// 1) リクエストボディを読み込み、JSONRPCRequest にパース
 	var rpcReq JSONRPCRequest
 	if err := c.ShouldBindJSON(&rpcReq); err != nil {
@@ -1379,6 +1966,10 @@ func handleJSONRPC(c *gin.Context) {
 		respondJSONRPCError(c, rpcReq.ID, -32601, fmt.Sprintf("API not found: %s", rpcReq.Method), nil)
 		return
 	}
+	if strings.TrimSpace(config.Type) == apiTypeSchedule {
+		respondJSONRPCError(c, rpcReq.ID, -32601, fmt.Sprintf("API not found: %s", rpcReq.Method), nil)
+		return
+	}
 
 	// 4) JSON-RPC では HTML 出力は想定しないため、script が必須とする
 	if config.Script == "" {
@@ -1406,6 +1997,12 @@ func handleJSONRPC(c *gin.Context) {
 	htmlPath := ""
 	if config.HTML != "" {
 		htmlPath = resolvePath(exeDir, config.HTML)
+	}
+
+	if allowed, handled := runParamCheck(c, config, exeDir, htmlPath, allParams); handled {
+		return
+	} else if !allowed {
+		return
 	}
 
 	// 7) メインのスクリプト実行（runJavaScript は既存関数）

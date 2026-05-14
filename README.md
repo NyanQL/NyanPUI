@@ -5,6 +5,8 @@ NyanPUI(にゃんぷい)は、GoLangで作られたサーバーサイドレン�
 * **JavaScript エンジン**: Goja (ECMAScript 5.1 準拠) – [https://github.com/dop251/goja](https://github.com/dop251/goja)
 * **双方向通信**: gorilla/websocket による WebSocket
 * **プッシュ通知**: 特定エンドポイントの処理結果を WebSocket で配信
+* **定期実行**: `type: "schedule"` による cron 形式の JavaScript ジョブ
+* **CORS**: `Access-Control-Allow-Origin: *` を付与
 
 ## ライセンス
 
@@ -97,12 +99,191 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 }
 ```
 
+* **type**: 種別。省略時は通常 API、`public` は静的ファイル公開、`ws_client` は WebSocket クライアント、`schedule` は定期実行ジョブ
 * **script**: 実行する JavaScript ファイル（空文字列なら HTML のみ返却）
 * **html**: HTML ファイルパス
+* **path**: `type: "public"` で公開するフォルダパス
+* **trigger**: `type: "schedule"` で使う実行トリガー
+* **paramCheck**: API 実行前に実行する JavaScript ファイル
+* **outCheck**: API 出力前に実行する JavaScript ファイル
 * **description**: 説明文
 * **push**: WebSocket で配信するエンドポイント名
 
-省略可能なフィールド: `script`, `push`。
+省略可能なフィールド: `type`, `script`, `html`, `path`, `connectURL`, `trigger`, `paramCheck`, `outCheck`, `description`, `push`。
+
+`paramCheck` は `paramcheck`、`outCheck` は `outcheck` の小文字表記でも読み込めます。README では `paramCheck` / `outCheck` を推奨表記とします。
+
+通常 API は `GET`, `POST`, `PUT`, `DELETE` などのメソッドを受け付けます。`Content-Type: application/json` の JSON body、フォーム値、URL クエリを `nyanAllParams` にまとめて渡します。`api` が未指定の場合は、エンドポイントパスまたは `html` が入ります。
+
+### public フォルダ公開（`type: "public"`）
+
+`type: "public"` を指定すると、`path` のフォルダ配下にあるファイルをそのまま配信します。`path` は実行ファイルのあるディレクトリからの相対パス、または絶対パスで指定できます。
+
+```json
+{
+  "public": {
+    "type": "public",
+    "path": "./public",
+    "description": "public フォルダ"
+  }
+}
+```
+
+この例では `./public/app.js` を `http://localhost:8009/public/app.js` で取得できます。リクエスト先が実在するファイルではない場合は 404 を返します。フォルダへのアクセスでは `index.html` を探さず、ディレクトリ一覧も表示しません。
+
+### 実行前チェック（`paramCheck`）
+
+`paramCheck` を指定すると、通常 API の `script` 実行前、または `type: "public"` のファイル配信前に JavaScript を実行できます。
+
+```json
+{
+  "private-files": {
+    "type": "public",
+    "path": "./public/private",
+    "paramCheck": "./javascript/check_login.js",
+    "description": "認証付きファイル"
+  }
+}
+```
+
+通常 API にも同じように指定できます。
+
+```json
+{
+  "private-api": {
+    "script": "./javascript/private_api.js",
+    "html": "./html/private.html",
+    "paramCheck": "./javascript/check_login.js",
+    "description": "認証付きAPI"
+  }
+}
+```
+
+`paramCheck` は次の JSON 形式を返します。
+
+```js
+return {
+  success: true,
+  status: 200,
+  result: {}
+};
+```
+
+`success: true` かつ `status: 200` の場合だけ次の処理へ進みます。それ以外は `paramCheck` の結果を JSON として返します。HTTP ステータスも `status` の値になります。
+
+```js
+return {
+  success: false,
+  status: 401,
+  result: {
+    message: "login required"
+  }
+};
+```
+
+`nyan_mode=checkOnly` を指定した場合は `paramCheck` だけを実行し、成功時も本処理へ進まずチェック結果を返します。`paramCheck` 未設定の場合は次を返します。
+
+```json
+{
+  "success": true,
+  "status": 200,
+  "result": null
+}
+```
+
+`type: "public"` の `paramCheck` では、リクエストされた公開ファイルの情報を参照できます。
+
+```js
+var endpoint = nyanAllParams.nyan_public_endpoint; // 例: "public"
+var path = nyanAllParams.nyan_public_path;         // 例: "docs/a.txt"
+```
+
+絶対パスは渡しません。認証・認可判定には公開フォルダ内の相対パスを使ってください。
+
+### 出力前チェック（`outCheck`）
+
+`outCheck` を指定すると、通常 API の本体実行後、または `type: "public"` のファイル送信前に JavaScript を実行できます。`outCheck` が成功した場合は本体の実行結果をそのまま出力し、失敗した場合は `outCheck` の結果を JSON として出力します。
+
+```json
+{
+  "checked-api": {
+    "script": "./javascript/main.js",
+    "outCheck": "./javascript/out_check.js",
+    "description": "出力前チェック付きAPI"
+  }
+}
+```
+
+`type: "public"` にも指定できます。この場合、ファイル送信前にファイル内容を `outCheck` へ渡して検査します。
+
+```json
+{
+  "public": {
+    "type": "public",
+    "path": "./public",
+    "paramCheck": "./javascript/check_login.js",
+    "outCheck": "./javascript/out_check.js",
+    "description": "チェック付き public フォルダ"
+  }
+}
+```
+
+`outCheck` は `paramCheck` と同じ JSON 形式を返します。
+
+```js
+return {
+  success: true,
+  status: 200,
+  result: {}
+};
+```
+
+`success: true` かつ `status: 200` の場合だけ本体の実行結果をそのまま出力します。それ以外は `outCheck` の結果を JSON として返します。HTTP ステータスも `status` の値になります。
+
+本体の実行結果は `nyanAllParams.nyan_output` で参照できます。
+
+```js
+if (nyanAllParams.nyan_output.body.indexOf("expected") >= 0) {
+  return {
+    success: true,
+    status: 200,
+    result: {}
+  };
+}
+
+return {
+  success: false,
+  status: 409,
+  result: {
+    message: "output mismatch"
+  }
+};
+```
+
+`nyan_output` には `status`, `contentType`, `headers`, `body`, `bodyBase64`, `bodyLength` が入ります。互換用に `nyan_output_status`, `nyan_output_content_type`, `nyan_output_body`, `nyan_output_body_base64` も利用できます。
+
+`type: "public"` の `outCheck` でも、リクエストされた公開ファイル名を参照できます。
+
+```js
+var path = nyanAllParams.nyan_public_path;
+
+if (path === "test.txt" && nyanAllParams.nyan_output.body === "expected") {
+  return {
+    success: true,
+    status: 200,
+    result: {}
+  };
+}
+
+return {
+  success: false,
+  status: 409,
+  result: {
+    message: "file output mismatch",
+    path: path
+  }
+};
+```
 
 ### WebSocket レシーバー（`type: "ws_client"`）
 
@@ -121,6 +302,18 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 
 `connectURL` は `env:WS_URL` のように環境変数からも指定できます。
 
+受信したメッセージは `script` に渡され、次の値を `nyanAllParams` で参照できます。`script` の戻り値が空でない場合は、接続先 WebSocket にテキストメッセージとして返信します。切断時は 1 秒から最大 30 秒までの指数バックオフで再接続します。
+
+| キー | 内容 |
+| --- | --- |
+| `ws_client` | ws_client 名 |
+| `ws_message_type` | `text`, `binary`, `close`, `ping`, `pong` など |
+| `ws_message_text` | 受信内容の文字列 |
+| `ws_message_base64` | バイナリ受信時の Base64 文字列 |
+| `ws_message_json` | テキスト受信内容が JSON として読めた場合の値 |
+| `ws_connect_url` | 接続先 URL |
+| `ws_description` | `api.json` の説明文 |
+
 #### 動作確認（NyanPUI 自身に接続）
 
 リポジトリ同梱の `api.json` には、NyanPUI 自身の `/push/receive` に接続するサンプル（`ws_client/self_push_receive`）があります。
@@ -131,10 +324,52 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 
 ポートを変更している場合は `api.json` の `connectURL` を合わせてください。
 
+### 定期実行ジョブ（`type: "schedule"`）
+
+`type: "schedule"` を指定すると、NyanPUI の起動時に定期実行ジョブとして登録されます。HTTP エンドポイント、`/nyan` の API 一覧、JSON-RPC には公開されません。
+
+```json
+{
+  "schedule_debug_every_minute": {
+    "type": "schedule",
+    "script": "./javascript/schedule_debug.js",
+    "trigger": {
+      "type": "cron",
+      "value": "* * * * *"
+    },
+    "description": "schedule の動作確認用。1分ごとにログへ実行時刻を出力します。"
+  }
+}
+```
+
+現在サポートしている `trigger.type` は `cron` です。`trigger.value` は `分 時 日 月 曜日` の 5 フィールドで指定します。
+
+例:
+
+```text
+* * * * *          # 毎分
+*/15 9-10 * * 1-5 # 平日 9:00-10:59 の15分ごと
+0 10 * * *         # 毎日 10:00
+```
+
+schedule の `script` では通常 API と同じ Goja 環境を使えます。加えて `nyanAllParams` に次の値が入ります。
+
+| キー | 内容 |
+| --- | --- |
+| `nyan_job_name` | ジョブ名 |
+| `nyan_schedule_trigger_type` | トリガー種別。現在は `cron` |
+| `nyan_schedule_trigger` | cron 式 |
+| `nyan_schedule_time` | 実行予定時刻 |
+| `nyan_schedule_description` | `api.json` の説明文 |
+
+同梱の `api.json` には動作確認用の `schedule_debug_every_minute` を追加しています。起動すると1分ごとに `javascript/schedule_debug.js` が実行され、ログへ実行時刻が出力されます。
+
 ## アプリケーションの実行
 
 * `config.json` と `api.json` を編集後、実行ファイルを起動。
 * デフォルトで [http://localhost:8009/](http://localhost:8009/) にアクセスするとサンプルが表示されます。 Windows MacOS Linuxで実行可能です。 各自でビルドいただくか、[リリース](https://github.com/NyanQL/NyanPUI/releases)からダウンロードしてください。
+* `/nyan` にアクセスすると、`type: "schedule"` 以外の API 一覧を JSON で取得できます。
+* `/css`, `/images`, `/js`, `/favicon.ico` は `html/` 配下の静的ファイルとして配信されます。
 
 ## ビルド
 
@@ -237,15 +472,16 @@ var response = nyanCallAPI("https://api.example.com/data", postData, "nyan", "pa
 ### 7. **nyanHostExec**
 ホスト側でコマンドを実行し、結果を取得します。
 ```javascript
-var result = nyanHostExec("ls -la");
-console.log("Command Result: " + result);
+var result = JSON.parse(nyanHostExec("ls -la"));
+console.log("Command Result: " + result.stdout);
 ```
-結果は次のようになります。上記例ですと、下記の stdoutにlsコマンドの結果が格納されます。
+戻り値は JSON 文字列です。上記例では `stdout` に ls コマンドの結果が格納されます。
 ```json
 {
+  "success": true,
+  "exit_code": 0,
   "stdout": "コマンドの標準出力",
-  "stderr": "コマンドの標準エラー出力",
-  "exit_code": 0
+  "stderr": "コマンドの標準エラー出力"
 }
 ```
 
@@ -260,7 +496,7 @@ console.log("File Content: " + fileContent);
 
 ### 9. **nyanReadFileB64**
 バイナリファイルをBase64文字列として取得します。
-ファイルのパスはカレントディレクトリからの相対パスでも指定できます。
+ファイルのパスはカレントディレクトリからの相対パス、または絶対パスで指定できます。存在しない場合は JavaScript 例外になります。
 ```javascript
 var b64 = nyanReadFileB64("./html/images/nyan.png");
 console.log(b64);
@@ -280,6 +516,7 @@ console.log(result);
 * 引数オブジェクトは呼び出し先 API の `nyanAllParams` に渡されます（`api` は呼び出し先名で上書き）。
 * 呼び出し先の戻り値が JSON 文字列の場合は自動でオブジェクト化されます。
 * `type: "ws_client"` のエンドポイントは `nyanCallMe` では呼び出せません。
+* `type: "schedule"` のエンドポイントは `nyanCallMe` では呼び出せません。
 * 現在処理中 API 名を解決できない場合（例: `ws_client` から `api` 未指定で呼ぶ場合）は例外になります。
 * 失敗時は JavaScript 側で例外になります。
 
@@ -307,10 +544,12 @@ JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
 }
 ```
 
+`method` には `api.json` の API 名を指定します。JSON-RPC では `script` が必須です。`type: "schedule"` は呼び出せません。成功時の `result` は JavaScript の戻り値を文字列化した値です。
+
 ---
 
 ## JavaScriptのレスポンス形式（拡張）
-JavaScript が文字列を返した場合は従来どおり HTML として返します。
+JavaScript が文字列を返した場合は従来どおり `text/html; charset=utf-8` として返します。`null` や `undefined` の場合は空ボディになります。
 オブジェクトを返すと、HTTPレスポンスを制御できます。
 
 ```javascript
@@ -322,7 +561,7 @@ JavaScript が文字列を返した場合は従来どおり HTML として返し
 });
 ```
 
-バイナリを返す場合は `body.encoding = "base64"` を指定します。
+`body` に配列やオブジェクトを指定した場合は JSON として返します。バイナリを返す場合は `body.encoding = "base64"` を指定します。
 
 ```javascript
 const data = nyanReadFileB64("./html/images/nyan.png");
@@ -338,6 +577,7 @@ const data = nyanReadFileB64("./html/images/nyan.png");
 
 - `http://localhost:8009/sample/json`
 - `http://localhost:8009/sample/png`
+- `schedule_debug_every_minute`（HTTP では公開されない定期実行ジョブ）
 
 ---
 
@@ -352,4 +592,4 @@ const data = nyanReadFileB64("./html/images/nyan.png");
 
 
 ## 予約語
-`api` と `nyan` で始まる文字列を避けてください。
+エンドポイント名や変数名など、`nyan` で始まる名前は予約語になりますので使用しないでください。`nyan`, `nyan-rpc` は固定ルートで使われます。`api` は `nyanAllParams` で呼び出し先 API 名に使う予約パラメータです。

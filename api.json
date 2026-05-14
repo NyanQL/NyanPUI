@@ -2,7 +2,8 @@
   "html": {
     "script": "./javascript/html.js",
     "html": "./html/index.html",
-    "description": "トップページです"
+    "description": "トップページです",
+    "outcheck": "./javascript/sample_outcheck.js"
   },
   "wf": {
     "html": "./html/wf_html.html",
@@ -48,5 +49,14 @@
     "script": "./javascript/sample_png.js",
     "html": "",
     "description": "nyan.pngをバイナリで返すサンプルAPI"
+  },
+  "schedule_debug_every_minute": {
+    "type": "schedule",
+    "script": "./javascript/schedule_debug.js",
+    "trigger": {
+      "type": "cron",
+      "value": "* * * * *"
+    },
+    "description": "schedule の動作確認用。1分ごとにログへ実行時刻を出力します。"
   }
 }
