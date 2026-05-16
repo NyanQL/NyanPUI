@@ -160,7 +160,7 @@ type APIResponse struct {
 var globalConfig Config
 
 // ビルド時に -ldflags "-X main.buildVersion=..." で上書き可能
-var buildVersion = "v0.0.13"
+var buildVersion = "v0.0.14"
 
 // api.jsonから取得する設定
 var apiConfig APIConfig
