@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -162,6 +163,16 @@ var globalConfig Config
 // ビルド時に -ldflags "-X main.buildVersion=..." で上書き可能
 var buildVersion = "v0.0.14"
 
+type serviceFilePath struct {
+	Path   string
+	Source string
+}
+
+type serviceFilePaths struct {
+	API    serviceFilePath
+	Config serviceFilePath
+}
+
 // api.jsonから取得する設定
 var apiConfig APIConfig
 
@@ -194,12 +205,19 @@ func main() {
 	}
 	exeDir := filepath.Dir(exePath)
 
+	paths, err := resolveServiceFilePaths(exeDir, os.Args[1:])
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// システム設定をロード
-	configPath := resolvePath(exeDir, "config.json")
-	config, err := loadConfig(configPath)
+	config, err := loadConfig(paths.Config.Path)
 	if err != nil {
 		log.Fatal("Error loading config:", err)
 	}
+	configBaseDir := filepath.Dir(paths.Config.Path)
+	apiBaseDir := filepath.Dir(paths.API.Path)
+	adjustConfigPaths(configBaseDir, &config)
 	globalConfig = config
 
 	// ログ設定を初期化
@@ -221,11 +239,12 @@ func main() {
 	}
 
 	log.Printf("Binary version: %s", buildVersion)
+	log.Printf("Config file: %s (source: %s)", paths.Config.Path, paths.Config.Source)
+	log.Printf("API file: %s (source: %s)", paths.API.Path, paths.API.Source)
 	log.Printf("Config version: %s", globalConfig.Version)
 
 	// API設定をロード
-	apiConfigPath := resolvePath(exeDir, "api.json")
-	if err := loadAPIConfig(apiConfigPath); err != nil {
+	if err := loadAPIConfig(paths.API.Path, apiBaseDir); err != nil {
 		log.Fatal("Error loading API configuration:", err)
 	}
 
@@ -311,6 +330,77 @@ func resolvePath(baseDir, path string) string {
 	return filepath.Join(baseDir, path)
 }
 
+func resolvePathFromBase(baseDir, pathValue string) string {
+	if strings.TrimSpace(pathValue) == "" || filepath.IsAbs(pathValue) {
+		return pathValue
+	}
+	return filepath.Join(baseDir, pathValue)
+}
+
+func resolveServiceFilePaths(execDir string, args []string) (serviceFilePaths, error) {
+	flags := flag.NewFlagSet("NyanPUI", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	apiFlag := flags.String("api", "", "path to api.json")
+	configFlag := flags.String("config", "", "path to config.json")
+	if err := flags.Parse(args); err != nil {
+		return serviceFilePaths{}, err
+	}
+
+	apiPath, apiSource := chooseServiceFilePath(*apiFlag, "NYAN_API_PATH", filepath.Join(execDir, "api.json"), "--api")
+	configPath, configSource := chooseServiceFilePath(*configFlag, "NYAN_CONFIG_PATH", filepath.Join(execDir, "config.json"), "--config")
+
+	resolvedAPIPath, err := resolveExistingServiceFilePath(apiPath, "api", apiSource)
+	if err != nil {
+		return serviceFilePaths{}, err
+	}
+	resolvedConfigPath, err := resolveExistingServiceFilePath(configPath, "config", configSource)
+	if err != nil {
+		return serviceFilePaths{}, err
+	}
+
+	return serviceFilePaths{
+		API:    serviceFilePath{Path: resolvedAPIPath, Source: apiSource},
+		Config: serviceFilePath{Path: resolvedConfigPath, Source: configSource},
+	}, nil
+}
+
+func chooseServiceFilePath(cliValue, envName, defaultPath, cliSource string) (string, string) {
+	if strings.TrimSpace(cliValue) != "" {
+		return cliValue, cliSource
+	}
+	if envValue := strings.TrimSpace(os.Getenv(envName)); envValue != "" {
+		return envValue, envName
+	}
+	return defaultPath, "default"
+}
+
+func resolveExistingServiceFilePath(pathValue, label, source string) (string, error) {
+	resolvedPath, err := filepath.Abs(pathValue)
+	if err != nil {
+		return "", fmt.Errorf("%s file path could not be resolved: %s (source: %s): %w", label, pathValue, source, err)
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("%s file not found: %s (source: %s)", label, resolvedPath, source)
+		}
+		return "", fmt.Errorf("%s file cannot be accessed: %s (source: %s): %w", label, resolvedPath, source, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s file is a directory: %s (source: %s)", label, resolvedPath, source)
+	}
+	return resolvedPath, nil
+}
+
+func adjustConfigPaths(configBaseDir string, config *Config) {
+	config.CertFile = resolvePathFromBase(configBaseDir, config.CertFile)
+	config.KeyFile = resolvePathFromBase(configBaseDir, config.KeyFile)
+	config.Log.Filename = resolvePathFromBase(configBaseDir, config.Log.Filename)
+	for i, includePath := range config.JavaScriptInclude {
+		config.JavaScriptInclude[i] = resolvePathFromBase(configBaseDir, includePath)
+	}
+}
+
 // loadConfig は設定ファイルを読み込みます。
 func loadConfig(filename string) (Config, error) {
 	var config Config
@@ -329,7 +419,7 @@ func loadConfig(filename string) (Config, error) {
 }
 
 // apiの設定を読み込みます。
-func loadAPIConfig(filePath string) error {
+func loadAPIConfig(filePath string, apiBaseDir string) error {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return err
@@ -337,7 +427,19 @@ func loadAPIConfig(filePath string) error {
 	if err := json.Unmarshal(data, &apiConfig); err != nil {
 		return err
 	}
+	adjustAPIConfigPaths(apiBaseDir)
 	return nil
+}
+
+func adjustAPIConfigPaths(apiBaseDir string) {
+	for apiKey, endpoint := range apiConfig {
+		endpoint.Script = resolvePathFromBase(apiBaseDir, endpoint.Script)
+		endpoint.HTML = resolvePathFromBase(apiBaseDir, endpoint.HTML)
+		endpoint.Path = resolvePathFromBase(apiBaseDir, endpoint.Path)
+		endpoint.ParamCheck = resolvePathFromBase(apiBaseDir, endpoint.ParamCheck)
+		endpoint.OutCheck = resolvePathFromBase(apiBaseDir, endpoint.OutCheck)
+		apiConfig[apiKey] = endpoint
+	}
 }
 
 // handleAPIRequestOrWebSocket はAPIリクエストまたはWebSocketリクエストを処理します。

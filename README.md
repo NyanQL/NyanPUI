@@ -36,6 +36,24 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 
 ## 設定ファイル
 
+NyanPUI は起動時に `api.json` と `config.json` の読み込みパスを指定できます。
+指定がない場合は、従来通り実行ファイルと同じディレクトリにある `api.json` / `config.json` を読み込みます。
+
+優先順位は次の通りです。
+
+1. CLI オプション
+2. 環境変数
+3. 実行ファイルと同じディレクトリのデフォルトファイル
+
+```sh
+./NyanPUI_Mac
+./NyanPUI_Mac --api /path/to/api.json --config /path/to/config.json
+NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./NyanPUI_Mac
+```
+
+`api.json` 内の `script` / `html` / `path` / `paramCheck` / `outCheck` の相対パスは、`api.json` が置かれているディレクトリから解決されます。
+`config.json` 内の `certPath` / `keyPath` / `javascript_include` / `log.Filename` の相対パスは、`config.json` が置かれているディレクトリから解決されます。
+
 ### config.json
 
 ```json
