@@ -41,8 +41,8 @@ NyanPUI は起動時に `api.json` と `config.json` の読み込みパスを指
 
 優先順位は次の通りです。
 
-1. CLI オプション
-2. 環境変数
+1. CLI オプション（`--api`, `--config`）
+2. 環境変数（`NYAN_API_PATH`, `NYAN_CONFIG_PATH`）
 3. 実行ファイルと同じディレクトリのデフォルトファイル
 
 ```sh
@@ -51,8 +51,24 @@ NyanPUI は起動時に `api.json` と `config.json` の読み込みパスを指
 NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./NyanPUI_Mac
 ```
 
+CLI オプションと環境変数には絶対パス、または NyanPUI を起動したカレントディレクトリからの相対パスを指定できます。指定したファイルが存在しない場合、またはディレクトリを指定した場合は起動時にエラーになります。
+
 `api.json` 内の `script` / `html` / `path` / `paramCheck` / `outCheck` の相対パスは、`api.json` が置かれているディレクトリから解決されます。
 `config.json` 内の `certPath` / `keyPath` / `javascript_include` / `log.Filename` の相対パスは、`config.json` が置かれているディレクトリから解決されます。
+
+起動時のログには、読み込んだ `config.json` / `api.json` の絶対パスと、その指定元（`--api`, `--config`, 環境変数, default）が出力されます。`/css`, `/images`, `/js`, `/favicon.ico` の組み込み静的ファイルは、設定ファイルの場所に関係なく実行ファイルと同じディレクトリの `html/` 配下から配信されます。
+
+パス解決の基準は次の通りです。
+
+| 指定箇所 | 相対パスの基準 |
+| --- | --- |
+| `--api`, `--config` | NyanPUI を起動したカレントディレクトリ |
+| `NYAN_API_PATH`, `NYAN_CONFIG_PATH` | NyanPUI を起動したカレントディレクトリ |
+| デフォルトの `api.json`, `config.json` | 実行ファイルと同じディレクトリ |
+| `api.json` の `script`, `html`, `path`, `paramCheck`, `outCheck` | `api.json` が置かれているディレクトリ |
+| `config.json` の `certPath`, `keyPath`, `javascript_include`, `log.Filename` | `config.json` が置かれているディレクトリ |
+| `api.json` の `connectURL` | URL 文字列として扱うため相対パス解決なし |
+| `/css`, `/images`, `/js`, `/favicon.ico` | 実行ファイルと同じディレクトリの `html/` 配下 |
 
 ### config.json
 
@@ -135,7 +151,7 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./NyanPUI_
 
 ### public フォルダ公開（`type: "public"`）
 
-`type: "public"` を指定すると、`path` のフォルダ配下にあるファイルをそのまま配信します。`path` は実行ファイルのあるディレクトリからの相対パス、または絶対パスで指定できます。
+`type: "public"` を指定すると、`path` のフォルダ配下にあるファイルをそのまま配信します。`path` は `api.json` が置かれているディレクトリからの相対パス、または絶対パスで指定できます。
 
 ```json
 {
@@ -319,6 +335,7 @@ return {
 ```
 
 `connectURL` は `env:WS_URL` のように環境変数からも指定できます。
+`script` の相対パスは `api.json` が置かれているディレクトリから解決されます。`connectURL` はファイルパスではないため、相対パス解決の対象ではありません。
 
 受信したメッセージは `script` に渡され、次の値を `nyanAllParams` で参照できます。`script` の戻り値が空でない場合は、接続先 WebSocket にテキストメッセージとして返信します。切断時は 1 秒から最大 30 秒までの指数バックオフで再接続します。
 
@@ -361,6 +378,7 @@ return {
 ```
 
 現在サポートしている `trigger.type` は `cron` です。`trigger.value` は `分 時 日 月 曜日` の 5 フィールドで指定します。
+`script` の相対パスは `api.json` が置かれているディレクトリから解決されます。
 
 例:
 
@@ -384,12 +402,14 @@ schedule の `script` では通常 API と同じ Goja 環境を使えます。�
 
 ## アプリケーションの実行
 
-* `config.json` と `api.json` を編集後、実行ファイルを起動。
+* `config.json` と `api.json` を編集後、実行ファイルを起動。設定ファイルを別の場所に置く場合は `--api` / `--config`、または `NYAN_API_PATH` / `NYAN_CONFIG_PATH` で指定します。
 * デフォルトで [http://localhost:8009/](http://localhost:8009/) にアクセスするとサンプルが表示されます。 Windows MacOS Linuxで実行可能です。 各自でビルドいただくか、[リリース](https://github.com/NyanQL/NyanPUI/releases)からダウンロードしてください。
 * `/nyan` にアクセスすると、`type: "schedule"` 以外の API 一覧を JSON で取得できます。
 * `/css`, `/images`, `/js`, `/favicon.ico` は `html/` 配下の静的ファイルとして配信されます。
 
 ## ビルド
+
+ビルドには `go.mod` に記載された Go バージョンを使用してください。
 
 ### macOS
 
