@@ -83,6 +83,10 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
   "javascript_include": [
     "javascript/lib/nyanPlateToJson.js"
   ],
+  "APIHotReload": {
+    "Enabled": true,
+    "Interval": "1s"
+  },
   "log": {
     "Filename": "./logs/nyanpui.log",
     "MaxSize": 5,
@@ -93,6 +97,14 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
   }
 }
 ```
+
+### api.json のホットリロード
+
+`api.json` は既定で1秒ごとに確認され、内容のSHA-256が変化した場合だけ再読み込みされます。`APIHotReload.Enabled` を `false` にすると無効化できます。`Interval` は `500ms`、`1s`、`1m`、`24h` などのGo duration形式で指定し、省略時は `1s` です。0以下または解析できない値は起動エラーになります。
+
+再読み込みではJSON全体と、すべての `schedule` / `ws_client` 定義を事前検証します。正常な候補だけが一括で公開され、不正な内容の場合は直前の正常な定義を維持します。同じ不正内容は変更されるまで再解析・再出力しません。
+
+追加、変更、削除は通常API、HTML API、public API、`/nyan`、JSON-RPC、`nyanCallMe`、WebSocket受信処理、pushへ次の処理から反映されます。`schedule` と `ws_client` も動的に開始、更新、停止します。既存のWebSocketサーバー接続は設定変更だけでは切断されません。`ws_client` はscriptまたはdescriptionだけの変更では接続を維持し、`connectURL` の変更時だけ接続先を切り替えます。
 
 ### ログ設定（例）
 

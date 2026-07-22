@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -13,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -30,14 +33,15 @@ import (
 
 // Config は設定データを表します。
 type Config struct {
-	Name              string    `json:"name"`
-	Profile           string    `json:"profile"`
-	Version           string    `json:"version"`
-	Port              int       `json:"port"`
-	CertFile          string    `json:"certPath"`
-	KeyFile           string    `json:"keyPath"`
-	JavaScriptInclude []string  `json:"javascript_include"`
-	Log               LogConfig `json:"log"`
+	Name              string             `json:"name"`
+	Profile           string             `json:"profile"`
+	Version           string             `json:"version"`
+	Port              int                `json:"port"`
+	CertFile          string             `json:"certPath"`
+	KeyFile           string             `json:"keyPath"`
+	JavaScriptInclude []string           `json:"javascript_include"`
+	Log               LogConfig          `json:"log"`
+	APIHotReload      APIHotReloadConfig `json:"APIHotReload"`
 }
 
 // LogConfig はログ設定を表します。
@@ -174,7 +178,11 @@ type serviceFilePaths struct {
 }
 
 // api.jsonから取得する設定
-var apiConfig APIConfig
+var (
+	apiConfigMu        sync.RWMutex
+	apiConfig          APIConfig
+	backgroundRuntimes *backgroundRuntimeManager
+)
 
 // ストレージ
 var storage = make(map[string]string)
@@ -219,6 +227,10 @@ func main() {
 	apiBaseDir := filepath.Dir(paths.API.Path)
 	adjustConfigPaths(configBaseDir, &config)
 	globalConfig = config
+	apiHotReloadInterval, err := parseAPIHotReloadInterval(config.APIHotReload.Interval)
+	if err != nil {
+		log.Fatalf("Invalid APIHotReload.Interval %q: %v", config.APIHotReload.Interval, err)
+	}
 
 	// ログ設定を初期化
 	if globalConfig.Log.EnableLogging {
@@ -243,16 +255,27 @@ func main() {
 	log.Printf("API file: %s (source: %s)", paths.API.Path, paths.API.Source)
 	log.Printf("Config version: %s", globalConfig.Version)
 
-	// API設定をロード
-	if err := loadAPIConfig(paths.API.Path, apiBaseDir); err != nil {
+	// API設定をロードし、background定義を公開前に全件検証する。
+	initialConfig, initialHash, err := readAPIConfigFile(paths.API.Path, apiBaseDir)
+	if err != nil {
 		log.Fatal("Error loading API configuration:", err)
 	}
-
-	if err := startWebSocketClients(exeDir); err != nil {
-		log.Printf("Failed to start WebSocket clients: %v", err)
+	initialSchedules, err := buildScheduleJobConfigs(initialConfig)
+	if err != nil {
+		log.Fatal("Error loading schedule configuration:", err)
 	}
-	if err := startScheduleJobs(exeDir); err != nil {
-		log.Printf("Failed to start schedule jobs: %v", err)
+	initialWSClients, err := buildWSClientConfigs(initialConfig)
+	if err != nil {
+		log.Fatal("Error loading WebSocket client configuration:", err)
+	}
+	setAPIConfig(initialConfig)
+	backgroundRuntimes = newBackgroundRuntimeManager()
+	backgroundRuntimes.reconcile(initialSchedules, initialWSClients)
+	if config.APIHotReload.Enabled {
+		log.Printf("API hot reload enabled: interval=%s", apiHotReloadInterval)
+		go watchAPIConfig(paths.API.Path, apiBaseDir, apiHotReloadInterval, initialHash)
+	} else {
+		log.Printf("API hot reload disabled")
 	}
 
 	gin.DisableConsoleColor()
@@ -267,33 +290,11 @@ func main() {
 	r.GET("/nyan", handleNyan)
 	r.POST("/nyan-rpc", handleJSONRPC)
 
-	// 各APIエンドポイントを設定
-	for endpoint := range apiConfig {
-		config := apiConfig[endpoint] // ループ変数をローカル変数にコピー
-		switch strings.TrimSpace(config.Type) {
-		case apiTypeWSClient:
-			continue
-		case apiTypeSchedule:
-			continue
-		case apiTypePublic:
-			registerPublicEndpoint(r, endpoint, config, exeDir)
-			continue
-		}
-		r.Any("/"+endpoint, func(c *gin.Context) {
-			handleAPIRequestOrWebSocket(c, config)
-		})
-	}
-
 	r.Any("/", func(c *gin.Context) {
 		// クエリパラメータ "api" をチェック
 		apiName := c.Query("api")
 		if apiName != "" {
-			if config, ok := apiConfig[apiName]; ok {
-				if strings.TrimSpace(config.Type) == apiTypeSchedule {
-					c.JSON(http.StatusNotFound, gin.H{"error": "API not found"})
-					return
-				}
-				handleAPIRequestOrWebSocket(c, config)
+			if handleAPIRequestOrWebSocket(c, apiName) {
 				return
 			} else {
 				c.JSON(http.StatusNotFound, gin.H{"error": "API not found"})
@@ -301,7 +302,16 @@ func main() {
 			}
 		}
 		// "api" パラメータがなければ、デフォルトで "html" を使用
-		handleAPIRequestOrWebSocket(c, apiConfig["html"])
+		if !handleAPIRequestOrWebSocket(c, "html") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "API not found"})
+		}
+	})
+
+	r.NoRoute(func(c *gin.Context) {
+		if dispatchDynamicEndpoint(c) {
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "API not found"})
 	})
 
 	// HTTPSサーバーを起動するかどうかを判断
@@ -404,6 +414,7 @@ func adjustConfigPaths(configBaseDir string, config *Config) {
 // loadConfig は設定ファイルを読み込みます。
 func loadConfig(filename string) (Config, error) {
 	var config Config
+	applyConfigDefaults(&config)
 
 	// 設定ファイルを読み込む
 	data, err := os.ReadFile(filename)
@@ -420,35 +431,37 @@ func loadConfig(filename string) (Config, error) {
 
 // apiの設定を読み込みます。
 func loadAPIConfig(filePath string, apiBaseDir string) error {
-	data, err := os.ReadFile(filePath)
+	config, _, err := readAPIConfigFile(filePath, apiBaseDir)
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(data, &apiConfig); err != nil {
-		return err
-	}
-	adjustAPIConfigPaths(apiBaseDir)
+	setAPIConfig(config)
 	return nil
 }
 
-func adjustAPIConfigPaths(apiBaseDir string) {
-	for apiKey, endpoint := range apiConfig {
+func adjustAPIConfigPaths(config APIConfig, apiBaseDir string) {
+	for apiKey, endpoint := range config {
 		endpoint.Script = resolvePathFromBase(apiBaseDir, endpoint.Script)
 		endpoint.HTML = resolvePathFromBase(apiBaseDir, endpoint.HTML)
 		endpoint.Path = resolvePathFromBase(apiBaseDir, endpoint.Path)
 		endpoint.ParamCheck = resolvePathFromBase(apiBaseDir, endpoint.ParamCheck)
 		endpoint.OutCheck = resolvePathFromBase(apiBaseDir, endpoint.OutCheck)
-		apiConfig[apiKey] = endpoint
+		config[apiKey] = endpoint
 	}
 }
 
 // handleAPIRequestOrWebSocket はAPIリクエストまたはWebSocketリクエストを処理します。
-func handleAPIRequestOrWebSocket(c *gin.Context, config EndpointConfig) {
+func handleAPIRequestOrWebSocket(c *gin.Context, apiName string) bool {
+	config, ok := currentAPIConfig()[apiName]
+	if !ok || !isRequestAPI(config) {
+		return false
+	}
 	if websocket.IsWebSocketUpgrade(c.Request) {
-		handleWebSocket(c, config)
+		handleWebSocket(c, apiName, config)
 	} else {
 		handleAPIRequest(c, config)
 	}
+	return true
 }
 
 // handleAPIRequest はAPIリクエストを処理します。
@@ -534,8 +547,7 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 }
 
 // handleWebSocket はWebSocketリクエストを処理します。
-func handleWebSocket(c *gin.Context, config EndpointConfig) {
-	endpoint := c.Request.URL.Path[1:] // 例: "/html2" -> "html2"
+func handleWebSocket(c *gin.Context, endpoint string, config EndpointConfig) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Printf("Failed to set websocket upgrade: %v", err)
@@ -582,7 +594,7 @@ func handleWebSocket(c *gin.Context, config EndpointConfig) {
 		// "api" キーがあるかチェック
 		if apiName, ok := req["api"]; ok {
 			// apiConfig から対象の設定を取得
-			apiCfg, found := apiConfig[apiName]
+			apiCfg, found := currentAPIConfig()[apiName]
 			if !found {
 				errMsg := fmt.Sprintf("API %s not found", apiName)
 				conn.WriteMessage(messageType, []byte(errMsg))
@@ -663,7 +675,7 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (interf
 		return nil, fmt.Errorf("api name is required")
 	}
 
-	apiCfg, found := apiConfig[apiName]
+	apiCfg, found := currentAPIConfig()[apiName]
 	if !found {
 		return nil, fmt.Errorf("API config not found: %s", apiName)
 	}
@@ -1075,6 +1087,96 @@ const (
 	apiTypeSchedule = "schedule"
 )
 
+func isRequestAPI(config EndpointConfig) bool {
+	switch strings.TrimSpace(config.Type) {
+	case apiTypeWSClient, apiTypePublic, apiTypeSchedule:
+		return false
+	default:
+		return true
+	}
+}
+
+// dispatchDynamicEndpoint resolves the request against one immutable API snapshot.
+func dispatchDynamicEndpoint(c *gin.Context) bool {
+	requestPath := strings.TrimPrefix(c.Request.URL.Path, "/")
+	config := currentAPIConfig()
+	if endpoint, ok := config[requestPath]; ok && isRequestAPI(endpoint) {
+		if websocket.IsWebSocketUpgrade(c.Request) {
+			handleWebSocket(c, requestPath, endpoint)
+		} else {
+			handleAPIRequest(c, endpoint)
+		}
+		return true
+	}
+
+	endpointName := ""
+	var endpoint EndpointConfig
+	for name, candidate := range config {
+		if strings.TrimSpace(candidate.Type) != apiTypePublic {
+			continue
+		}
+		cleanName := strings.Trim(strings.TrimSpace(name), "/")
+		if requestPath == cleanName || strings.HasPrefix(requestPath, cleanName+"/") {
+			if len(cleanName) > len(endpointName) {
+				endpointName, endpoint = cleanName, candidate
+			}
+		}
+	}
+	if endpointName == "" {
+		return false
+	}
+	servePublicEndpoint(c, endpointName, endpoint)
+	return true
+}
+
+func servePublicEndpoint(c *gin.Context, endpoint string, config EndpointConfig) {
+	publicPath := strings.TrimSpace(config.Path)
+	if publicPath == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "public path is missing"})
+		return
+	}
+	requestPath := strings.TrimPrefix(c.Request.URL.Path, "/")
+	requestedPath := strings.TrimPrefix(strings.TrimPrefix(requestPath, endpoint), "/")
+	allParams, err := collectRequestParams(c, endpoint)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON data"})
+		return
+	}
+	allParams["nyan_public_endpoint"] = endpoint
+	allParams["nyan_public_path"] = requestedPath
+	ginContext = c
+	defer func() { ginContext = nil }()
+	if allowed, handled := runParamCheck(c, config, filepath.Dir(publicPath), "", allParams); handled || !allowed {
+		return
+	}
+	if requestedPath == "" || !filepath.IsLocal(requestedPath) {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	filePath := filepath.Join(publicPath, requestedPath)
+	info, err := os.Stat(filePath)
+	if err != nil || info.IsDir() {
+		if err != nil && !os.IsNotExist(err) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read public file"})
+		} else {
+			c.Status(http.StatusNotFound)
+		}
+		return
+	}
+	if strings.TrimSpace(config.OutCheck) != "" {
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read public file"})
+			return
+		}
+		response := APIResponse{Status: http.StatusOK, ContentType: http.DetectContentType(content), Headers: map[string]string{}, Body: content}
+		if runOutCheck(c, config, filepath.Dir(publicPath), "", allParams, response) {
+			return
+		}
+	}
+	c.File(filePath)
+}
+
 func registerPublicEndpoint(r *gin.Engine, endpoint string, config EndpointConfig, exeDir string) {
 	routePath := "/" + strings.Trim(strings.TrimSpace(endpoint), "/")
 	if routePath == "/" {
@@ -1328,89 +1430,6 @@ func (s cronSchedule) matches(t time.Time) bool {
 		s.months[int(t.Month())]
 }
 
-func startScheduleJobs(execDir string) error {
-	var firstErr error
-	for name, cfg := range apiConfig {
-		if strings.TrimSpace(cfg.Type) != apiTypeSchedule {
-			continue
-		}
-
-		scriptPath := strings.TrimSpace(cfg.Script)
-		trigger := cfg.Trigger
-		trigger.Type = strings.TrimSpace(trigger.Type)
-		trigger.Value = strings.TrimSpace(trigger.Value)
-
-		if scriptPath == "" {
-			err := fmt.Errorf("schedule %s: script is missing", name)
-			log.Print(err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if trigger.Type != "cron" {
-			err := fmt.Errorf("schedule %s: unsupported trigger type %q", name, trigger.Type)
-			log.Print(err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-
-		schedule, err := parseCronSchedule(trigger.Value)
-		if err != nil {
-			err = fmt.Errorf("schedule %s: invalid cron trigger %q: %w", name, trigger.Value, err)
-			log.Print(err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-
-		jobCfg := scheduleJobConfig{
-			name:        name,
-			scriptPath:  resolvePath(execDir, scriptPath),
-			trigger:     trigger,
-			description: cfg.Description,
-			schedule:    schedule,
-		}
-
-		log.Printf("Starting schedule job %s with cron %q", jobCfg.name, jobCfg.trigger.Value)
-		go runScheduleJob(jobCfg)
-	}
-
-	return firstErr
-}
-
-func runScheduleJob(cfg scheduleJobConfig) {
-	for {
-		next := cfg.schedule.next(time.Now())
-		if next.IsZero() {
-			log.Printf("Schedule job %s has no next run time", cfg.name)
-			return
-		}
-
-		log.Printf("Schedule job %s next run at %s", cfg.name, next.Format(time.RFC3339))
-		timer := time.NewTimer(time.Until(next))
-		<-timer.C
-
-		allParams := map[string]interface{}{
-			"api":                        cfg.name,
-			"nyan_job_name":              cfg.name,
-			"nyan_schedule_trigger_type": cfg.trigger.Type,
-			"nyan_schedule_trigger":      cfg.trigger.Value,
-			"nyan_schedule_time":         next.Format(time.RFC3339),
-			"nyan_schedule_description":  cfg.description,
-		}
-		result, err := runJavaScript(cfg.scriptPath, "", allParams)
-		if err != nil {
-			log.Printf("Schedule job %s failed: %v", cfg.name, err)
-			continue
-		}
-		log.Printf("Schedule job %s completed: %s", cfg.name, result)
-	}
-}
-
 // connectURL が env:XXXX 形式なら環境変数 XXXX で解決する。空や未設定はエラー。
 func resolveConnectURL(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
@@ -1429,133 +1448,6 @@ func resolveConnectURL(raw string) (string, error) {
 		return val, nil
 	}
 	return raw, nil
-}
-
-// startWebSocketClients は api.json に定義された ws_client を起動します。
-func startWebSocketClients(execDir string) error {
-	var firstErr error
-	for name, cfg := range apiConfig {
-		if strings.TrimSpace(cfg.Type) != apiTypeWSClient {
-			continue
-		}
-
-		scriptPath := strings.TrimSpace(cfg.Script)
-		connectURLRaw := strings.TrimSpace(cfg.ConnectURL)
-
-		if scriptPath == "" {
-			err := fmt.Errorf("ws_client %s: script is missing", name)
-			log.Print(err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if connectURLRaw == "" {
-			err := fmt.Errorf("ws_client %s: connectURL is missing", name)
-			log.Print(err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-
-		connectURL, err := resolveConnectURL(connectURLRaw)
-		if err != nil {
-			log.Printf("ws_client %s: %v", name, err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-
-		wsCfg := wsClientConfig{
-			name:        name,
-			scriptPath:  scriptPath,
-			connectURL:  connectURL,
-			description: cfg.Description,
-		}
-
-		log.Printf("Starting WebSocket client %s -> %s", wsCfg.name, wsCfg.connectURL)
-		go runWebSocketClient(wsCfg)
-	}
-
-	return firstErr
-}
-
-// 常時接続を維持し、切断時は指数バックオフで再接続します。
-func runWebSocketClient(cfg wsClientConfig) {
-	backoff := time.Second
-	for {
-		err := connectAndListenWebSocket(cfg)
-		if err != nil {
-			log.Printf("WebSocket client %s disconnected: %v", cfg.name, err)
-		}
-
-		time.Sleep(backoff)
-		if backoff < 30*time.Second {
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
-		}
-	}
-}
-
-func connectAndListenWebSocket(cfg wsClientConfig) error {
-	conn, _, err := websocket.DefaultDialer.Dial(cfg.connectURL, nil)
-	if err != nil {
-		return fmt.Errorf("dial failed: %w", err)
-	}
-	defer conn.Close()
-
-	log.Printf("WebSocket client %s connected", cfg.name)
-
-	for {
-		msgType, data, err := conn.ReadMessage()
-		if err != nil {
-			return fmt.Errorf("read error: %w", err)
-		}
-		if msgType == websocket.CloseMessage {
-			return fmt.Errorf("close message received: %s", string(data))
-		}
-
-		log.Printf("ws_client %s received %s: %s", cfg.name, websocketMessageTypeLabel(msgType), string(data))
-
-		allParams := map[string]interface{}{
-			"api":             cfg.name,
-			"ws_client":       cfg.name,
-			"ws_message_type": websocketMessageTypeLabel(msgType),
-			"ws_message_text": string(data),
-			"ws_connect_url":  cfg.connectURL,
-			"ws_description":  cfg.description,
-		}
-
-		if msgType == websocket.BinaryMessage {
-			allParams["ws_message_base64"] = base64.StdEncoding.EncodeToString(data)
-		}
-
-		if msgType == websocket.TextMessage {
-			var decoded interface{}
-			if err := json.Unmarshal(data, &decoded); err == nil {
-				allParams["ws_message_json"] = decoded
-			}
-		}
-
-		result, err := runJavaScript(cfg.scriptPath, "", allParams)
-		if err != nil {
-			log.Printf("ws_client %s script error: %v", cfg.name, err)
-			continue
-		}
-
-		trimmed := strings.TrimSpace(result)
-		if trimmed == "" {
-			continue
-		}
-
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(trimmed)); err != nil {
-			return fmt.Errorf("send error: %w", err)
-		}
-	}
 }
 
 func websocketMessageTypeLabel(t int) string {
@@ -1954,7 +1846,7 @@ func cp932ToUTF8(data []byte) (string, error) {
 // handleNyan は /nyan へのリクエストを処理します。
 func handleNyan(c *gin.Context) {
 	apis := make(map[string]ApiData)
-	for apiName, cfg := range apiConfig {
+	for apiName, cfg := range currentAPIConfig() {
 		if strings.TrimSpace(cfg.Type) == apiTypeSchedule {
 			continue
 		}
@@ -2063,7 +1955,7 @@ func handleJSONRPC(c *gin.Context) {
 	}
 
 	// 3) api.json から、リクエストされたAPI設定を取得
-	config, exists := apiConfig[rpcReq.Method]
+	config, exists := currentAPIConfig()[rpcReq.Method]
 	if !exists {
 		respondJSONRPCError(c, rpcReq.ID, -32601, fmt.Sprintf("API not found: %s", rpcReq.Method), nil)
 		return
@@ -2144,7 +2036,7 @@ func performPush(config EndpointConfig, allParams map[string]interface{}) {
 	if config.Push == "" {
 		return
 	}
-	pushConfig, ok := apiConfig[config.Push]
+	pushConfig, ok := currentAPIConfig()[config.Push]
 	if !ok {
 		log.Printf("Push target %s not found in apiConfig", config.Push)
 		return
@@ -2182,6 +2074,539 @@ func performPush(config EndpointConfig, allParams map[string]interface{}) {
 				log.Printf("Error pushing message to %s: %v", config.Push, err)
 			} else {
 				log.Printf("Push message sent to %s", config.Push)
+			}
+		}
+	}
+}
+
+const defaultAPIHotReloadCheckInterval = time.Second
+
+type APIHotReloadConfig struct {
+	Enabled  bool   `json:"Enabled"`
+	Interval string `json:"Interval"`
+}
+
+func applyConfigDefaults(target *Config) {
+	target.APIHotReload.Enabled = true
+	target.APIHotReload.Interval = defaultAPIHotReloadCheckInterval.String()
+}
+
+func parseAPIHotReloadInterval(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultAPIHotReloadCheckInterval, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	if interval <= 0 {
+		return 0, fmt.Errorf("must be greater than zero")
+	}
+	return interval, nil
+}
+
+func decodeAPIConfig(data []byte, apiBaseDir string) (APIConfig, error) {
+	var config APIConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("decode api JSON: %w", err)
+	}
+	if config == nil {
+		return nil, fmt.Errorf("decode api JSON: top-level value must be an object")
+	}
+	adjustAPIConfigPaths(config, apiBaseDir)
+	return config, nil
+}
+
+func readAPIConfigFile(path, apiBaseDir string) (APIConfig, [sha256.Size]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, [sha256.Size]byte{}, fmt.Errorf("read api file: %w", err)
+	}
+	hash := sha256.Sum256(data)
+	config, err := decodeAPIConfig(data, apiBaseDir)
+	return config, hash, err
+}
+
+func currentAPIConfig() APIConfig {
+	apiConfigMu.RLock()
+	config := apiConfig
+	apiConfigMu.RUnlock()
+	return config
+}
+
+func setAPIConfig(config APIConfig) {
+	apiConfigMu.Lock()
+	apiConfig = config
+	apiConfigMu.Unlock()
+}
+
+func reloadAPIConfigIfChanged(path, apiBaseDir string, lastHash [sha256.Size]byte) ([sha256.Size]byte, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return lastHash, false, fmt.Errorf("read api file: %w", err)
+	}
+	hash := sha256.Sum256(data)
+	if hash == lastHash {
+		return lastHash, false, nil
+	}
+	candidate, err := decodeAPIConfig(data, apiBaseDir)
+	if err != nil {
+		return hash, false, err
+	}
+	if reflect.DeepEqual(currentAPIConfig(), candidate) {
+		return hash, false, nil
+	}
+	schedules, err := buildScheduleJobConfigs(candidate)
+	if err != nil {
+		return hash, false, err
+	}
+	wsClients, err := buildWSClientConfigs(candidate)
+	if err != nil {
+		return hash, false, err
+	}
+	setAPIConfig(candidate)
+	if backgroundRuntimes != nil {
+		backgroundRuntimes.reconcile(schedules, wsClients)
+	}
+	return hash, true, nil
+}
+
+func watchAPIConfig(path, apiBaseDir string, interval time.Duration, initialHash [sha256.Size]byte) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	lastHash := initialHash
+	lastError := ""
+	for range ticker.C {
+		hash, reloaded, err := reloadAPIConfigIfChanged(path, apiBaseDir, lastHash)
+		lastHash = hash
+		if err != nil {
+			if err.Error() != lastError {
+				log.Printf("API hot reload failed: %v; current API configuration remains active", err)
+			}
+			lastError = err.Error()
+			continue
+		}
+		lastError = ""
+		if reloaded {
+			log.Printf("API hot reload succeeded: api_count=%d", len(currentAPIConfig()))
+		}
+	}
+}
+
+type backgroundRuntimeManager struct {
+	mu        sync.Mutex
+	schedules map[string]*scheduleRuntime
+	wsClients map[string]*wsClientRuntime
+}
+
+type scheduleRuntime struct {
+	mu      sync.Mutex
+	desired *scheduleJobConfig
+	wake    chan struct{}
+	done    chan struct{}
+	stopped bool
+}
+
+type wsClientRuntime struct {
+	mu         sync.Mutex
+	desired    *wsClientConfig
+	wake       chan struct{}
+	done       chan struct{}
+	stopped    bool
+	conn       *websocket.Conn
+	dialCancel context.CancelFunc
+}
+
+func newBackgroundRuntimeManager() *backgroundRuntimeManager {
+	return &backgroundRuntimeManager{schedules: make(map[string]*scheduleRuntime), wsClients: make(map[string]*wsClientRuntime)}
+}
+
+func (manager *backgroundRuntimeManager) reconcile(schedules map[string]scheduleJobConfig, wsClients map[string]wsClientConfig) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	for name, runtime := range manager.schedules {
+		if _, exists := schedules[name]; !exists {
+			if _, changed := runtime.update(nil); changed {
+				log.Printf("Stopping schedule job %s", name)
+			}
+		}
+	}
+	for name, cfg := range schedules {
+		if runtime, exists := manager.schedules[name]; exists {
+			if accepted, changed := runtime.update(&cfg); accepted {
+				if changed {
+					log.Printf("Updated schedule job %s with cron %q", name, cfg.trigger.Value)
+				}
+				continue
+			}
+		}
+		runtime := newScheduleRuntime(cfg)
+		manager.schedules[name] = runtime
+		log.Printf("Starting schedule job %s with cron %q", name, cfg.trigger.Value)
+		go manager.runSchedule(name, runtime)
+	}
+	for name, runtime := range manager.wsClients {
+		if _, exists := wsClients[name]; !exists {
+			if _, changed, _ := runtime.update(nil); changed {
+				log.Printf("Stopping WebSocket client %s", name)
+			}
+		}
+	}
+	for name, cfg := range wsClients {
+		if runtime, exists := manager.wsClients[name]; exists {
+			if accepted, changed, reconnect := runtime.update(&cfg); accepted {
+				if changed {
+					log.Printf("Updated WebSocket client %s reconnect=%t", name, reconnect)
+				}
+				continue
+			}
+		}
+		runtime := newWSClientRuntime(cfg)
+		manager.wsClients[name] = runtime
+		log.Printf("Starting WebSocket client %s -> %s", name, cfg.connectURL)
+		go manager.runWSClient(name, runtime)
+	}
+}
+
+func (manager *backgroundRuntimeManager) runSchedule(name string, runtime *scheduleRuntime) {
+	runtime.run()
+	manager.mu.Lock()
+	if manager.schedules[name] == runtime {
+		delete(manager.schedules, name)
+	}
+	manager.mu.Unlock()
+}
+
+func (manager *backgroundRuntimeManager) runWSClient(name string, runtime *wsClientRuntime) {
+	runtime.run()
+	manager.mu.Lock()
+	if manager.wsClients[name] == runtime {
+		delete(manager.wsClients, name)
+	}
+	manager.mu.Unlock()
+}
+
+func buildScheduleJobConfigs(config APIConfig) (map[string]scheduleJobConfig, error) {
+	result := make(map[string]scheduleJobConfig)
+	for name, endpoint := range config {
+		if strings.TrimSpace(endpoint.Type) != apiTypeSchedule {
+			continue
+		}
+		if strings.TrimSpace(endpoint.Script) == "" {
+			return nil, fmt.Errorf("schedule %s: script is missing", name)
+		}
+		trigger := endpoint.Trigger
+		trigger.Type, trigger.Value = strings.TrimSpace(trigger.Type), strings.TrimSpace(trigger.Value)
+		if trigger.Type != "cron" {
+			return nil, fmt.Errorf("schedule %s: unsupported trigger type %q", name, trigger.Type)
+		}
+		schedule, err := parseCronSchedule(trigger.Value)
+		if err != nil {
+			return nil, fmt.Errorf("schedule %s: invalid cron trigger %q: %w", name, trigger.Value, err)
+		}
+		result[name] = scheduleJobConfig{name: name, scriptPath: endpoint.Script, trigger: trigger, description: endpoint.Description, schedule: schedule}
+	}
+	return result, nil
+}
+
+func buildWSClientConfigs(config APIConfig) (map[string]wsClientConfig, error) {
+	result := make(map[string]wsClientConfig)
+	for name, endpoint := range config {
+		if strings.TrimSpace(endpoint.Type) != apiTypeWSClient {
+			continue
+		}
+		if strings.TrimSpace(endpoint.Script) == "" {
+			return nil, fmt.Errorf("ws_client %s: script is missing", name)
+		}
+		connectURL, err := resolveConnectURL(endpoint.ConnectURL)
+		if err != nil {
+			return nil, fmt.Errorf("ws_client %s: %w", name, err)
+		}
+		result[name] = wsClientConfig{name: name, scriptPath: endpoint.Script, connectURL: connectURL, description: endpoint.Description}
+	}
+	return result, nil
+}
+
+func signalRuntime(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func newScheduleRuntime(cfg scheduleJobConfig) *scheduleRuntime {
+	copy := cfg
+	return &scheduleRuntime{desired: &copy, wake: make(chan struct{}, 1), done: make(chan struct{})}
+}
+
+func sameScheduleTiming(a, b scheduleJobConfig) bool {
+	return a.name == b.name && a.scriptPath == b.scriptPath && a.trigger == b.trigger
+}
+func sameScheduleConfig(a, b scheduleJobConfig) bool {
+	return sameScheduleTiming(a, b) && a.description == b.description
+}
+
+func (runtime *scheduleRuntime) update(cfg *scheduleJobConfig) (bool, bool) {
+	runtime.mu.Lock()
+	if runtime.stopped {
+		runtime.mu.Unlock()
+		return false, false
+	}
+	if cfg == nil {
+		if runtime.desired == nil {
+			runtime.mu.Unlock()
+			return true, false
+		}
+		runtime.desired = nil
+		runtime.mu.Unlock()
+		signalRuntime(runtime.wake)
+		return true, true
+	}
+	if runtime.desired != nil && sameScheduleConfig(*runtime.desired, *cfg) {
+		runtime.mu.Unlock()
+		return true, false
+	}
+	wake := runtime.desired == nil || !sameScheduleTiming(*runtime.desired, *cfg)
+	copy := *cfg
+	runtime.desired = &copy
+	runtime.mu.Unlock()
+	if wake {
+		signalRuntime(runtime.wake)
+	}
+	return true, true
+}
+
+func (runtime *scheduleRuntime) current(stop bool) (scheduleJobConfig, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.desired == nil {
+		if stop {
+			runtime.stopped = true
+		}
+		return scheduleJobConfig{}, false
+	}
+	return *runtime.desired, true
+}
+
+func (runtime *scheduleRuntime) run() {
+	defer close(runtime.done)
+	for {
+		cfg, active := runtime.current(true)
+		if !active {
+			return
+		}
+		next := cfg.schedule.next(time.Now())
+		if next.IsZero() {
+			<-runtime.wake
+			continue
+		}
+		timer := time.NewTimer(time.Until(next))
+		select {
+		case <-runtime.wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			continue
+		case <-timer.C:
+		}
+		latest, active := runtime.current(false)
+		if !active || !sameScheduleTiming(cfg, latest) {
+			continue
+		}
+		params := map[string]interface{}{"api": latest.name, "nyan_job_name": latest.name, "nyan_schedule_trigger_type": latest.trigger.Type, "nyan_schedule_trigger": latest.trigger.Value, "nyan_schedule_time": next.Format(time.RFC3339), "nyan_schedule_description": latest.description}
+		if result, err := runJavaScript(latest.scriptPath, "", params); err != nil {
+			log.Printf("Schedule job %s failed: %v", latest.name, err)
+		} else {
+			log.Printf("Schedule job %s completed: %s", latest.name, result)
+		}
+	}
+}
+
+func newWSClientRuntime(cfg wsClientConfig) *wsClientRuntime {
+	copy := cfg
+	return &wsClientRuntime{desired: &copy, wake: make(chan struct{}, 1), done: make(chan struct{})}
+}
+
+func (runtime *wsClientRuntime) update(cfg *wsClientConfig) (bool, bool, bool) {
+	runtime.mu.Lock()
+	if runtime.stopped {
+		runtime.mu.Unlock()
+		return false, false, false
+	}
+	if cfg == nil {
+		if runtime.desired == nil {
+			runtime.mu.Unlock()
+			return true, false, false
+		}
+		runtime.desired = nil
+		conn, cancel := runtime.conn, runtime.dialCancel
+		runtime.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if conn != nil {
+			_ = conn.Close()
+		}
+		signalRuntime(runtime.wake)
+		return true, true, false
+	}
+	if runtime.desired != nil && *runtime.desired == *cfg {
+		runtime.mu.Unlock()
+		return true, false, false
+	}
+	reconnect := runtime.desired == nil || runtime.desired.connectURL != cfg.connectURL
+	copy := *cfg
+	runtime.desired = &copy
+	conn, cancel := runtime.conn, runtime.dialCancel
+	runtime.mu.Unlock()
+	if reconnect {
+		if cancel != nil {
+			cancel()
+		}
+		if conn != nil {
+			_ = conn.Close()
+		}
+		signalRuntime(runtime.wake)
+	}
+	return true, true, reconnect
+}
+
+func (runtime *wsClientRuntime) current(stop bool) (wsClientConfig, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.desired == nil {
+		if stop {
+			runtime.stopped = true
+		}
+		return wsClientConfig{}, false
+	}
+	return *runtime.desired, true
+}
+
+func (runtime *wsClientRuntime) beginDial(cfg wsClientConfig) (context.Context, context.CancelFunc, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.stopped || runtime.desired == nil || runtime.desired.connectURL != cfg.connectURL {
+		return nil, nil, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime.dialCancel = cancel
+	return ctx, cancel, true
+}
+
+func (runtime *wsClientRuntime) finishDial(cancel context.CancelFunc) {
+	runtime.mu.Lock()
+	runtime.dialCancel = nil
+	runtime.mu.Unlock()
+	cancel()
+}
+func (runtime *wsClientRuntime) acceptConnection(conn *websocket.Conn, url string) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.stopped || runtime.desired == nil || runtime.desired.connectURL != url {
+		return false
+	}
+	runtime.conn = conn
+	return true
+}
+func (runtime *wsClientRuntime) clearConnection(conn *websocket.Conn) {
+	runtime.mu.Lock()
+	if runtime.conn == conn {
+		runtime.conn = nil
+	}
+	runtime.mu.Unlock()
+}
+
+func (runtime *wsClientRuntime) run() {
+	defer close(runtime.done)
+	backoff := time.Second
+	for {
+		cfg, active := runtime.current(true)
+		if !active {
+			return
+		}
+		err := runtime.connectAndListen(cfg)
+		latest, active := runtime.current(true)
+		if !active {
+			return
+		}
+		if latest.connectURL != cfg.connectURL {
+			select {
+			case <-runtime.wake:
+			default:
+			}
+			backoff = time.Second
+			continue
+		}
+		if err != nil {
+			log.Printf("WebSocket client %s disconnected: %v", cfg.name, err)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-runtime.wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			backoff = time.Second
+		case <-timer.C:
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
+	ctx, cancel, ok := runtime.beginDial(cfg)
+	if !ok {
+		return nil
+	}
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, cfg.connectURL, nil)
+	runtime.finishDial(cancel)
+	if err != nil {
+		return fmt.Errorf("dial failed: %w", err)
+	}
+	if !runtime.acceptConnection(conn, cfg.connectURL) {
+		_ = conn.Close()
+		return nil
+	}
+	defer runtime.clearConnection(conn)
+	defer conn.Close()
+	for {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read error: %w", err)
+		}
+		latest, active := runtime.current(false)
+		if !active || latest.connectURL != cfg.connectURL {
+			return nil
+		}
+		params := map[string]interface{}{"api": latest.name, "ws_client": latest.name, "ws_message_type": websocketMessageTypeLabel(msgType), "ws_message_text": string(data), "ws_connect_url": latest.connectURL, "ws_description": latest.description}
+		if msgType == websocket.BinaryMessage {
+			params["ws_message_base64"] = base64.StdEncoding.EncodeToString(data)
+		}
+		if msgType == websocket.TextMessage {
+			var decoded interface{}
+			if json.Unmarshal(data, &decoded) == nil {
+				params["ws_message_json"] = decoded
+			}
+		}
+		result, err := runJavaScript(latest.scriptPath, "", params)
+		if err != nil {
+			log.Printf("ws_client %s script error: %v", latest.name, err)
+			continue
+		}
+		if result = strings.TrimSpace(result); result != "" {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(result)); err != nil {
+				return fmt.Errorf("send error: %w", err)
 			}
 		}
 	}
