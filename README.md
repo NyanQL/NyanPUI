@@ -53,7 +53,7 @@ NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./NyanPUI_
 
 CLI オプションと環境変数には絶対パス、または NyanPUI を起動したカレントディレクトリからの相対パスを指定できます。指定したファイルが存在しない場合、またはディレクトリを指定した場合は起動時にエラーになります。
 
-`api.json` 内の `script` / `html` / `path` / `paramCheck` / `outCheck` の相対パスは、`api.json` が置かれているディレクトリから解決されます。
+各 `api.json` 内の `script` / `html` / `path` / `paramCheck` / `outCheck` の相対パスは、その定義を書いた `api.json` が置かれているディレクトリから解決されます。
 `config.json` 内の `certPath` / `keyPath` / `javascript_include` / `log.Filename` の相対パスは、`config.json` が置かれているディレクトリから解決されます。
 
 起動時のログには、読み込んだ `config.json` / `api.json` の絶対パスと、その指定元（`--api`, `--config`, 環境変数, default）が出力されます。`/css`, `/images`, `/js`, `/favicon.ico` の組み込み静的ファイルは、設定ファイルの場所に関係なく実行ファイルと同じディレクトリの `html/` 配下から配信されます。
@@ -100,9 +100,9 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
 
 ### api.json のホットリロード
 
-`api.json` は既定で1秒ごとに確認され、内容のSHA-256が変化した場合だけ再読み込みされます。`APIHotReload.Enabled` を `false` にすると無効化できます。`Interval` は `500ms`、`1s`、`1m`、`24h` などのGo duration形式で指定し、省略時は `1s` です。0以下または解析できない値は起動エラーになります。
+ルートの `api.json` と、そこからincludeされたすべての `api.json` は既定で1秒ごとに確認され、いずれかの内容が変化した場合にルートから再読み込みされます。`APIHotReload.Enabled` を `false` にすると無効化できます。`Interval` は `500ms`、`1s`、`1m`、`24h` などのGo duration形式で指定し、省略時は `1s` です。0以下または解析できない値は起動エラーになります。
 
-再読み込みではJSON全体と、すべての `schedule` / `ws_client` 定義を事前検証します。正常な候補だけが一括で公開され、不正な内容の場合は直前の正常な定義を維持します。同じ不正内容は変更されるまで再解析・再出力しません。
+再読み込みではincludeグラフ全体と、すべての `schedule` / `ws_client` 定義を事前検証します。正常な候補だけが一括で公開され、不正な内容の場合は直前の正常な定義を維持します。存在しないinclude候補も監視され、ファイルを作成・修正すると自動復旧します。同じ不正内容のログは状態が変わるまで重複出力しません。
 
 追加、変更、削除は通常API、HTML API、public API、`/nyan`、JSON-RPC、`nyanCallMe`、WebSocket受信処理、pushへ次の処理から反映されます。`schedule` と `ws_client` も動的に開始、更新、停止します。既存のWebSocketサーバー接続は設定変更だけでは切断されません。`ws_client` はscriptまたはdescriptionだけの変更では接続を維持し、`connectURL` の変更時だけ接続先を切り替えます。
 
@@ -157,7 +157,22 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
 
 省略可能なフィールド: `type`, `script`, `html`, `path`, `connectURL`, `trigger`, `paramCheck`, `outCheck`, `description`, `push`。
 
-`paramCheck` は `paramcheck`、`outCheck` は `outcheck` の小文字表記でも読み込めます。README では `paramCheck` / `outCheck` を推奨表記とします。
+`paramCheck` は `paramcheck` / `check`、`outCheck` は `outcheck` の別名でも読み込めます。README では `paramCheck` / `outCheck` を推奨表記とします。
+
+### api.jsonの分割と多段include
+
+`type: "include"` を使うとAPI定義を複数ファイルに分割できます。includeのキーがマウント名となり、子ファイルのAPIは `/` 区切りの完全名で公開されます。
+
+```json
+{
+  "health": {"script": "./javascript/health.js"},
+  "sub": {"type": "include", "path": "./sub/api.json"}
+}
+```
+
+子の `sub/api.json` に `getItem` と、さらに `admin` includeがある場合、API名は `sub/getItem`、`sub/admin/...` となります。完全名はHTTP、WebSocket、JSON-RPC、`nyanCallMe`、push、public、schedule、ws_clientで共通です。
+
+include定義に指定できるフィールドは`type`と`path`だけです。循環参照、展開後の重複名、重複JSONキー、マウント名の衝突や `/` を含む不正なマウント名は読み込みエラーになります。includeされない既存API名に `/` を含める書き方は引き続き利用できます。
 
 通常 API は `GET`, `POST`, `PUT`, `DELETE` などのメソッドを受け付けます。`Content-Type: application/json` の JSON body、フォーム値、URL クエリを `nyanAllParams` にまとめて渡します。`api` が未指定の場合は、エンドポイントパスまたは `html` が入ります。
 
@@ -331,6 +346,35 @@ return {
 };
 ```
 
+### `/nyan`と入出力スキーマ
+
+`GET /nyan`または`GET /nyan/`は通常APIだけを一覧表示します。`public`、`schedule`、`ws_client`は含まれません。`GET /nyan/{API名}`では通常APIの詳細と`inputSchema`、`outputSchema`、`schemaSource`を返します。includeされたAPIも`/nyan/sub/admin/getItem`のような完全名で取得できます。
+
+入力スキーマは`paramCheck`のトップレベルに`nyanInputSchema`、出力スキーマは`outCheck`に`nyanOutputSchema`として宣言します。
+
+```js
+const nyanInputSchema = {
+  type: "object",
+  properties: {id: {type: "integer"}},
+  required: ["id"],
+  additionalProperties: false
+};
+```
+
+```js
+const nyanOutputSchema = {
+  type: "object",
+  properties: {status: {const: 200}},
+  required: ["status"]
+};
+```
+
+入力は`nyanInputSchema`、本体scriptの旧形式`nyanAcceptedParams`、空スキーマの順で解決します。出力は`nyanOutputSchema`、空スキーマの順です。legacy入力を利用した場合は互換性のため`nyanAcceptedParams`も返します。`nyanOutputColumns`は公開しません。
+
+スキーマはJavaScriptを実行せずASTから静的に読み取ります。オブジェクト、配列、文字列、数値、真偽値、`null`を利用できます。関数呼び出し、spread、識別子参照などの動的な定義はスキーマ解決エラーになります。スキーマファイルは詳細リクエストごとに読み直されます。
+
+公開したJSON Schemaによるリクエスト・レスポンスの自動検証は行いません。実際の検証は従来どおり`paramCheck`と`outCheck`が担当します。
+
 ### WebSocket レシーバー（`type: "ws_client"`）
 
 `type: "ws_client"` を指定すると NyanPUI 自身が WebSocket クライアントになり、起動時に常時接続します（HTTP エンドポイントとしては登録されません）。
@@ -416,7 +460,7 @@ schedule の `script` では通常 API と同じ Goja 環境を使えます。�
 
 * `config.json` と `api.json` を編集後、実行ファイルを起動。設定ファイルを別の場所に置く場合は `--api` / `--config`、または `NYAN_API_PATH` / `NYAN_CONFIG_PATH` で指定します。
 * デフォルトで [http://localhost:8009/](http://localhost:8009/) にアクセスするとサンプルが表示されます。 Windows MacOS Linuxで実行可能です。 各自でビルドいただくか、[リリース](https://github.com/NyanQL/NyanPUI/releases)からダウンロードしてください。
-* `/nyan` にアクセスすると、`type: "schedule"` 以外の API 一覧を JSON で取得できます。
+* `/nyan` にアクセスすると通常APIの一覧を、`/nyan/{API名}`では入出力スキーマを含む詳細をJSONで取得できます。
 * `/css`, `/images`, `/js`, `/favicon.ico` は `html/` 配下の静的ファイルとして配信されます。
 
 ## ビルド

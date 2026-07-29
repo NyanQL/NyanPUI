@@ -396,8 +396,8 @@ func TestLoadAPIConfigResolvesEndpointPathsFromAPIFileDirectory(t *testing.T) {
 			"path": "./public"
 		}
 	}`)
-	apiConfig = nil
-	t.Cleanup(func() { apiConfig = nil })
+	setAPIConfig(nil)
+	t.Cleanup(func() { setAPIConfig(nil) })
 
 	if err := loadAPIConfig(apiPath, apiBaseDir); err != nil {
 		t.Fatalf("loadAPIConfig() error = %v", err)
@@ -942,6 +942,181 @@ func assertParamCheckResponse(t *testing.T, body []byte, success bool, status in
 	}
 	if response.Status != status {
 		t.Fatalf("status = %d, want %d; body=%q", response.Status, status, string(body))
+	}
+}
+
+func TestReadAPIConfigGraphExpandsNestedIncludesAndResolvesPaths(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "api.json")
+	child := filepath.Join(dir, "sub", "api.json")
+	grandchild := filepath.Join(dir, "sub", "admin", "api.json")
+	writeTestFile(t, root, `{"root":{"script":"./root.js"},"sub":{"type":"include","path":"./sub/api.json"}}`)
+	writeTestFile(t, child, `{"item":{"script":"./item.js","html":"./item.html"},"admin":{"type":"include","path":"./admin/api.json"}}`)
+	writeTestFile(t, grandchild, `{"user":{"script":"./user.js","paramCheck":"./check.js","outCheck":"./out.js"}}`)
+
+	loaded, err := readAPIConfigGraph(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := loaded.Snapshot.Config
+	if len(config) != 3 {
+		t.Fatalf("api count = %d, want 3: %#v", len(config), config)
+	}
+	if got := config["sub/item"].Script; got != filepath.Join(dir, "sub", "item.js") {
+		t.Fatalf("sub/item script = %q", got)
+	}
+	if got := config["sub/item"].HTML; got != filepath.Join(dir, "sub", "item.html") {
+		t.Fatalf("sub/item html = %q", got)
+	}
+	if got := config["sub/admin/user"].ParamCheck; got != filepath.Join(dir, "sub", "admin", "check.js") {
+		t.Fatalf("nested paramCheck = %q", got)
+	}
+	if _, exists := config["sub"]; exists {
+		t.Fatal("include definition was published as an API")
+	}
+	if len(loaded.Snapshot.FileStates) != 3 {
+		t.Fatalf("watched files = %d, want 3", len(loaded.Snapshot.FileStates))
+	}
+}
+
+func TestReadAPIConfigGraphRejectsInvalidIncludes(t *testing.T) {
+	t.Run("cycle", func(t *testing.T) {
+		dir := t.TempDir()
+		root := filepath.Join(dir, "api.json")
+		child := filepath.Join(dir, "child.json")
+		writeTestFile(t, root, `{"child":{"type":"include","path":"./child.json"}}`)
+		writeTestFile(t, child, `{"root":{"type":"include","path":"./api.json"}}`)
+		if _, err := readAPIConfigGraph(root, dir); err == nil || !strings.Contains(err.Error(), "cycle") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("duplicate key", func(t *testing.T) {
+		dir := t.TempDir()
+		root := filepath.Join(dir, "api.json")
+		writeTestFile(t, root, `{"x":{"script":"a"},"x":{"script":"b"}}`)
+		if _, err := readAPIConfigGraph(root, dir); err == nil || !strings.Contains(err.Error(), "duplicate key") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("mount conflict", func(t *testing.T) {
+		dir := t.TempDir()
+		root := filepath.Join(dir, "api.json")
+		writeTestFile(t, root, `{"sub":{"type":"include","path":"child.json"},"sub/existing":{"script":"x.js"}}`)
+		writeTestFile(t, filepath.Join(dir, "child.json"), `{}`)
+		if _, err := readAPIConfigGraph(root, dir); err == nil || !strings.Contains(err.Error(), "conflicts") {
+			t.Fatalf("error = %v", err)
+		}
+	})
+}
+
+func TestReloadAPIConfigGraphTracksGrandchildAndRecoversMissingInclude(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "api.json")
+	child := filepath.Join(dir, "child.json")
+	grandchild := filepath.Join(dir, "grandchild.json")
+	writeTestFile(t, root, `{"sub":{"type":"include","path":"child.json"}}`)
+	writeTestFile(t, child, `{"nested":{"type":"include","path":"grandchild.json"}}`)
+	writeTestFile(t, grandchild, `{"one":{"script":"one.js"}}`)
+	loaded, err := readAPIConfigGraph(root, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := currentAPISnapshot()
+	publishAPISnapshot(loaded.Snapshot)
+	t.Cleanup(func() { publishAPISnapshot(old) })
+
+	writeTestFile(t, grandchild, `{"two":{"script":"two.js"}}`)
+	states, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, loaded.Snapshot.FileStates)
+	if err != nil || !reloaded {
+		t.Fatalf("reloaded=%v err=%v", reloaded, err)
+	}
+	if _, ok := currentAPIConfig()["sub/nested/two"]; !ok {
+		t.Fatal("grandchild change was not published")
+	}
+
+	writeTestFile(t, child, `{"missing":{"type":"include","path":"missing.json"}}`)
+	states, reloaded, err = reloadAPIConfigGraphIfChanged(root, dir, states)
+	if err == nil || reloaded {
+		t.Fatalf("reloaded=%v err=%v", reloaded, err)
+	}
+	missing := filepath.Join(dir, "missing.json")
+	if _, watched := states[missing]; !watched {
+		t.Fatalf("missing candidate is not watched: %#v", states)
+	}
+	writeTestFile(t, missing, `{"ready":{"script":"ready.js"}}`)
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(root, dir, states)
+	if err != nil || !reloaded {
+		t.Fatalf("recovery reloaded=%v err=%v", reloaded, err)
+	}
+	if _, ok := currentAPIConfig()["sub/missing/ready"]; !ok {
+		t.Fatal("created include was not published")
+	}
+}
+
+func TestHandleNyanDetailPublishesStaticSchemas(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	paramCheck := filepath.Join(dir, "param.js")
+	outCheck := filepath.Join(dir, "out.js")
+	writeTestFile(t, paramCheck, `const nyanInputSchema = {type:"object",properties:{id:{type:"integer"}},required:["id"]};`)
+	writeTestFile(t, outCheck, `const nyanOutputSchema = {type:"object",properties:{status:{const:200}}};`)
+	old := currentAPISnapshot()
+	setAPIConfig(APIConfig{"sub/get": {ParamCheck: paramCheck, OutCheck: outCheck, Description: "nested"}, "assets": {Type: apiTypePublic}})
+	t.Cleanup(func() { publishAPISnapshot(old) })
+	router := gin.New()
+	router.GET("/nyan", handleNyan)
+	router.GET("/nyan/*apiName", handleNyanDetail)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/nyan/sub/get", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	sources := response["schemaSource"].(map[string]interface{})
+	if sources["input"] != schemaSourceParamCheck || sources["output"] != schemaSourceOutCheck {
+		t.Fatalf("sources=%#v", sources)
+	}
+
+	list := httptest.NewRecorder()
+	router.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/nyan/", nil))
+	if strings.Contains(list.Body.String(), "assets") {
+		t.Fatalf("public API leaked into list: %s", list.Body.String())
+	}
+}
+
+func TestNyanCallMeKeepsCapturedSnapshotGeneration(t *testing.T) {
+	dir := t.TempDir()
+	caller := filepath.Join(dir, "caller.js")
+	oldTarget := filepath.Join(dir, "old.js")
+	newTarget := filepath.Join(dir, "new.js")
+	writeTestFile(t, caller, `JSON.stringify(nyanCallMe({api:"sub/target"}));`)
+	writeTestFile(t, oldTarget, `({status:200,generation:"old"});`)
+	writeTestFile(t, newTarget, `({status:200,generation:"new"});`)
+	captured := &APIConfigSnapshot{Config: APIConfig{"sub/caller": {Script: caller}, "sub/target": {Script: oldTarget}}}
+	latest := &APIConfigSnapshot{Config: APIConfig{"sub/caller": {Script: caller}, "sub/target": {Script: newTarget}}}
+	old := currentAPISnapshot()
+	publishAPISnapshot(latest)
+	t.Cleanup(func() { publishAPISnapshot(old) })
+
+	result, err := runJavaScriptWithSnapshot(captured, caller, "", map[string]interface{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, `"generation":"old"`) {
+		t.Fatalf("result=%q, want captured generation", result)
+	}
+}
+
+func TestStaticSchemaParserRejectsDynamicValues(t *testing.T) {
+	if _, err := parseStaticJavaScriptValue("schema.js", `{type:createType()}`); err == nil {
+		t.Fatal("dynamic function call was accepted")
+	}
+	if _, err := parseStaticJavaScriptValue("schema.js", `{...common}`); err == nil {
+		t.Fatal("spread property was accepted")
 	}
 }
 
