@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1118,6 +1122,425 @@ func TestStaticSchemaParserRejectsDynamicValues(t *testing.T) {
 	if _, err := parseStaticJavaScriptValue("schema.js", `{...common}`); err == nil {
 		t.Fatal("spread property was accepted")
 	}
+}
+
+func TestMCPJSONSchemaValidationRejectsInvalidValuesAndExternalReferences(t *testing.T) {
+	schema := map[string]interface{}{
+		"type":                 "object",
+		"properties":           map[string]interface{}{"value": map[string]interface{}{"type": "integer"}},
+		"required":             []interface{}{"value"},
+		"additionalProperties": false,
+	}
+	if err := validateMCPJSONSchemaValue(schema, map[string]interface{}{"value": float64(1)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMCPJSONSchemaValue(schema, map[string]interface{}{"value": "not-an-integer"}); err == nil {
+		t.Fatal("invalid input was accepted")
+	}
+	if _, err := compileMCPJSONSchema(map[string]interface{}{"$ref": "https://example.test/schema.json"}); err == nil {
+		t.Fatal("external JSON Schema reference was accepted")
+	}
+}
+
+func TestMCPRateAndConcurrencyLimits(t *testing.T) {
+	now := time.Now()
+	limit := &MCPRateLimit{Requests: 2, Window: "1m"}
+	endpointName := t.Name()
+	if allowed, _ := mcpRateLimitAllows(endpointName, limit, "192.0.2.10:1234", now); !allowed {
+		t.Fatal("first request was rejected")
+	}
+	if allowed, _ := mcpRateLimitAllows(endpointName, limit, "192.0.2.10:5678", now); !allowed {
+		t.Fatal("second request was rejected")
+	}
+	if allowed, retry := mcpRateLimitAllows(endpointName, limit, "192.0.2.10:9999", now); allowed || retry <= 0 {
+		t.Fatalf("third request allowed=%v retry=%s", allowed, retry)
+	}
+	if allowed, _ := mcpRateLimitAllows(endpointName, limit, "192.0.2.10:1234", now.Add(time.Minute)); !allowed {
+		t.Fatal("request after window was rejected")
+	}
+	release, acquired := acquireMCPExecutionSlot(endpointName, 1)
+	if !acquired {
+		t.Fatal("first concurrency slot was rejected")
+	}
+	if _, acquired := acquireMCPExecutionSlot(endpointName, 1); acquired {
+		t.Fatal("concurrency limit was not enforced")
+	}
+	release()
+	if releaseAgain, acquired := acquireMCPExecutionSlot(endpointName, 1); !acquired {
+		t.Fatal("released concurrency slot was not reusable")
+	} else {
+		releaseAgain()
+	}
+}
+
+func TestProductionMCPConfiguration(t *testing.T) {
+	path, err := filepath.Abs("api.vps.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Skip("local production API configuration is not present")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readAPIConfigGraph(path, filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcp := loaded.Snapshot.Config["server_mcp_http"]
+	if mcp.Transport != "streamable_http" || len(mcp.Tools) != 1 || mcp.Tools[0].Name != "sample/json" {
+		t.Fatalf("production MCP=%#v", mcp)
+	}
+}
+
+func TestMCPAndOAuthDelegateDecisionsToJavaScriptHooks(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	hook := filepath.Join(dir, "oauth_validate.js")
+	toolScript := filepath.Join(dir, "tool.js")
+	writeTestFile(t, hook, `({authenticated: nyanAllParams.authorization === "Bearer test-token", principal:{id:"user-1"}});`)
+	writeTestFile(t, toolScript, `({status:200,contentType:"application/json",body:{ok:true,items:[1,2,3]}});`)
+	snapshot := &APIConfigSnapshot{Config: APIConfig{
+		"server_mcp":                             {Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{"2025-11-25"}, AllowedOrigins: []string{"https://chatgpt.com"}, RedirectURIAllowedPrefixes: []string{"https://chatgpt.com/connector/oauth/"}, OAuth: MCPOAuthHooks{AuthorizationServerMetadata: ".well-known/oauth-authorization-server", ProtectedResourceMetadataAPI: ".well-known/oauth-protected-resource/server_mcp", Authorize: "oauth/authorize", Token: "oauth/token", Register: "oauth/register", AdminUser: "oauth/admin/users", VerifyAccess: "oauth/verify_access"}, Tools: []MCPToolConfig{{Name: "sample", API: "sample"}}, Instructions: "test"},
+		"sample":                                 {Type: "api", Script: toolScript, SecuritySchemes: []map[string]interface{}{{"type": "oauth2", "scopes": []string{"nyanpui:read"}}}},
+		".well-known/oauth-authorization-server": {Type: "api"}, ".well-known/oauth-protected-resource/server_mcp": {Type: "api"},
+		"oauth/authorize": {Type: "api", Script: hook}, "oauth/token": {Type: "api", Script: hook}, "oauth/register": {Type: "api", Script: hook}, "oauth/admin/users": {Type: "api", Script: hook}, "oauth/verify_access": {Type: "api", Script: hook, Scopes: []string{"nyanpui:read"}},
+	}}
+	if err := validateMCPConfiguration(snapshot.Config); err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot := currentAPISnapshot()
+	oldConfig := globalConfig
+	publishAPISnapshot(snapshot)
+	globalConfig = Config{Name: "NyanPUI", Version: "test"}
+	t.Cleanup(func() { publishAPISnapshot(oldSnapshot); globalConfig = oldConfig })
+
+	router := gin.New()
+	router.Use(CORSMiddleware())
+	router.NoRoute(func(c *gin.Context) {
+		if !dispatchMCPOrOAuth(c) {
+			c.Status(http.StatusNotFound)
+		}
+	})
+	preflight := httptest.NewRequest(http.MethodOptions, "/server_mcp", nil)
+	preflight.Header.Set("Origin", "https://chatgpt.com")
+	preflightResponse := httptest.NewRecorder()
+	router.ServeHTTP(preflightResponse, preflight)
+	if preflightResponse.Code != http.StatusNoContent || preflightResponse.Header().Get("Access-Control-Allow-Origin") != "https://chatgpt.com" {
+		t.Fatalf("preflight status=%d headers=%v", preflightResponse.Code, preflightResponse.Header())
+	}
+	forbiddenPreflight := httptest.NewRequest(http.MethodOptions, "/server_mcp", nil)
+	forbiddenPreflight.Header.Set("Origin", "https://attacker.test")
+	forbiddenPreflightResponse := httptest.NewRecorder()
+	router.ServeHTTP(forbiddenPreflightResponse, forbiddenPreflight)
+	if forbiddenPreflightResponse.Code != http.StatusForbidden || forbiddenPreflightResponse.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("forbidden preflight status=%d headers=%v", forbiddenPreflightResponse.Code, forbiddenPreflightResponse.Header())
+	}
+	notification := httptest.NewRequest(http.MethodPost, "/server_mcp", strings.NewReader(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
+	notification.Header.Set("Content-Type", "application/json")
+	notification.Header.Set("Accept", "application/json, text/event-stream")
+	notification.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	notificationResponse := httptest.NewRecorder()
+	router.ServeHTTP(notificationResponse, notification)
+	if notificationResponse.Code != http.StatusAccepted || notificationResponse.Body.Len() != 0 {
+		t.Fatalf("notification status=%d body=%s", notificationResponse.Code, notificationResponse.Body.String())
+	}
+	body, _ := json.Marshal(map[string]interface{}{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": map[string]interface{}{"name": "sample", "arguments": map[string]interface{}{}}})
+	req := httptest.NewRequest(http.MethodPost, "/server_mcp", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"structuredContent"`) || !strings.Contains(rec.Body.String(), `"ok":true`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), hook) {
+		t.Fatal("hook filesystem path leaked in MCP response")
+	}
+}
+
+func TestOAuthHookJavaScriptLoadsWithoutGoState(t *testing.T) {
+	path, err := filepath.Abs("javascript/oauth_hooks.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		t.Skip("local OAuth hook JavaScript is not present")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot := currentAPISnapshot()
+	oldConfig := globalConfig
+	publishAPISnapshot(&APIConfigSnapshot{Config: APIConfig{}})
+	globalConfig = Config{}
+	t.Cleanup(func() { publishAPISnapshot(oldSnapshot); globalConfig = oldConfig })
+	value, err := runJavaScriptValueWithSnapshot(currentAPISnapshot(), path, "", map[string]interface{}{"oauth_hook": "oauthValidateAccessToken", "headers": map[string]interface{}{}, "resource": "https://example.test/mcp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := value.Export().(map[string]interface{})
+	if !ok || result["authenticated"] != false {
+		t.Fatalf("hook result=%#v", value.Export())
+	}
+}
+
+func TestJavaScriptOAuthAuthorizationCodePKCEFlow(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	hook, err := filepath.Abs("javascript/oauth_hooks.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(hook); os.IsNotExist(err) {
+		t.Skip("local OAuth hook JavaScript is not present")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	toolScript := filepath.Join(t.TempDir(), "tool.js")
+	writeTestFile(t, toolScript, `({status:200,contentType:"application/json",body:{ok:true,user:nyanAllParams.mcp_principal.user_id}});`)
+	stateDirectory := t.TempDir()
+	resource := "https://example.test:8443/server_mcp"
+	snapshot := &APIConfigSnapshot{Config: APIConfig{
+		"server_mcp":                             {Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{"2025-11-25"}, AllowedOrigins: []string{"https://chatgpt.com"}, RedirectURIAllowedPrefixes: []string{"https://chatgpt.com/connector/oauth/"}, OAuth: MCPOAuthHooks{AuthorizationServerMetadata: ".well-known/oauth-authorization-server", ProtectedResourceMetadataAPI: ".well-known/oauth-protected-resource/server_mcp", Authorize: "oauth/authorize", Token: "oauth/token", Register: "oauth/register", AdminUser: "oauth/admin/users", VerifyAccess: "oauth/verify_access"}, Tools: []MCPToolConfig{{Name: "sample", API: "sample"}}},
+		"sample":                                 {Type: "api", Script: toolScript, SecuritySchemes: []map[string]interface{}{{"type": "oauth2", "scopes": []string{"nyanpui:read"}}}},
+		".well-known/oauth-authorization-server": {Type: "api"}, ".well-known/oauth-protected-resource/server_mcp": {Type: "api"},
+		"oauth/authorize": {Type: "api", Script: hook}, "oauth/token": {Type: "api", Script: hook}, "oauth/register": {Type: "api", Script: hook}, "oauth/admin/users": {Type: "api", Script: hook}, "oauth/verify_access": {Type: "api", Script: hook, Scopes: []string{"nyanpui:read"}},
+	}}
+	if err := validateMCPConfiguration(snapshot.Config); err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot := currentAPISnapshot()
+	oldConfig := globalConfig
+	publishAPISnapshot(snapshot)
+	globalConfig = Config{Name: "NyanPUI", Version: "test", BasicAuth: BasicAuthConfig{Username: "operator", Password: "operator-password"}, OAuthStateRoot: stateDirectory}
+	t.Cleanup(func() { publishAPISnapshot(oldSnapshot); globalConfig = oldConfig })
+	router := gin.New()
+	router.NoRoute(func(c *gin.Context) {
+		c.Request.Host = "example.test:8443"
+		c.Request.URL.Scheme = "https"
+		if !dispatchMCPOrOAuth(c) {
+			c.Status(http.StatusNotFound)
+		}
+	})
+
+	adminBody := strings.NewReader(`{"username":"neko","password":"oauth-password"}`)
+	adminRequest := httptest.NewRequest(http.MethodPost, "/oauth/admin/users", adminBody)
+	adminRequest.Header.Set("Content-Type", "application/json")
+	adminRequest.SetBasicAuth("operator", "operator-password")
+	admin := httptest.NewRecorder()
+	router.ServeHTTP(admin, adminRequest)
+	if admin.Code != http.StatusCreated {
+		t.Fatalf("admin status=%d body=%s", admin.Code, admin.Body.String())
+	}
+	badRegisterRequest := httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(`{"redirect_uris":["https://attacker.test/callback"],"scope":"nyanpui:read"}`))
+	badRegisterRequest.Header.Set("Content-Type", "application/json")
+	badRegistration := httptest.NewRecorder()
+	router.ServeHTTP(badRegistration, badRegisterRequest)
+	if badRegistration.Code != http.StatusBadRequest || !strings.Contains(badRegistration.Body.String(), "invalid_redirect_uri") {
+		t.Fatalf("bad registration status=%d body=%s", badRegistration.Code, badRegistration.Body.String())
+	}
+
+	registerRequest := httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(`{"client_name":"test","redirect_uris":["https://chatgpt.com/connector/oauth/test-client"],"scope":"nyanpui:read","grant_types":["authorization_code","refresh_token"],"response_types":["code"],"token_endpoint_auth_method":"none"}`))
+	registerRequest.Header.Set("Content-Type", "application/json; charset=utf-8")
+	registration := httptest.NewRecorder()
+	router.ServeHTTP(registration, registerRequest)
+	if registration.Code != http.StatusCreated {
+		t.Fatalf("register status=%d body=%s", registration.Code, registration.Body.String())
+	}
+	var client map[string]interface{}
+	if err := json.Unmarshal(registration.Body.Bytes(), &client); err != nil {
+		t.Fatal(err)
+	}
+	clientID, _ := client["client_id"].(string)
+	if clientID == "" {
+		t.Fatalf("registration=%#v", client)
+	}
+
+	verifier := strings.Repeat("v", 48)
+	digest := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(digest[:])
+	authorizeQuery := url.Values{"response_type": {"code"}, "client_id": {clientID}, "redirect_uri": {"https://chatgpt.com/connector/oauth/test-client"}, "scope": {"nyanpui:read"}, "state": {"test-state"}, "resource": {resource}, "code_challenge": {challenge}, "code_challenge_method": {"S256"}}
+	authorizeRequest := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+authorizeQuery.Encode(), nil)
+	authorize := httptest.NewRecorder()
+	router.ServeHTTP(authorize, authorizeRequest)
+	if authorize.Code != http.StatusOK || len(authorize.Result().Cookies()) != 1 {
+		t.Fatalf("authorize status=%d body=%s cookies=%v", authorize.Code, authorize.Body.String(), authorize.Result().Cookies())
+	}
+	body := authorize.Body.String()
+	if !strings.Contains(body, `action="https://example.test:8443/oauth/authorize"`) {
+		t.Fatalf("authorize form action is not absolute: %s", body)
+	}
+	if csp := authorize.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self' https://chatgpt.com") {
+		t.Fatalf("authorize CSP does not allow form submission from a sandboxed OAuth modal: %q", csp)
+	}
+	requestID := htmlInputValue(body, "request_id")
+	csrf := htmlInputValue(body, "csrf")
+	if requestID == "" || csrf == "" {
+		t.Fatalf("authorize form is incomplete: %s", body)
+	}
+	consentForm := url.Values{"request_id": {requestID}, "csrf": {csrf}, "username": {"neko"}, "password": {"oauth-password"}, "decision": {"allow"}}
+	consentRequest := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(consentForm.Encode()))
+	consentRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	consentRequest.AddCookie(authorize.Result().Cookies()[0])
+	consent := httptest.NewRecorder()
+	router.ServeHTTP(consent, consentRequest)
+	if consent.Code != http.StatusSeeOther {
+		t.Fatalf("consent status=%d body=%s", consent.Code, consent.Body.String())
+	}
+	redirect, err := url.Parse(consent.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := redirect.Query().Get("code")
+	if code == "" || redirect.Query().Get("state") != "test-state" {
+		t.Fatalf("redirect=%s", redirect.String())
+	}
+
+	tokenForm := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "client_id": {clientID}, "redirect_uri": {"https://chatgpt.com/connector/oauth/test-client"}, "resource": {resource}, "code_verifier": {verifier}}
+	tokenRequest := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(tokenForm.Encode()))
+	tokenRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenResponse := httptest.NewRecorder()
+	router.ServeHTTP(tokenResponse, tokenRequest)
+	if tokenResponse.Code != http.StatusOK {
+		t.Fatalf("token status=%d body=%s", tokenResponse.Code, tokenResponse.Body.String())
+	}
+	var token map[string]interface{}
+	if err := json.Unmarshal(tokenResponse.Body.Bytes(), &token); err != nil {
+		t.Fatal(err)
+	}
+	accessToken, _ := token["access_token"].(string)
+	if accessToken == "" {
+		t.Fatalf("token=%#v", token)
+	}
+
+	callBody := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sample","arguments":{}}}`
+	callRequest := httptest.NewRequest(http.MethodPost, "/server_mcp", strings.NewReader(callBody))
+	callRequest.Header.Set("Content-Type", "application/json")
+	callRequest.Header.Set("Accept", "application/json, text/event-stream")
+	callRequest.Header.Set("Authorization", "Bearer "+accessToken)
+	callRequest.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	callResponse := httptest.NewRecorder()
+	router.ServeHTTP(callResponse, callRequest)
+	if callResponse.Code != http.StatusOK || !strings.Contains(callResponse.Body.String(), `"user":"neko"`) {
+		t.Fatalf("tool status=%d body=%s", callResponse.Code, callResponse.Body.String())
+	}
+
+	reuseRequest := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(tokenForm.Encode()))
+	reuseRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	reuseResponse := httptest.NewRecorder()
+	router.ServeHTTP(reuseResponse, reuseRequest)
+	if reuseResponse.Code != http.StatusBadRequest || !strings.Contains(reuseResponse.Body.String(), "invalid_grant") {
+		t.Fatalf("reused code status=%d body=%s", reuseResponse.Code, reuseResponse.Body.String())
+	}
+}
+
+func TestCurrentMCPConfigSupportsMultipleTransportsAndSharedTool(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "tool.js")
+	writeTestFile(t, script, `({ok:true,transport:nyanAllParams.mcp_principal.transport});`)
+	data := []byte(fmt.Sprintf(`{"shared":{"type":"api","script":%q,"title":"Shared","description":"shared tool"},"http_mcp":{"type":"mcp","transport":"streamable_http","allowedOrigins":["https://chatgpt.com"],"tools":["shared"]},"local_mcp":{"type":"mcp","transport":"stdio","tools":["shared"]}}`, script))
+	config, err := decodeAPIConfig(data, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config["http_mcp"].Tools) != 1 || config["http_mcp"].Tools[0].Title != "Shared" {
+		t.Fatalf("HTTP tools=%#v", config["http_mcp"].Tools)
+	}
+	if len(config["local_mcp"].Tools) != 1 || config["local_mcp"].Tools[0].API != "shared" {
+		t.Fatalf("stdio tools=%#v", config["local_mcp"].Tools)
+	}
+}
+
+func TestCurrentMCPConfigRejectsRemovedAndUnknownFields(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "tool.js")
+	writeTestFile(t, script, `({ok:true});`)
+	for _, body := range []string{fmt.Sprintf(`{"tool":{"type":"api","script":%q},"m":{"type":"mcp","transports":["stdio"],"tools":["tool"]}}`, script), fmt.Sprintf(`{"tool":{"type":"api","script":%q},"m":{"type":"mcp","transport":"stdio","tools":["tool"],"resource":"https://example.test/m"}}`, script), fmt.Sprintf(`{"tool":{"type":"api","script":%q},"m":{"type":"mcp","transport":"stdio","tools":["tool"],"surprise":true}}`, script)} {
+		if _, err := decodeAPIConfig([]byte(body), dir); err == nil {
+			t.Fatalf("invalid MCP config accepted: %s", body)
+		}
+	}
+}
+
+func TestMCPStdioLifecycleAndPrincipal(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "tool.js")
+	writeTestFile(t, script, `({transport:nyanAllParams.mcp_principal.transport,user:nyanAllParams.mcp_principal.user_id});`)
+	config := APIConfig{"tool": {Type: "api", Script: script}, "local": {Type: apiTypeMCP, Transport: "stdio", Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}}}
+	if err := validateMCPConfiguration(config); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := &APIConfigSnapshot{Config: config}
+	input := strings.Join([]string{`{"jsonrpc":"2.0","id":1,"method":"ping"}`, `{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`, `{"jsonrpc":"2.0","method":"notifications/initialized"}`, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tool","arguments":{}}}`}, "\n") + "\n"
+	var output bytes.Buffer
+	if err := serveMCPStdio(strings.NewReader(input), &output, snapshot, config["local"]); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("responses=%q", output.String())
+	}
+	if !strings.Contains(lines[0], `"code":-32002`) {
+		t.Fatalf("pre-init response=%s", lines[0])
+	}
+	if !strings.Contains(lines[2], `\"transport\":\"stdio\"`) || !strings.Contains(lines[2], `\"user\":\"local-process\"`) {
+		t.Fatalf("tool response=%s", lines[2])
+	}
+}
+
+func TestMCPHTTPCanonicalAndQueryEndpoints(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "tool.js")
+	writeTestFile(t, script, `({ok:true});`)
+	config := APIConfig{"tool": {Type: "api", Script: script}, "server": {Type: apiTypeMCP, Transport: "streamable_http", AllowedOrigins: []string{"https://chatgpt.com"}, Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}}, "local": {Type: apiTypeMCP, Transport: "stdio", Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}}}
+	if err := validateMCPConfiguration(config); err != nil {
+		t.Fatal(err)
+	}
+	old := currentAPISnapshot()
+	publishAPISnapshot(&APIConfigSnapshot{Config: config})
+	t.Cleanup(func() { publishAPISnapshot(old) })
+	router := gin.New()
+	router.Any("/", func(c *gin.Context) {
+		if !dispatchMCPOrOAuth(c) {
+			c.Status(http.StatusNotFound)
+		}
+	})
+	router.NoRoute(func(c *gin.Context) {
+		if !dispatchMCPOrOAuth(c) {
+			c.Status(http.StatusNotFound)
+		}
+	})
+	for _, target := range []string{"/server", "/?api=server"} {
+		request := httptest.NewRequest(http.MethodPost, target, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", "application/json, text/event-stream")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", target, response.Code, response.Body.String())
+		}
+	}
+	request := httptest.NewRequest(http.MethodPost, "/local", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("stdio HTTP status=%d", response.Code)
+	}
+}
+
+func htmlInputValue(body, name string) string {
+	marker := `name="` + name + `" value="`
+	start := strings.Index(body, marker)
+	if start < 0 {
+		return ""
+	}
+	start += len(marker)
+	end := strings.Index(body[start:], `"`)
+	if end < 0 {
+		return ""
+	}
+	return body[start : start+end]
 }
 
 func writeTestFile(t *testing.T, path string, content string) {
