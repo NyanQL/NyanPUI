@@ -17,5 +17,9 @@
     "MaxAge": 7,
     "Compress": true,
     "EnableLogging": false
+  },
+  "APIHotReload": {
+    "Enabled": true,
+    "Interval": "1s"
   }
 }
