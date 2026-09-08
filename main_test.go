@@ -1553,3 +1553,356 @@ func writeTestFile(t *testing.T, path string, content string) {
 		t.Fatal(err)
 	}
 }
+
+// Regression coverage for request isolation and transport consistency.
+func writeFixtureFile(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "fixture")
+	if err := os.WriteFile(p, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func newRequestRegressionRouter(t *testing.T, config APIConfig) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	old, oldGlobal := currentAPISnapshot(), globalConfig
+	publishAPISnapshot(&APIConfigSnapshot{Config: config})
+	globalConfig = Config{}
+	t.Cleanup(func() { publishAPISnapshot(old); globalConfig = oldGlobal })
+	r := gin.New()
+	r.POST("/nyan-rpc", handleJSONRPC)
+	r.NoRoute(func(c *gin.Context) {
+		if !dispatchMCPOrOAuth(c) && !dispatchDynamicEndpoint(c) {
+			c.Status(404)
+		}
+	})
+	return r
+}
+
+func serveMCPRegressionRequest(r *gin.Engine, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("POST", "https://example.test/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestMCPStdioAcceptsStandardInitialize(t *testing.T) {
+	state := mcpStdioCreated
+	mcp := EndpointConfig{Transport: "stdio", ProtocolVersions: []string{mcpProtocol20251125}}
+	response := handleMCPStdioMessage(&APIConfigSnapshot{}, mcp, &state, []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`))
+	encoded, _ := json.Marshal(response.Payload)
+	if state != mcpStdioWaitingForInitialized {
+		t.Fatalf("standard initialize rejected: %s", encoded)
+	}
+}
+
+func completeTestOAuthConfiguration(t *testing.T, cfg APIConfig) {
+	t.Helper()
+	mcp := cfg["mcp"]
+	mcp.AllowedOrigins = []string{"https://client.example"}
+	mcp.RedirectURIAllowedPrefixes = []string{"https://client.example/callback/"}
+	mcp.OAuth = MCPOAuthHooks{AuthorizationServerMetadata: "metadata", ProtectedResourceMetadataAPI: "resource_metadata", Authorize: "authorize", Token: "token", Register: "register", VerifyAccess: "verify"}
+	cfg["metadata"], cfg["resource_metadata"] = EndpointConfig{}, EndpointConfig{}
+	hook := cfg["verify"]
+	hook.Scopes = []string{"read"}
+	cfg["verify"] = hook
+	for _, name := range []string{"authorize", "token", "register"} {
+		cfg[name] = EndpointConfig{Script: hook.Script}
+	}
+	backing := cfg["tool"]
+	backing.SecuritySchemes = []map[string]interface{}{{"type": "oauth2", "scopes": []string{"read"}}}
+	cfg["tool"], cfg["mcp"] = backing, mcp
+	if err := validateMCPConfiguration(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCookieRequestIsolation(t *testing.T) {
+	enteredA, enteredB := make(chan struct{}), make(chan struct{})
+	releaseA, releaseB := make(chan struct{}), make(chan struct{})
+	gate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/a" {
+			close(enteredA)
+			<-releaseA
+		} else {
+			close(enteredB)
+			<-releaseB
+		}
+	}))
+	defer gate.Close()
+	script := writeFixtureFile(t, `nyanGetAPI(nyanAllParams.gate,"",""); nyanGetCookie("session");`)
+	r := newRequestRegressionRouter(t, APIConfig{"who": {Script: script}})
+	run := func(id string, done chan<- string) {
+		req := httptest.NewRequest("POST", "/who", strings.NewReader(`{"gate":"`+gate.URL+`/`+id+`"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: "session", Value: id})
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		done <- rec.Body.String()
+	}
+	doneA, doneB := make(chan string, 1), make(chan string, 1)
+	go run("a", doneA)
+	<-enteredA
+	go run("b", doneB)
+	<-enteredB
+	close(releaseA)
+	resultA := <-doneA
+	close(releaseB)
+	resultB := <-doneB
+	if resultA != "a" || resultB != "b" {
+		t.Fatalf("request A got %q; request B got %q", resultA, resultB)
+	}
+}
+
+func TestWebSocketChecksAuthorization(t *testing.T) {
+	deny := writeFixtureFile(t, `({success:false,status:401,result:"denied"});`)
+	secret := writeFixtureFile(t, "PRIVATE_HTML")
+	r := newRequestRegressionRouter(t, APIConfig{"private": {HTML: secret, ParamCheck: deny}})
+	normal := httptest.NewRecorder()
+	r.ServeHTTP(normal, httptest.NewRequest("GET", "/private", nil))
+	if normal.Code != 401 {
+		t.Fatalf("HTTP baseline=%d", normal.Code)
+	}
+	server := httptest.NewServer(r)
+	defer server.Close()
+	conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/private", http.Header{"Origin": []string{"https://untrusted.example"}})
+	if err != nil {
+		if response == nil || response.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("unexpected upgrade failure: %v, response=%v", err, response)
+		}
+		return
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := conn.WriteJSON(map[string]string{"api": "private"}); err != nil {
+		t.Fatal(err)
+	}
+	_, body, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) == "PRIVATE_HTML" {
+		t.Fatal("HTTP denied with 401, but unauthenticated WebSocket returned PRIVATE_HTML")
+	}
+}
+
+func TestJSONRPCOutCheck(t *testing.T) {
+	script := writeFixtureFile(t, `"PRIVATE_RESULT";`)
+	deny := writeFixtureFile(t, `({success:false,status:403,result:"denied"});`)
+	r := newRequestRegressionRouter(t, APIConfig{"private": {Script: script, OutCheck: deny}})
+	normal := httptest.NewRecorder()
+	r.ServeHTTP(normal, httptest.NewRequest("GET", "/private", nil))
+	if normal.Code != 403 {
+		t.Fatalf("HTTP baseline=%d", normal.Code)
+	}
+	req := httptest.NewRequest("POST", "/nyan-rpc", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"private","params":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "PRIVATE_RESULT") {
+		t.Fatalf("outCheck bypassed: %s", rec.Body.String())
+	}
+}
+
+func TestOAuthVerifierFailsClosed(t *testing.T) {
+	for _, body := range []string{`false;`, `({status:401,body:{error:"invalid_token"}});`} {
+		t.Run(body, func(t *testing.T) {
+			hook := writeFixtureFile(t, body)
+			tool := writeFixtureFile(t, `({ok:true});`)
+			cfg := APIConfig{"tool": {Script: tool}, "verify": {Script: hook}, "mcp": {Type: "mcp", Transport: "streamable_http", ProtocolVersions: []string{mcpProtocol20251125}, OAuth: MCPOAuthHooks{VerifyAccess: "verify"}, Tools: []MCPToolConfig{{Name: "tool", API: "tool", InputSchema: map[string]interface{}{"type": "object"}}}}}
+			completeTestOAuthConfiguration(t, cfg)
+			r := newRequestRegressionRouter(t, cfg)
+			rec := serveMCPRegressionRequest(r, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{}}}`)
+			if rec.Code != 401 {
+				t.Fatalf("verifier denial did not block tool: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestRawAPICannotForgeMCPPrincipal(t *testing.T) {
+	hook := writeFixtureFile(t, `({authenticated:false});`)
+	tool := writeFixtureFile(t, `({status:200,contentType:"application/json",body:{user:nyanAllParams.mcp_principal.user_id}});`)
+	cfg := APIConfig{"tool": {Script: tool}, "verify": {Script: hook}, "mcp": {Type: "mcp", Transport: "streamable_http", ProtocolVersions: []string{mcpProtocol20251125}, OAuth: MCPOAuthHooks{VerifyAccess: "verify"}, Tools: []MCPToolConfig{{Name: "tool", API: "tool", InputSchema: map[string]interface{}{"type": "object"}}}}}
+	completeTestOAuthConfiguration(t, cfg)
+	r := newRequestRegressionRouter(t, cfg)
+	mcp := serveMCPRegressionRequest(r, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{}}}`)
+	if mcp.Code != 401 {
+		t.Fatalf("MCP baseline=%d", mcp.Code)
+	}
+	req := httptest.NewRequest("POST", "/tool", strings.NewReader(`{"mcp_principal":{"user_id":"forged-admin"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "forged-admin") {
+		t.Fatalf("raw API accepted client-supplied principal: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMCPToolErrorStatus(t *testing.T) {
+	tool := writeFixtureFile(t, `({status:403,contentType:"application/json",body:{error:"forbidden"}});`)
+	cfg := APIConfig{"tool": {Script: tool}, "mcp": {Type: "mcp", Transport: "streamable_http", ProtocolVersions: []string{mcpProtocol20251125}, Tools: []MCPToolConfig{{Name: "tool", API: "tool", InputSchema: map[string]interface{}{"type": "object"}}}}}
+	r := newRequestRegressionRouter(t, cfg)
+	rec := serveMCPRegressionRequest(r, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{}}}`)
+	if strings.Contains(rec.Body.String(), `"isError":false`) {
+		t.Fatalf("tool 403 reported as success: %s", rec.Body.String())
+	}
+}
+
+func TestStorageConcurrency(t *testing.T) {
+	oldStorage := storage
+	storage = make(map[string]string)
+	t.Cleanup(func() { storage = oldStorage })
+	vmA, vmB := setupGojaRuntime(), setupGojaRuntime()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); <-start; vmA.RunString(`nyanSetItem("key","a");`) }()
+	go func() { defer wg.Done(); <-start; vmB.RunString(`nyanGetItem("key");`) }()
+	close(start)
+	wg.Wait()
+}
+
+func TestWebSocketChecksTargetAndPreservesPublicMessages(t *testing.T) {
+	publicHTML := writeFixtureFile(t, "PUBLIC_HTML")
+	privateHTML := writeFixtureFile(t, "PRIVATE_HTML")
+	denyInput := writeFixtureFile(t, `({success:false,status:401,result:"denied"});`)
+	denyOutput := writeFixtureFile(t, `({success:false,status:403,result:"denied"});`)
+	router := newRequestRegressionRouter(t, APIConfig{
+		"public":   {HTML: publicHTML},
+		"private":  {HTML: privateHTML, ParamCheck: denyInput},
+		"filtered": {HTML: privateHTML, OutCheck: denyOutput},
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/public", http.Header{"Origin": []string{"https://existing-client.example"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for _, test := range []struct{ message, want string }{
+		{`{"echo":"hello"}`, `{"echo":"hello"}`},
+		{`{"api":"public"}`, "PUBLIC_HTML"},
+		{`{"api":"private"}`, `"status":401`},
+		{`{"api":"filtered"}`, `"status":403`},
+	} {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(test.message)); err != nil {
+			t.Fatal(err)
+		}
+		_, body, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), test.want) || strings.Contains(string(body), "PRIVATE_HTML") {
+			t.Fatalf("message %s returned %s, expected %s", test.message, body, test.want)
+		}
+	}
+}
+
+func TestWebSocketConcurrentPushAndReplies(t *testing.T) {
+	html := writeFixtureFile(t, "PUSH")
+	router := newRequestRegressionRouter(t, APIConfig{"updates": {HTML: html}})
+	server := httptest.NewServer(router)
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/updates", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	// An echo round trip ensures the connection is registered before pushing.
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	const count = 32
+	snapshot := currentAPISnapshot()
+	var writers sync.WaitGroup
+	writers.Add(3)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer writers.Done()
+			for j := 0; j < count; j++ {
+				performPushWithSnapshot(snapshot, EndpointConfig{Push: "updates"}, nil)
+			}
+		}()
+	}
+	writeErrors := make(chan error, 1)
+	go func() {
+		defer writers.Done()
+		for j := 0; j < count; j++ {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"echo":"true"}`)); err != nil {
+				writeErrors <- err
+				return
+			}
+		}
+		writeErrors <- nil
+	}()
+	received := map[string]int{}
+	for i := 0; i < count*3; i++ {
+		_, body, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		received[string(body)]++
+	}
+	writers.Wait()
+	if err := <-writeErrors; err != nil {
+		t.Fatal(err)
+	}
+	if received["PUSH"] != count*2 || received[`{"echo":"true"}`] != count {
+		t.Fatalf("lost or corrupted WebSocket messages: %v", received)
+	}
+}
+
+func TestNestedJavaScriptPreservesRequestCookies(t *testing.T) {
+	target := writeFixtureFile(t, `nyanSetCookie("result",nyanGetCookie("session")); nyanGetCookie("session");`)
+	caller := writeFixtureFile(t, `nyanCallMe({api:"target"});`)
+	router := newRequestRegressionRouter(t, APIConfig{"caller": {Script: caller}, "target": {Script: target}})
+	req := httptest.NewRequest("GET", "https://example.test/caller", nil)
+	req.AddCookie(&http.Cookie{Name: "session", Value: "request-owner"})
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	cookies := rec.Result().Cookies()
+	if rec.Body.String() != "request-owner" || len(cookies) != 1 || cookies[0].Value != "request-owner" || !cookies[0].Secure {
+		t.Fatalf("nested request lost its cookie context: body=%s cookies=%v", rec.Body.String(), cookies)
+	}
+	value, err := setupGojaRuntime().RunString(`nyanGetCookie("session");`)
+	if err != nil || value.String() != "" {
+		t.Fatalf("background VM inherited HTTP cookies: value=%v err=%v", value, err)
+	}
+}
+
+func TestMCPStdioToolReportsErrorsAndHTTPIncludesAPIName(t *testing.T) {
+	script := writeFixtureFile(t, `({status:403,contentType:"application/json",body:{api:nyanAllParams.api,error:"denied"}});`)
+	config := APIConfig{"tool": {Script: script}, "mcp": {Type: apiTypeMCP, Transport: "streamable_http", AllowedOrigins: []string{"https://client.example"}, Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}}}
+	if err := validateMCPConfiguration(config); err != nil {
+		t.Fatal(err)
+	}
+	router := newRequestRegressionRouter(t, config)
+	rec := serveMCPRegressionRequest(router, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{}}}`)
+	var httpResult struct {
+		Result map[string]interface{} `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &httpResult); err != nil {
+		t.Fatal(err)
+	}
+	payload, errText := executeMCPTool(currentAPISnapshot(), config["mcp"].Tools[0], nil, map[string]interface{}{"transport": "stdio"})
+	if errText != "" || payload["isError"] != true || httpResult.Result["isError"] != true {
+		t.Fatalf("error conversion: HTTP=%s stdio=%v err=%s", rec.Body.String(), payload, errText)
+	}
+	for _, result := range []map[string]interface{}{payload, httpResult.Result} {
+		structured, ok := result["structuredContent"].(map[string]interface{})
+		if !ok || structured["api"] != "tool" {
+			t.Fatalf("Tool API identity missing: %v", result)
+		}
+	}
+}
