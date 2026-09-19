@@ -9,10 +9,12 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math"
 	"mime"
 	"net"
@@ -72,6 +74,7 @@ type LogConfig struct {
 	MaxAge        int    `json:"MaxAge"`
 	Compress      bool   `json:"Compress"`
 	EnableLogging bool   `json:"EnableLogging"`
+	Level         string `json:"Level,omitempty"`
 }
 
 // ResponseData はAPIのレスポンスデータを表します。
@@ -651,16 +654,20 @@ func (conn *serverWebSocket) WriteMessage(messageType int, data []byte) error {
 
 // main はメイン関数です。
 func main() {
+	// stdout is reserved for MCP protocol responses, including during startup.
+	log.SetOutput(os.Stderr)
+	log.SetFlags(0)
+	log.SetPrefix("")
 	// 実行ファイルのディレクトリを取得
 	exePath, err := os.Executable()
 	if err != nil {
-		log.Fatal("Failed to get executable path:", err)
+		fatalServiceError("executable_path_failed", err)
 	}
 	exeDir := filepath.Dir(exePath)
 
 	options, err := resolveStartupOptions(exeDir, os.Args[1:])
 	if err != nil {
-		log.Fatal(err)
+		fatalServiceError("startup_options_failed", err)
 	}
 	paths := options.Paths
 	mcpStdio := options.MCPServer != ""
@@ -668,74 +675,56 @@ func main() {
 	// システム設定をロード
 	config, err := loadConfig(paths.Config.Path)
 	if err != nil {
-		log.Fatal("Error loading config:", err)
+		fatalServiceError("config_load_failed", err)
 	}
 	configBaseDir := filepath.Dir(paths.Config.Path)
 	apiBaseDir := filepath.Dir(paths.API.Path)
 	adjustConfigPaths(configBaseDir, &config)
 	globalConfig = config
-	if mcpStdio {
-		log.SetOutput(os.Stderr)
-		gin.DefaultWriter = os.Stderr
+	if err := setupLogger(configBaseDir); err != nil {
+		fatalServiceError("Invalid log.Level: expected debug, info, warn, or error", err)
 	}
-
-	// ログ設定を初期化
-	if globalConfig.Log.EnableLogging {
-		// ファイルへのログ出力のみ行う
-		initLogger(globalConfig.Log, exeDir)
-		// Gin のログ設定もファイルへのみ出力するようにする
-		logFile := resolvePath(exeDir, globalConfig.Log.Filename)
-		f, err := os.Create(logFile)
-		if err != nil {
-			log.Printf("Failed to create log file: %v", err)
-		} else {
-			gin.DefaultWriter = f
-		}
-	} else if mcpStdio {
-		log.SetOutput(os.Stderr)
-		gin.DefaultWriter = os.Stderr
-	} else {
-		// ログをターミナル（標準出力）のみに出力する
-		log.SetOutput(os.Stdout)
-		gin.DefaultWriter = os.Stdout
-	}
-
-	log.Printf("Binary version: %s", buildVersion)
-	log.Printf("Config file: %s (source: %s)", paths.Config.Path, paths.Config.Source)
-	log.Printf("API file: %s (source: %s)", paths.API.Path, paths.API.Source)
-	log.Printf("Config version: %s", globalConfig.Version)
+	// Suppress Gin's unstructured route and listener diagnostics.
+	gin.DefaultWriter = io.Discard
+	gin.DefaultErrorWriter = io.Discard
+	serviceLog(slog.LevelInfo, "starting", "binary_version", buildVersion, "go_version", runtime.Version(), "config_version", globalConfig.Version)
+	serviceLog(slog.LevelInfo, "config_loaded", "file", paths.Config.Path, "source", paths.Config.Source)
 
 	// API設定をロードし、background定義を公開前に全件検証する。
 	initialConfig, err := readAPIConfigGraph(paths.API.Path, apiBaseDir)
 	if err != nil {
-		log.Fatal("Error loading API configuration:", err)
+		fatalServiceError("api_config_load_failed", err, "file", paths.API.Path)
 	}
 	publishAPISnapshot(initialConfig.Snapshot)
+	serviceLog(slog.LevelInfo, "api_config_loaded", "file", paths.API.Path, "source", paths.API.Source, "api_count", len(initialConfig.Snapshot.Config))
 	if mcpStdio {
 		mcp, selectErr := selectMCPStdioServer(initialConfig.Snapshot, options.MCPServer)
 		if selectErr != nil {
-			log.Fatal(selectErr)
+			fatalServiceError("mcp_stdio_selection_failed", selectErr)
 		}
+		serviceLog(slog.LevelInfo, "mcp_stdio_starting", "api", options.MCPServer)
 		if serveErr := serveMCPStdio(os.Stdin, os.Stdout, initialConfig.Snapshot, mcp); serveErr != nil {
-			log.Fatal(serveErr)
+			fatalServiceError("mcp_stdio_failed", serveErr)
 		}
+		serviceLog(slog.LevelInfo, "mcp_stdio_stopped", "api", options.MCPServer)
 		return
 	}
 	apiHotReloadInterval, err := parseAPIHotReloadInterval(config.APIHotReload.Interval)
 	if err != nil {
-		log.Fatalf("Invalid APIHotReload.Interval %q: %v", config.APIHotReload.Interval, err)
+		fatalServiceError("api_hot_reload_interval_invalid", err)
 	}
 	backgroundRuntimes = newBackgroundRuntimeManager()
 	backgroundRuntimes.reconcile(initialConfig.Snapshot.Schedules, initialConfig.Snapshot.WSClients)
 	if config.APIHotReload.Enabled {
-		log.Printf("API hot reload enabled: interval=%s", apiHotReloadInterval)
+		serviceLog(slog.LevelInfo, "api_hot_reload_enabled", "interval", apiHotReloadInterval.String())
 		go watchAPIConfigGraph(paths.API.Path, apiBaseDir, apiHotReloadInterval, initialConfig.Snapshot.FileStates)
 	} else {
-		log.Printf("API hot reload disabled")
+		serviceLog(slog.LevelInfo, "api_hot_reload_disabled")
 	}
 
 	gin.DisableConsoleColor()
-	r := gin.Default()
+	r := gin.New()
+	r.Use(serviceRecovery())
 	r.SetTrustedProxies(nil)
 	r.Use(CORSMiddleware())
 	r.StaticFile("/favicon.ico", resolvePath(exeDir, "./html/favicon.ico"))
@@ -780,17 +769,22 @@ func main() {
 	// HTTPSサーバーを起動するかどうかを判断
 	certFile := resolvePath(exeDir, globalConfig.CertFile)
 	keyFile := resolvePath(exeDir, globalConfig.KeyFile)
+	server := &http.Server{
+		Addr:     fmt.Sprintf(":%d", globalConfig.Port),
+		Handler:  r.Handler(),
+		ErrorLog: httpServerErrorLogger(),
+	}
 	if globalConfig.CertFile != "" && globalConfig.KeyFile != "" {
-		log.Printf("Starting HTTPS server at %d", globalConfig.Port)
-		err = r.RunTLS(fmt.Sprintf(":%d", globalConfig.Port), certFile, keyFile)
+		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "https", "port", globalConfig.Port)
+		err = server.ListenAndServeTLS(certFile, keyFile)
 		if err != nil {
-			log.Fatal("Failed to start HTTPS server:", err)
+			fatalServiceError("https_server_failed", err)
 		}
 	} else {
-		log.Printf("Starting HTTP server at %d", globalConfig.Port)
-		err = r.Run(fmt.Sprintf(":%d", globalConfig.Port))
+		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "http", "port", globalConfig.Port)
+		err = server.ListenAndServe()
 		if err != nil {
-			log.Fatal("Failed to start HTTP server:", err)
+			fatalServiceError("http_server_failed", err)
 		}
 	}
 }
@@ -1048,7 +1042,7 @@ func handleWebSocketWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, en
 	}
 	rawConn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		log.Printf("Failed to set websocket upgrade: %v", err)
+		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err, "endpoint", endpoint)
 		return
 	}
 	conn := &serverWebSocket{Conn: rawConn}
@@ -1070,8 +1064,10 @@ func handleWebSocketWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, en
 	for {
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
+			logWebSocketDisconnect("websocket_disconnected", endpoint, err)
 			break
 		}
+		serviceLog(slog.LevelDebug, "websocket_message_received", "endpoint", endpoint, "bytes", len(message))
 		var req map[string]string
 		if err := json.Unmarshal(message, &req); err != nil {
 			_ = conn.WriteMessage(messageType, []byte("Invalid JSON"))
@@ -1150,7 +1146,7 @@ func checkWebSocketScript(conn *serverWebSocket, snapshot *APIConfigSnapshot, re
 func sendWebSocketHTMLError(conn *serverWebSocket, messageType int, errorMessage string) {
 	errorHTML := fmt.Sprintf("<html><body><h1>Error</h1><p>%s</p></body></html>", errorMessage)
 	if err := conn.WriteMessage(messageType, []byte(errorHTML)); err != nil {
-		log.Printf("Error writing error message: %v", err)
+		logServiceError(slog.LevelWarn, "websocket_error_send_failed", err)
 	}
 }
 
@@ -1255,7 +1251,12 @@ func runJavaScriptValueWithSnapshot(snapshot *APIConfigSnapshot, scriptPath stri
 	return runJavaScriptValueWithContext(snapshot, nil, scriptPath, htmlPath, allParams)
 }
 
-func runJavaScriptValueWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Context, scriptPath string, htmlPath string, allParams map[string]interface{}) (goja.Value, error) {
+func runJavaScriptValueWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Context, scriptPath string, htmlPath string, allParams map[string]interface{}) (_ goja.Value, runErr error) {
+	defer func() {
+		if runErr != nil {
+			logServiceError(slog.LevelError, "script_failed", runErr, "file", scriptPath)
+		}
+	}()
 	// 実行ファイルのディレクトリを取得
 	exePath, err := os.Executable()
 	if err != nil {
@@ -1277,10 +1278,10 @@ func runJavaScriptValueWithContext(snapshot *APIConfigSnapshot, requestContext *
 	for _, includePath := range globalConfig.JavaScriptInclude {
 		includePath = resolvePath(exeDir, includePath)
 		code, err := os.ReadFile(includePath)
-		log.Print("Include file:", includePath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read included JS file %s: %v", includePath, err)
 		}
+		serviceLog(slog.LevelDebug, "script_include_loaded", "file", includePath)
 		jsLibCode += string(code) + "\n"
 	}
 
@@ -1292,7 +1293,6 @@ func runJavaScriptValueWithContext(snapshot *APIConfigSnapshot, requestContext *
 		htmlPath = resolvePath(exeDir, htmlPath)
 		htmlCodeBytes, err := os.ReadFile(htmlPath)
 		if err != nil {
-			log.Printf("Failed to load HTML file at path: %s, error: %v", htmlPath, err)
 			return nil, fmt.Errorf("failed to load HTML file: %v", err)
 		}
 		escapedHTML := strconv.Quote(string(htmlCodeBytes))
@@ -1760,13 +1760,13 @@ func servePublicEndpointWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot
 func registerPublicEndpoint(r *gin.Engine, endpoint string, config EndpointConfig, exeDir string) {
 	routePath := "/" + strings.Trim(strings.TrimSpace(endpoint), "/")
 	if routePath == "/" {
-		log.Printf("public endpoint %q is invalid: endpoint name must not be empty", endpoint)
+		serviceLog(slog.LevelError, "public_endpoint_name_invalid")
 		return
 	}
 
 	publicPath := strings.TrimSpace(config.Path)
 	if publicPath == "" {
-		log.Printf("public endpoint %s: path is missing", endpoint)
+		serviceLog(slog.LevelError, "public_endpoint_path_missing", "endpoint", endpoint)
 	}
 
 	basePath := resolvePath(exeDir, publicPath)
@@ -2163,21 +2163,135 @@ func jsonAPI(url string, jsonData []byte, username, password string, headers map
 	return string(body), nil
 }
 
-// ログの設定を有効化する。
-func initLogger(logConfig LogConfig, baseDir string) {
-	logFile := resolvePath(baseDir, logConfig.Filename)
-	if logConfig.EnableLogging {
+var serviceLogLevel slog.LevelVar // INFO unless configured otherwise.
+var serviceLogger = slog.New(slog.NewJSONHandler(serviceLogWriter{}, &slog.HandlerOptions{Level: &serviceLogLevel}))
+
+// Keep the standard logger's synchronized writer so file rotation and output
+// capture use the same destination. The JSON handler escapes untrusted strings.
+type serviceLogWriter struct{}
+
+func (serviceLogWriter) Write(data []byte) (int, error) {
+	err := log.Output(3, strings.TrimSuffix(string(data), "\n"))
+	return len(data), err
+}
+
+func serviceLog(level slog.Level, event string, fields ...interface{}) {
+	serviceLogger.Log(context.Background(), level, event, fields...)
+}
+
+func logServiceError(level slog.Level, event string, err error, fields ...interface{}) {
+	if err != nil {
+		cause := err
+		for errors.Unwrap(cause) != nil {
+			cause = errors.Unwrap(cause)
+		}
+		fields = append(fields, "error_type", fmt.Sprintf("%T", cause))
+		var state interface{ SQLState() string }
+		if errors.As(err, &state) {
+			fields = append(fields, "sqlstate", state.SQLState())
+		}
+		var closeError *websocket.CloseError
+		if errors.As(err, &closeError) {
+			fields = append(fields, "close_code", closeError.Code)
+		}
+		// Driver errors and JavaScript exceptions can contain request values.
+		// Full diagnostic text is an explicit debug-only choice, even on errors.
+		if serviceLogLevel.Level() <= slog.LevelDebug {
+			fields = append(fields, "error_detail", boundedLogText(err.Error()))
+		}
+	}
+	serviceLog(level, event, fields...)
+}
+
+func fatalServiceError(event string, err error, fields ...interface{}) {
+	logServiceError(slog.LevelError, event, err, fields...)
+	os.Exit(1)
+}
+
+func logWebSocketDisconnect(event, name string, err error) {
+	level := slog.LevelWarn
+	var closeError *websocket.CloseError
+	if errors.Is(err, net.ErrClosed) || (errors.As(err, &closeError) && (closeError.Code == websocket.CloseNormalClosure || closeError.Code == websocket.CloseGoingAway)) {
+		level = slog.LevelDebug
+	}
+	logServiceError(level, event, err, "endpoint", name)
+}
+
+func boundedLogText(value string) string {
+	const maxLogTextBytes = 4096
+	if len(value) > maxLogTextBytes {
+		return value[:maxLogTextBytes] + "...[truncated]"
+	}
+	return value
+}
+
+func logURLOrigin(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "ws" && parsed.Scheme != "wss") {
+		return "[invalid URL]"
+	}
+	// Userinfo, paths, queries and fragments can all contain credentials.
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+func setupLogger(configBaseDir string) error {
+	level := slog.LevelInfo
+	switch strings.ToLower(strings.TrimSpace(globalConfig.Log.Level)) {
+	case "", "info":
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		return errors.New("log.Level must be debug, info, warn, or error")
+	}
+	logFilePath := resolvePathFromBase(configBaseDir, globalConfig.Log.Filename)
+	if globalConfig.Log.EnableLogging {
 		log.SetOutput(&lumberjack.Logger{
-			Filename:   logFile,
-			MaxSize:    logConfig.MaxSize,    // megabytes
-			MaxBackups: logConfig.MaxBackups, // number of backups
-			MaxAge:     logConfig.MaxAge,     // days
-			Compress:   logConfig.Compress,
+			Filename:   logFilePath,
+			MaxSize:    globalConfig.Log.MaxSize,
+			MaxBackups: globalConfig.Log.MaxBackups,
+			MaxAge:     globalConfig.Log.MaxAge,
+			Compress:   globalConfig.Log.Compress,
 		})
 	} else {
-		// ログを無効にする場合は、標準出力を無効にする（例: io.Discard へ出力する）
-		log.SetOutput(io.Discard)
+		log.SetOutput(os.Stderr)
 	}
+	log.SetFlags(0)
+	log.SetPrefix("")
+	serviceLogLevel.Set(level)
+	return nil
+}
+
+// net/http diagnostics must also honor the output, level and error privacy policy.
+type httpErrorLogWriter struct{}
+
+func (httpErrorLogWriter) Write(data []byte) (int, error) {
+	logServiceError(slog.LevelError, "http_server_error", errors.New(strings.TrimSpace(string(data))))
+	return len(data), nil
+}
+
+func httpServerErrorLogger() *log.Logger {
+	return log.New(httpErrorLogWriter{}, "", 0)
+}
+
+func serviceRecovery() gin.HandlerFunc {
+	// A nil writer prevents Gin from dumping request headers and source code.
+	// Gin still handles broken connections without writing to the dead socket.
+	return gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, recovered interface{}) {
+		if err, ok := recovered.(error); ok {
+			logServiceError(slog.LevelError, "http_panic", err, "route", c.FullPath())
+		} else {
+			fields := []interface{}{"route", c.FullPath(), "error_type", fmt.Sprintf("%T", recovered)}
+			if serviceLogLevel.Level() <= slog.LevelDebug {
+				fields = append(fields, "error_detail", boundedLogText(fmt.Sprint(recovered)))
+			}
+			serviceLog(slog.LevelError, "http_panic", fields...)
+		}
+		c.AbortWithStatus(http.StatusInternalServerError)
+	})
 }
 
 // setupGojaRuntime は goja のランタイムをセットアップします。
@@ -2203,7 +2317,7 @@ func setupGojaRuntimeWithContext(snapshot *APIConfigSnapshot, requestContext *gi
 
 		result, err := getAPI(url, username, password)
 		if err != nil {
-			log.Println("getAPI error:", err)
+			logServiceError(slog.LevelError, "http_client_request_failed", err)
 			return vm.ToValue("")
 		}
 		return vm.ToValue(result)
@@ -2257,7 +2371,7 @@ func setupGojaRuntimeWithContext(snapshot *APIConfigSnapshot, requestContext *gi
 		if requestContext != nil {
 			cookieValue, err := requestContext.Cookie(cookieName)
 			if err != nil {
-				log.Printf("Error retrieving cookie: %v", err)
+				logServiceError(slog.LevelDebug, "cookie_unavailable", err)
 				return vm.ToValue("")
 			}
 			return vm.ToValue(cookieValue)
@@ -2274,7 +2388,7 @@ func setupGojaRuntimeWithContext(snapshot *APIConfigSnapshot, requestContext *gi
 		if requestContext != nil {
 			requestContext.SetCookie(cookieName, cookieValue, 3600, "/", "", requestContext.Request.TLS != nil, true)
 		} else {
-			log.Println("HTTP request context is not set")
+			serviceLog(slog.LevelDebug, "http_request_context_unavailable")
 		}
 		return vm.ToValue(nil)
 	})
@@ -2379,13 +2493,36 @@ func setupGojaRuntimeWithContext(snapshot *APIConfigSnapshot, requestContext *gi
 		return vm.ToValue(result)
 	})
 
-	// console.log の登録
-	console := map[string]func(...interface{}){
-		"log": func(args ...interface{}) {
-			log.Println(args...)
+	vm.Set("console", map[string]interface{}{
+		"log": func(call goja.FunctionCall) goja.Value {
+			if serviceLogLevel.Level() > slog.LevelDebug {
+				return goja.Undefined()
+			}
+			var args []string
+			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
+			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
+			if !ok {
+				serviceLog(slog.LevelWarn, "script_console_stringify_unavailable")
+				return goja.Undefined()
+			}
+			for _, arg := range call.Arguments {
+				exported := arg.Export()
+				switch exported.(type) {
+				case map[string]interface{}, []interface{}:
+					s, err := jsonStringify(goja.Undefined(), arg)
+					if err == nil {
+						args = append(args, s.String())
+					} else {
+						args = append(args, arg.String())
+					}
+				default:
+					args = append(args, arg.String())
+				}
+			}
+			serviceLog(slog.LevelDebug, "script_console", "message", boundedLogText(strings.Join(args, " ")))
+			return goja.Undefined()
 		},
-	}
-	vm.Set("console", console)
+	})
 
 	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
@@ -2670,7 +2807,7 @@ func nyanReadFileB64(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 }
 
 func handleJSONRPC(c *gin.Context) {
-	log.Print("handleJSONRPC called")
+	serviceLog(slog.LevelDebug, "jsonrpc_request_received")
 
 	// 1) リクエストボディを読み込み、JSONRPCRequest にパース
 	var rpcReq JSONRPCRequest
@@ -2812,12 +2949,12 @@ func performPushWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Con
 	}
 	pushConfig, ok := snapshot.Config[config.Push]
 	if !ok {
-		log.Printf("Push target %s not found in apiConfig", config.Push)
+		serviceLog(slog.LevelWarn, "push_target_not_found", "channel", config.Push)
 		return
 	}
 	exePath, err := os.Executable()
 	if err != nil {
-		log.Printf("Failed to get executable path for push: %v", err)
+		logServiceError(slog.LevelError, "push_executable_path_failed", err)
 		return
 	}
 	exeDir := filepath.Dir(exePath)
@@ -2827,14 +2964,14 @@ func performPushWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Con
 	if pushConfig.Script == "" {
 		content, err := os.ReadFile(htmlPath)
 		if err != nil {
-			log.Printf("Failed to read push HTML file %s: %v", htmlPath, err)
+			logServiceError(slog.LevelError, "push_html_load_failed", err, "channel", config.Push)
 			return
 		}
 		pushResult = string(content)
 	} else {
 		result, err := runJavaScriptValueWithContext(snapshot, requestContext, scriptPath, htmlPath, allParams)
 		if err != nil {
-			log.Printf("Failed to run push script: %v", err)
+			logServiceError(slog.LevelError, "push_script_failed", err, "channel", config.Push)
 			return
 		}
 		pushResult = result.String()
@@ -2845,9 +2982,9 @@ func performPushWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Con
 		wsConnections.RUnlock()
 		for _, conn := range pushConns {
 			if err := conn.WriteMessage(websocket.TextMessage, []byte(pushResult)); err != nil {
-				log.Printf("Error pushing message to %s: %v", config.Push, err)
+				logServiceError(slog.LevelWarn, "push_send_failed", err, "channel", config.Push)
 			} else {
-				log.Printf("Push message sent to %s", config.Push)
+				serviceLog(slog.LevelDebug, "push_sent", "channel", config.Push, "bytes", len(pushResult))
 			}
 		}
 	}
@@ -3237,14 +3374,14 @@ func watchAPIConfig(path, apiBaseDir string, interval time.Duration, initialHash
 		lastHash = hash
 		if err != nil {
 			if err.Error() != lastError {
-				log.Printf("API hot reload failed: %v; current API configuration remains active", err)
+				logServiceError(slog.LevelError, "api_hot_reload_failed", err, "file", path, "active_config_retained", true)
 			}
 			lastError = err.Error()
 			continue
 		}
 		lastError = ""
 		if reloaded {
-			log.Printf("API hot reload succeeded: api_count=%d", len(currentAPIConfig()))
+			serviceLog(slog.LevelInfo, "api_hot_reload_succeeded", "api_count", len(currentAPIConfig()))
 		}
 	}
 }
@@ -3546,14 +3683,14 @@ func watchAPIConfigGraph(path, apiBaseDir string, interval time.Duration, initia
 		watched = states
 		if err != nil {
 			if err.Error() != lastError {
-				log.Printf("API hot reload failed: %v; current API configuration remains active", err)
+				logServiceError(slog.LevelError, "api_hot_reload_failed", err, "file", path, "active_config_retained", true)
 			}
 			lastError = err.Error()
 			continue
 		}
 		lastError = ""
 		if reloaded {
-			log.Printf("API hot reload succeeded: api_count=%d", len(currentAPIConfig()))
+			serviceLog(slog.LevelInfo, "api_hot_reload_succeeded", "api_count", len(currentAPIConfig()))
 		}
 	}
 }
@@ -3592,7 +3729,7 @@ func (manager *backgroundRuntimeManager) reconcile(schedules map[string]schedule
 	for name, runtime := range manager.schedules {
 		if _, exists := schedules[name]; !exists {
 			if _, changed := runtime.update(nil); changed {
-				log.Printf("Stopping schedule job %s", name)
+				serviceLog(slog.LevelInfo, "schedule_stopping", "job", name)
 			}
 		}
 	}
@@ -3600,20 +3737,20 @@ func (manager *backgroundRuntimeManager) reconcile(schedules map[string]schedule
 		if runtime, exists := manager.schedules[name]; exists {
 			if accepted, changed := runtime.update(&cfg); accepted {
 				if changed {
-					log.Printf("Updated schedule job %s with cron %q", name, cfg.trigger.Value)
+					serviceLog(slog.LevelInfo, "schedule_updated", "job", name, "cron", cfg.trigger.Value)
 				}
 				continue
 			}
 		}
 		runtime := newScheduleRuntime(cfg)
 		manager.schedules[name] = runtime
-		log.Printf("Starting schedule job %s with cron %q", name, cfg.trigger.Value)
+		serviceLog(slog.LevelInfo, "schedule_starting", "job", name, "cron", cfg.trigger.Value)
 		go manager.runSchedule(name, runtime)
 	}
 	for name, runtime := range manager.wsClients {
 		if _, exists := wsClients[name]; !exists {
 			if _, changed, _ := runtime.update(nil); changed {
-				log.Printf("Stopping WebSocket client %s", name)
+				serviceLog(slog.LevelInfo, "ws_client_stopping", "client", name)
 			}
 		}
 	}
@@ -3621,14 +3758,14 @@ func (manager *backgroundRuntimeManager) reconcile(schedules map[string]schedule
 		if runtime, exists := manager.wsClients[name]; exists {
 			if accepted, changed, reconnect := runtime.update(&cfg); accepted {
 				if changed {
-					log.Printf("Updated WebSocket client %s reconnect=%t", name, reconnect)
+					serviceLog(slog.LevelInfo, "ws_client_updated", "client", name, "reconnect", reconnect)
 				}
 				continue
 			}
 		}
 		runtime := newWSClientRuntime(cfg)
 		manager.wsClients[name] = runtime
-		log.Printf("Starting WebSocket client %s -> %s", name, cfg.connectURL)
+		serviceLog(slog.LevelInfo, "ws_client_starting", "client", name, "origin", logURLOrigin(cfg.connectURL))
 		go manager.runWSClient(name, runtime)
 	}
 }
@@ -3762,9 +3899,11 @@ func (runtime *scheduleRuntime) run() {
 		}
 		next := cfg.schedule.next(time.Now())
 		if next.IsZero() {
+			serviceLog(slog.LevelWarn, "schedule_no_next_run", "job", cfg.name)
 			<-runtime.wake
 			continue
 		}
+		serviceLog(slog.LevelDebug, "schedule_next_run", "job", cfg.name, "next_run", next)
 		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-runtime.wake:
@@ -3783,9 +3922,9 @@ func (runtime *scheduleRuntime) run() {
 		}
 		params := map[string]interface{}{"api": latest.name, "nyan_job_name": latest.name, "nyan_schedule_trigger_type": latest.trigger.Type, "nyan_schedule_trigger": latest.trigger.Value, "nyan_schedule_time": next.Format(time.RFC3339), "nyan_schedule_description": latest.description}
 		if result, err := runJavaScript(latest.scriptPath, "", params); err != nil {
-			log.Printf("Schedule job %s failed: %v", latest.name, err)
+			logServiceError(slog.LevelError, "schedule_failed", err, "job", latest.name)
 		} else {
-			log.Printf("Schedule job %s completed: %s", latest.name, result)
+			serviceLog(slog.LevelInfo, "schedule_completed", "job", latest.name, "result_bytes", len(result))
 		}
 	}
 }
@@ -3907,7 +4046,7 @@ func (runtime *wsClientRuntime) run() {
 			continue
 		}
 		if err != nil {
-			log.Printf("WebSocket client %s disconnected: %v", cfg.name, err)
+			logWebSocketDisconnect("ws_client_disconnected", cfg.name, err)
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -3942,6 +4081,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 		_ = conn.Close()
 		return nil
 	}
+	serviceLog(slog.LevelInfo, "ws_client_connected", "client", cfg.name)
 	defer runtime.clearConnection(conn)
 	defer conn.Close()
 	for {
@@ -3953,6 +4093,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 		if !active || latest.connectURL != cfg.connectURL {
 			return nil
 		}
+		serviceLog(slog.LevelDebug, "ws_client_message_received", "client", latest.name, "message_type", websocketMessageTypeLabel(msgType), "bytes", len(data))
 		params := map[string]interface{}{"api": latest.name, "ws_client": latest.name, "ws_message_type": websocketMessageTypeLabel(msgType), "ws_message_text": string(data), "ws_connect_url": latest.connectURL, "ws_description": latest.description}
 		if msgType == websocket.BinaryMessage {
 			params["ws_message_base64"] = base64.StdEncoding.EncodeToString(data)
@@ -3965,7 +4106,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 		}
 		result, err := runJavaScript(latest.scriptPath, "", params)
 		if err != nil {
-			log.Printf("ws_client %s script error: %v", latest.name, err)
+			logServiceError(slog.LevelError, "ws_client_script_failed", err, "client", latest.name)
 			continue
 		}
 		if result = strings.TrimSpace(result); result != "" {

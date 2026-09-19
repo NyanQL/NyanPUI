@@ -2,23 +2,33 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
+	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/natefinch/lumberjack"
 )
 
 func TestRegisterPublicEndpointServesFiles(t *testing.T) {
@@ -1903,6 +1913,520 @@ func TestMCPStdioToolReportsErrorsAndHTTPIncludesAPIName(t *testing.T) {
 		structured, ok := result["structuredContent"].(map[string]interface{})
 		if !ok || structured["api"] != "tool" {
 			t.Fatalf("Tool API identity missing: %v", result)
+		}
+	}
+}
+
+func decodeLogObject(t *testing.T, data []byte) map[string]interface{} {
+	t.Helper()
+	var record map[string]interface{}
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatalf("invalid JSON log %q: %v", data, err)
+	}
+	return record
+}
+func writeLoggingFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func captureServiceLogs(t *testing.T, level slog.Level) *bytes.Buffer {
+	t.Helper()
+	writer, flags, prefix, previousLevel := log.Writer(), log.Flags(), log.Prefix(), serviceLogLevel.Level()
+	var output bytes.Buffer
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	serviceLogLevel.Set(level)
+	t.Cleanup(func() {
+		log.SetOutput(writer)
+		log.SetFlags(flags)
+		log.SetPrefix(prefix)
+		serviceLogLevel.Set(previousLevel)
+	})
+	return &output
+}
+
+func TestServiceLoggingLevelsAndErrorPrivacy(t *testing.T) {
+	output := captureServiceLogs(t, slog.LevelInfo)
+	secretError := errors.New("password=private-error\nforged log line")
+	serviceLog(slog.LevelDebug, "hidden_debug_event")
+	logServiceError(slog.LevelError, "execution_failed", secretError, "api", "example\napi")
+	if strings.Contains(output.String(), "private-error") || strings.Contains(output.String(), "hidden_debug_event") {
+		t.Fatalf("info log contains debug data: %s", output.String())
+	}
+	if bytes.Count(output.Bytes(), []byte("\n")) != 1 {
+		t.Fatalf("log injection produced extra lines: %s", output.String())
+	}
+	record := decodeLogObject(t, output.Bytes())
+	if record["msg"] != "execution_failed" || record["level"] != "ERROR" || record["error_type"] == nil || record["api"] != "example\napi" {
+		t.Fatalf("missing diagnostic metadata: %#v", record)
+	}
+	output.Reset()
+	serviceLogLevel.Set(slog.LevelDebug)
+	logServiceError(slog.LevelError, "execution_failed", secretError)
+	record = decodeLogObject(t, output.Bytes())
+	if record["error_detail"] != secretError.Error() {
+		t.Fatalf("debug log missing error detail: %#v", record)
+	}
+	output.Reset()
+	serviceLogLevel.Set(slog.LevelError)
+	serviceLog(slog.LevelInfo, "hidden_info")
+	serviceLog(slog.LevelWarn, "hidden_warning")
+	if output.Len() != 0 {
+		t.Fatalf("error level emitted lower levels: %s", output.String())
+	}
+}
+
+func TestSetupLoggerRejectsInvalidLevelWithoutChangingOutput(t *testing.T) {
+	output := captureServiceLogs(t, slog.LevelInfo)
+	previous := globalConfig.Log
+	t.Cleanup(func() { globalConfig.Log = previous })
+	globalConfig.Log = LogConfig{Level: "verbose"}
+	if err := setupLogger(t.TempDir()); err == nil {
+		t.Fatal("invalid log.Level was accepted")
+	}
+	if log.Writer() != output || serviceLogLevel.Level() != slog.LevelInfo {
+		t.Fatal("invalid configuration partially changed the logger")
+	}
+}
+
+func TestWebSocketLoggingPrivacyAndNormalClose(t *testing.T) {
+	output := captureServiceLogs(t, slog.LevelInfo)
+	endpoint := "wss://user:private-password@example.com/private-path?token=private-token#private-fragment"
+	serviceLog(slog.LevelInfo, "ws_client_starting", "origin", logURLOrigin(endpoint))
+	record := decodeLogObject(t, output.Bytes())
+	if record["origin"] != "wss://example.com" {
+		t.Fatalf("URL was not sanitized: %#v", record)
+	}
+	output.Reset()
+	logWebSocketDisconnect("ws_client_disconnected", "example", fmt.Errorf("read: %w", &websocket.CloseError{Code: 1000, Text: "private-close-text"}))
+	if output.Len() != 0 {
+		t.Fatalf("normal close logged as a warning: %s", output.String())
+	}
+	logWebSocketDisconnect("ws_client_disconnected", "example", &websocket.CloseError{Code: 1006, Text: "private-close-text"})
+	record = decodeLogObject(t, output.Bytes())
+	if record["level"] != "WARN" || record["close_code"] != float64(1006) || strings.Contains(output.String(), "private-close-text") {
+		t.Fatalf("unexpected disconnect log: %#v", record)
+	}
+}
+
+func TestMCPStdioProcessLogging(t *testing.T) {
+	dir := t.TempDir()
+	writeLoggingFile(t, filepath.Join(dir, "tool.js"), `console.log("stdio-console-marker"); ({ok:true})`)
+	writeLoggingFile(t, filepath.Join(dir, "api.json"), `{"tool":{"script":"tool.js"},"mcp":{"type":"mcp","transport":"stdio","tools":["tool"]}}`)
+	input := "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"}}\n" +
+		"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n" +
+		"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"tool\",\"arguments\":{}}}\n"
+	for _, tc := range []struct {
+		name, level string
+		file        bool
+	}{
+		{name: "default_stderr"},
+		{name: "debug_stderr", level: "debug"},
+		{name: "rotating_file", file: true},
+		{name: "debug_rotating_file", level: "debug", file: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logFile := filepath.Join(dir, tc.name+".log")
+			cfg, err := json.Marshal(Config{Log: LogConfig{EnableLogging: tc.file, Filename: logFile, Level: tc.level}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			configFile := filepath.Join(dir, tc.name+".json")
+			writeLoggingFile(t, configFile, string(cfg))
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMCPStdioLoggingHelper$", "--", "--config", configFile, "--api", filepath.Join(dir, "api.json"), "--mcp-server", "mcp")
+			cmd.Env = append(os.Environ(), "NYANPUI_TEST_STDIO_LOGGING_CHILD=1")
+			cmd.Stdin = strings.NewReader(input)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("stdio process failed: %v; stderr=%s", err, stderr.String())
+			}
+			lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("stdout contains non-protocol data: %s", stdout.String())
+			}
+			for _, line := range lines {
+				record := decodeLogObject(t, []byte(line))
+				if record["jsonrpc"] != "2.0" || record["error"] != nil {
+					t.Fatalf("invalid protocol response: %s", line)
+				}
+			}
+			logs := stderr.Bytes()
+			if tc.file {
+				if len(logs) != 0 {
+					t.Fatalf("file logging also wrote stderr: %s", logs)
+				}
+				logs, err = os.ReadFile(logFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !bytes.Contains(logs, []byte("mcp_stdio_starting")) {
+				t.Fatalf("missing startup diagnostics: %s", logs)
+			}
+			for _, line := range bytes.Split(bytes.TrimSpace(logs), []byte("\n")) {
+				record := decodeLogObject(t, line)
+				if record["msg"] == "mcp_stdio_starting" || record["msg"] == "mcp_stdio_stopped" {
+					if record["api"] != "mcp" || record["server"] != nil {
+						t.Fatalf("unexpected MCP log fields: %#v", record)
+					}
+				}
+			}
+			if bytes.Contains(logs, []byte("stdio-console-marker")) != (tc.level == "debug") {
+				t.Fatalf("unexpected console logging: %s", logs)
+			}
+		})
+	}
+}
+
+func TestMCPStdioLoggingHelper(t *testing.T) {
+	if os.Getenv("NYANPUI_TEST_STDIO_LOGGING_CHILD") != "1" {
+		return
+	}
+	for i, arg := range os.Args {
+		if arg == "--" {
+			os.Args = append([]string{os.Args[0]}, os.Args[i+1:]...)
+			main()
+			os.Exit(0) // Do not let the test runner write PASS to protocol stdout.
+		}
+	}
+	os.Exit(2)
+}
+
+func TestSetupLoggerLevelsAndStderr(t *testing.T) {
+	captureServiceLogs(t, slog.LevelInfo)
+	previous := globalConfig.Log
+	t.Cleanup(func() { globalConfig.Log = previous })
+	for _, tc := range []struct {
+		input string
+		want  slog.Level
+	}{
+		{"", slog.LevelInfo}, {"info", slog.LevelInfo}, {" DEBUG ", slog.LevelDebug}, {"warn", slog.LevelWarn}, {"error", slog.LevelError},
+	} {
+		globalConfig.Log = LogConfig{Level: tc.input}
+		if err := setupLogger(t.TempDir()); err != nil {
+			t.Fatal(err)
+		}
+		if log.Writer() != os.Stderr || serviceLogLevel.Level() != tc.want || log.Flags() != 0 || log.Prefix() != "" {
+			t.Fatalf("unexpected logger configuration for %q", tc.input)
+		}
+	}
+}
+
+func TestScriptConsoleAndErrorLogging(t *testing.T) {
+	output := captureServiceLogs(t, slog.LevelInfo)
+	previous := globalConfig
+	globalConfig = Config{}
+	t.Cleanup(func() { globalConfig = previous })
+	script := writeFixtureFile(t, `console.log("private-console\nsecond line", {value: 1}); "private-result"`)
+	for _, level := range []slog.Level{slog.LevelInfo, slog.LevelDebug} {
+		output.Reset()
+		serviceLogLevel.Set(level)
+		result, err := runJavaScript(script, "", nil)
+		if err != nil || result != "private-result" {
+			t.Fatalf("script result changed: %q, %v", result, err)
+		}
+		if level == slog.LevelInfo {
+			if output.Len() != 0 {
+				t.Fatalf("info exposed console: %s", output.String())
+			}
+		} else {
+			record := decodeLogObject(t, output.Bytes())
+			if record["message"] != "private-console\nsecond line {\"value\":1}" || bytes.Count(output.Bytes(), []byte("\n")) != 1 {
+				t.Fatalf("unexpected console record: %s", output.String())
+			}
+		}
+	}
+	output.Reset()
+	vm := setupGojaRuntimeWithSnapshot(nil)
+	if _, err := vm.RunString(`console.log("x".repeat(10000))`); err != nil {
+		t.Fatal(err)
+	}
+	message := decodeLogObject(t, output.Bytes())["message"].(string)
+	if message != strings.Repeat("x", 4096)+"...[truncated]" {
+		t.Fatal("console text was not bounded")
+	}
+	output.Reset()
+	logServiceError(slog.LevelError, "bounded_error", errors.New(strings.Repeat("x", 10000)))
+	if decodeLogObject(t, output.Bytes())["error_detail"] != message {
+		t.Fatal("error detail was not bounded")
+	}
+	output.Reset()
+	serviceLogLevel.Set(slog.LevelInfo)
+	// Disabled console must not serialize objects (which could run a user toJSON hook).
+	if _, err := vm.RunString(`console.log({toJSON() { throw new Error("must not run") }});`); err != nil {
+		t.Fatal(err)
+	}
+	script = writeFixtureFile(t, `throw new Error("private-script-error")`)
+	if _, err := runJavaScript(script, "", nil); err == nil {
+		t.Fatal("script failure was swallowed")
+	}
+	record := decodeLogObject(t, output.Bytes())
+	if record["msg"] != "script_failed" || strings.Contains(output.String(), "private-script-error") {
+		t.Fatalf("unsafe script error log: %s", output.String())
+	}
+}
+
+func TestHTTPLoggingPrivacyAndRecovery(t *testing.T) {
+	output := captureServiceLogs(t, slog.LevelInfo)
+	router := gin.New()
+	router.Use(serviceRecovery())
+	router.GET("/items/:id", func(c *gin.Context) { c.String(200, "private-response") })
+	router.GET("/panic", func(c *gin.Context) { panic("private-panic") })
+	router.GET("/broken", func(c *gin.Context) {
+		panic(&net.OpError{Op: "write", Err: &os.SyscallError{Syscall: "write", Err: syscall.EPIPE}})
+	})
+	router.GET("/failure", func(c *gin.Context) { _ = c.Error(errors.New("private-error")); c.Status(400) })
+	for _, tc := range []struct {
+		path   string
+		status int
+	}{
+		{"/items/private-id?token=private-query", 200},
+		{"/private-unknown?token=private-query", 404},
+		{"/panic", 500},
+		{"/broken", 200}, // Gin's existing broken-pipe behavior.
+		{"/failure", 400},
+	} {
+		output.Reset()
+		req := httptest.NewRequest("GET", tc.path, strings.NewReader("private-body"))
+		req.Header.Set("Authorization", "Bearer private-auth")
+		req.Header.Set("Cookie", "session=private-cookie")
+		req.Header.Set("X-API-Key", "private-key")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != tc.status {
+			t.Fatalf("response changed for %s: %d", tc.path, rec.Code)
+		}
+		if strings.Contains(output.String(), "private-") {
+			t.Fatalf("sensitive data in log: %s", output.String())
+		}
+		if tc.path == "/panic" {
+			record := decodeLogObject(t, output.Bytes())
+			if record["msg"] != "http_panic" || record["route"] != "/panic" || record["level"] != "ERROR" {
+				t.Fatalf("unexpected panic metadata: %#v", record)
+			}
+		} else if output.Len() != 0 {
+			t.Fatalf("unexpected access log: %s", output.String())
+		}
+	}
+}
+
+func TestFileLoggingAppendsAndRotatesHTTPAndServiceEvents(t *testing.T) {
+	captureServiceLogs(t, slog.LevelInfo)
+	previous := globalConfig.Log
+	t.Cleanup(func() { globalConfig.Log = previous })
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "service.log")
+	writeLoggingFile(t, filename, "{\"msg\":\"existing_log\"}\n")
+	globalConfig.Log = LogConfig{EnableLogging: true, Filename: "service.log", MaxSize: 1, MaxBackups: 3}
+	if err := setupLogger(dir); err != nil {
+		t.Fatal(err)
+	}
+	rotating, ok := log.Writer().(*lumberjack.Logger)
+	if !ok {
+		t.Fatal("file logger is not rotating")
+	}
+	t.Cleanup(func() { rotating.Close() })
+	router := gin.New()
+	router.Use(serviceRecovery())
+	router.GET("/before", func(c *gin.Context) { panic("private-before") })
+	router.GET("/after", func(c *gin.Context) { panic("private-after") })
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/before", nil))
+	for range 150 {
+		serviceLog(slog.LevelInfo, "rotation_padding", "padding", strings.Repeat("x", 8000))
+	}
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/after", nil))
+	httpServerErrorLogger().Print("private-server-diagnostic")
+	if err := rotating.Close(); err != nil {
+		t.Fatal(err)
+	}
+	files, err := filepath.Glob(filepath.Join(dir, "*.log"))
+	if err != nil || len(files) != 2 {
+		t.Fatalf("rotation failed: %v, %v", files, err)
+	}
+	var all bytes.Buffer
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+			decodeLogObject(t, line)
+		}
+		all.Write(data)
+	}
+	for _, marker := range []string{"existing_log", `"route":"/before"`, `"route":"/after"`, `"msg":"http_server_error"`} {
+		if !strings.Contains(all.String(), marker) {
+			t.Fatalf("lost log %s during append/rotation", marker)
+		}
+	}
+	active, err := os.ReadFile(filename)
+	if err != nil || !bytes.Contains(active, []byte(`"route":"/after"`)) {
+		t.Fatal("HTTP logs did not follow rotation")
+	}
+	if !bytes.Contains(active, []byte(`"msg":"http_server_error"`)) || bytes.Contains(all.Bytes(), []byte("private-")) {
+		t.Fatal("server diagnostics did not follow rotation or leaked details")
+	}
+}
+
+// Exercise main's actual HTTP/TLS wiring, including net/http's own diagnostics.
+func TestHTTPProcessLogging(t *testing.T) {
+	fixture := httptest.NewTLSServer(http.NotFoundHandler())
+	certificate := fixture.TLS.Certificates[0]
+	client := fixture.Client()
+	client.Timeout = time.Second
+	fixture.Close()
+	defer client.CloseIdleConnections()
+	key, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, transport := range []string{"http", "https"} {
+		for _, level := range []string{"info", "debug"} {
+			t.Run(transport+"_"+level, func(t *testing.T) {
+				listener, err := net.Listen("tcp4", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				port := listener.Addr().(*net.TCPAddr).Port
+				listener.Close()
+				dir := t.TempDir()
+				configPath, apiPath := filepath.Join(dir, "config.json"), filepath.Join(dir, "api.json")
+				logPath := filepath.Join(dir, "service.log")
+				cfg := Config{Port: port, Log: LogConfig{Level: level, EnableLogging: level == "debug", Filename: logPath}}
+				if transport == "https" {
+					cfg.CertFile, cfg.KeyFile = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+					writeLoggingFile(t, cfg.CertFile, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]})))
+					writeLoggingFile(t, cfg.KeyFile, string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key})))
+				}
+				encoded, err := json.Marshal(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeLoggingFile(t, configPath, string(encoded))
+				writeLoggingFile(t, apiPath, `{}`)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMCPStdioLoggingHelper$", "--", "--config", configPath, "--api", apiPath)
+				cmd.Env = append(os.Environ(), "NYANPUI_TEST_STDIO_LOGGING_CHILD=1")
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout, cmd.Stderr = &stdout, &stderr
+				if err := cmd.Start(); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if cmd.ProcessState == nil {
+						cmd.Process.Kill()
+						cmd.Wait()
+					}
+				}()
+				address := fmt.Sprintf("127.0.0.1:%d", port)
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					response, err := client.Get(transport + "://" + address + "/private-path?token=private-query")
+					if err == nil {
+						io.Copy(io.Discard, response.Body)
+						response.Body.Close()
+						if response.StatusCode != http.StatusNotFound {
+							t.Fatalf("unexpected HTTP status: %d", response.StatusCode)
+						}
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("server did not start: %v", err)
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				if transport == "https" {
+					conn, err := net.DialTimeout("tcp", address, time.Second)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer conn.Close()
+					conn.SetDeadline(time.Now().Add(time.Second))
+					if _, err := io.WriteString(conn, "invalid TLS handshake\n"); err != nil {
+						t.Fatal(err)
+					}
+					// net/http logs the handshake error before closing the connection.
+					io.Copy(io.Discard, conn)
+					conn.Close()
+				}
+				cmd.Process.Kill()
+				cmd.Wait()
+				if stdout.Len() != 0 {
+					t.Fatalf("HTTP service wrote stdout: %s", stdout.String())
+				}
+				logs := stderr.Bytes()
+				if cfg.Log.EnableLogging {
+					if len(logs) != 0 {
+						t.Fatalf("file logging also wrote stderr: %s", logs)
+					}
+					logs, err = os.ReadFile(logPath)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				var diagnostics int
+				for _, line := range bytes.Split(bytes.TrimSpace(logs), []byte("\n")) {
+					record := decodeLogObject(t, line)
+					switch record["msg"] {
+					case "starting", "config_loaded", "api_config_loaded", "api_hot_reload_disabled", "http_server_starting":
+					case "http_server_error":
+						diagnostics++
+						if record["level"] != "ERROR" || record["error_type"] == nil {
+							t.Fatalf("invalid server diagnostic: %#v", record)
+						}
+						if level == "debug" {
+							detail, _ := record["error_detail"].(string)
+							if !strings.Contains(detail, "TLS handshake error") {
+								t.Fatalf("debug detail missing: %#v", record)
+							}
+						} else if record["error_detail"] != nil || bytes.Contains(line, []byte("127.0.0.1")) {
+							t.Fatalf("info exposed server diagnostic: %#v", record)
+						}
+					default:
+						t.Fatalf("unexpected request/access log: %#v", record)
+					}
+				}
+				if (transport == "https" && diagnostics != 1) || (transport == "http" && diagnostics != 0) {
+					t.Fatalf("unexpected server diagnostic count: %d", diagnostics)
+				}
+				if bytes.Contains(logs, []byte("private-")) {
+					t.Fatalf("request values exposed: %s", logs)
+				}
+			})
+		}
+	}
+}
+
+func TestStartupLoggingFailuresStayOffStdout(t *testing.T) {
+	for _, invalidLevel := range []bool{false, true} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.json")
+		if invalidLevel {
+			writeLoggingFile(t, path, `{"log":{"Level":"verbose"}}`)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMCPStdioLoggingHelper$", "--", "--config", path)
+		cmd.Env = append(os.Environ(), "NYANPUI_TEST_STDIO_LOGGING_CHILD=1")
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err == nil {
+			t.Fatal("invalid startup succeeded")
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("startup failure polluted stdout: %s", stdout.String())
+		}
+		record := decodeLogObject(t, bytes.TrimSpace(stderr.Bytes()))
+		if record["level"] != "ERROR" {
+			t.Fatalf("missing startup error: %#v", record)
 		}
 	}
 }

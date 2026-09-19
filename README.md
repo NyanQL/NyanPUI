@@ -99,7 +99,8 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
     "MaxBackups": 3,
     "MaxAge": 7,
     "Compress": true,
-    "EnableLogging": false
+    "EnableLogging": false,
+    "Level": "info"
   }
 }
 ```
@@ -123,7 +124,8 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
   "MaxBackups": 3,
   "MaxAge": 7,
   "Compress": true,
-  "EnableLogging": false
+  "EnableLogging": false,
+  "Level": "info"
 }
 ```
 
@@ -132,7 +134,20 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
 * **MaxBackups**: ローテーション保持数
 * **MaxAge**: 保持日数
 * **Compress**: gzip 圧縮 (true/false)
-* **EnableLogging**: ログ出力をファイルに書くか（false でターミナル出力）
+* **EnableLogging**: `true` はファイルへの追記、`false` は標準エラーへの出力（ログ自体は無効化しません）
+* **Level**: `debug` / `info` / `warn` / `error`。省略時は `info` で、指定以上の重大度を出力します。不正な値では起動を中止します。変更後は再起動が必要です。
+
+Nyan8・NyanQLと同じく、ログは1行1件のJSON形式で出力します。`time`、`level`、`msg`（処理名）と、処理に応じた項目を記録します。起動時の設定読み込みエラーも標準エラーへ出力し、標準出力はログには使いません。MCPのstdioモードでは標準出力をJSON-RPC応答専用に保ちます。ファイル出力時はアプリケーション・エラーのログが同じローテーション設定を使用し、再起動時にも既存ログを保持します。起動ログは `starting` イベントに `binary_version`、`go_version`、`config_version` を、MCP開始・終了ログは `api` にサーバーの定義名を記録します。
+
+通常の `info` では、起動、設定変更、ジョブ完了、接続状態、警告、エラーを記録します。ジョブ結果は本文ではなく `result_bytes`（結果文字列のバイト数）を記録します。WebSocket接続先は資格情報・パス・クエリ・フラグメントを除いたschemeとhostだけを記録します。リクエスト・WebSocket・Pushの本文、API設定全体、JavaScript全文は自動出力しません。
+
+Nyan8・NyanQLと同じく、全リクエストのURL・ステータス・処理時間を記録するHTTPアクセスログは出力しません。panic時もリクエストのダンプは出力しません。TLSハンドシェイク失敗などHTTPサーバー内部のエラーは、Nyan8と同じ `http_server_error` イベントとしてJSONで記録し、詳細文字列は `debug` 時だけ出力します。
+
+```json
+{"time":"2026-09-09T12:00:00+09:00","level":"INFO","msg":"schedule_completed","job":"daily_update","result_bytes":128}
+```
+
+エラーは処理名と型、取得できる場合はWebSocket終了コードなどを記録します。`debug` では受信メッセージやPushのバイト数、ジョブの次回実行時刻に加え、**エラー詳細文字列とJavaScriptの `console.log(...)`** を出力します。エラー詳細・consoleメッセージはそれぞれ4096バイトまでとし、改行はJSON内でエスケープします。これらの詳細にはパラメータや認証情報が含まれ得るため、調査時に限って `debug` を使用してください。
 
 ## API 定義ファイル (api.json)
 
@@ -595,9 +610,9 @@ const nyanOutputSchema = {
 
 リポジトリ同梱の `api.json` には、NyanPUI 自身の `/push/receive` に接続するサンプル（`ws_client/self_push_receive`）があります。
 
-1. `./NyanPUI` を起動（ログに `Starting WebSocket client ws_client/self_push_receive -> ws://127.0.0.1:8009/push/receive` が出ます）
+1. `log.Level` を `debug` にして `./NyanPUI` を起動（`ws_client_starting` イベントの `client` が `ws_client/self_push_receive`、`origin` が `ws://127.0.0.1:8009` になります）
 2. ブラウザで `http://localhost:8009/push/request` を開く（push が飛びます）
-3. ターミナルに `ws_client ... received ...` が出ればOK
+3. 設定したログ出力先に `ws_client_message_received` イベントが出ればOK
 
 ポートを変更している場合は `api.json` の `connectURL` を合わせてください。
 
@@ -640,7 +655,7 @@ schedule の `script` では通常 API と同じ Goja 環境を使えます。�
 | `nyan_schedule_time` | 実行予定時刻 |
 | `nyan_schedule_description` | `api.json` の説明文 |
 
-同梱の `api.json` には動作確認用の `schedule_debug_every_minute` を追加しています。起動すると1分ごとに `javascript/schedule_debug.js` が実行され、ログへ実行時刻が出力されます。
+同梱の `api.json` には動作確認用の `schedule_debug_every_minute` を追加しています。起動すると1分ごとに `javascript/schedule_debug.js` が実行され、`info` では `schedule_completed` イベントを記録します。`console.log` による実行時刻の詳細は `debug` 時だけ `script_console` イベントとして出力されます。
 
 ## アプリケーションの実行
 
@@ -695,8 +710,8 @@ nyanHtmlCode には `api.json` で指定した HTML ファイルの内容が文�
 HTMLコードを加工して出力する場合にはこちらの変数を利用してください。
 
 ### 3. **console.log()**
-console.log はコンソールもしくはログファイルへ内容が出力されます。
-どちらに表示されるかは config.json の `log.EnableLogging` で制御します。
+console.log は `log.Level` が `debug` のときだけ、JSONログの `script_console` イベントとして内容を出力します。
+出力先は config.json の `log.EnableLogging` で制御し、`true` ならログファイル、`false` なら標準エラーへ出力します。
 ```javascript
 console.log("Hello, NyanPUI!");
 ```
