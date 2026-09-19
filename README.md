@@ -431,7 +431,7 @@ return {
 };
 ```
 
-`success: true` かつ `status: 200` の場合だけ次の処理へ進みます。それ以外は `paramCheck` の結果を JSON として返します。HTTP ステータスも `status` の値になります。
+`success: true` かつ `status: 200` の場合だけ次の処理へ進みます。それ以外は、通常のHTTP呼び出しでは `paramCheck` の結果を JSON として返し、HTTP ステータスも `status` の値になります。JSON-RPC呼び出し時は、後述のJSON-RPCエラー形式で返します。
 
 ```js
 return {
@@ -464,7 +464,7 @@ var path = nyanAllParams.nyan_public_path;         // 例: "docs/a.txt"
 
 ### 出力前チェック（`outCheck`）
 
-`outCheck` を指定すると、通常 API の本体実行後、または `type: "public"` のファイル送信前に JavaScript を実行できます。`outCheck` が成功した場合は本体の実行結果をそのまま出力し、失敗した場合は `outCheck` の結果を JSON として出力します。
+`outCheck` を指定すると、通常 API の本体実行後、または `type: "public"` のファイル送信前に JavaScript を実行できます。`outCheck` が成功した場合は本体の実行結果をそのまま出力し、失敗した場合は `outCheck` の結果を JSON として出力します。JSON-RPC呼び出し時は、後述のJSON-RPCエラー形式で返します。
 
 ```json
 {
@@ -500,7 +500,7 @@ return {
 };
 ```
 
-`success: true` かつ `status: 200` の場合だけ本体の実行結果をそのまま出力します。それ以外は `outCheck` の結果を JSON として返します。HTTP ステータスも `status` の値になります。
+`success: true` かつ `status: 200` の場合だけ本体の実行結果をそのまま出力します。それ以外は、通常のHTTP呼び出しでは `outCheck` の結果を JSON として返し、HTTP ステータスも `status` の値になります。
 
 本体の実行結果は `nyanAllParams.nyan_output` で参照できます。
 
@@ -865,6 +865,28 @@ JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
 ```
 
 `method` には `api.json` の API 名を指定します。JSON-RPC では `script` が必須です。`type: "schedule"` は呼び出せません。成功時の `result` は JavaScript の戻り値を文字列化した値です。
+
+JSON-RPCでも `paramCheck` と `outCheck` を実行します。チェックが `success: true` かつ `status: 200` を満たさなかった場合、HTTP 200で次のJSON-RPCエラーを返します。`id` はリクエストの値を保持し、`error.code` は `-32000`、`error.message` は `paramCheck rejected` または `outCheck rejected` です。元のチェック結果は `error.data` に保持します。
+
+```json
+{
+  "jsonrpc": "2.0",
+  "error": {
+    "code": -32000,
+    "message": "paramCheck rejected",
+    "data": {
+      "success": false,
+      "status": 403,
+      "result": "denied"
+    }
+  },
+  "id": 1
+}
+```
+
+`paramCheck` の拒否時は本体とPushを実行しません。`outCheck` の拒否時は実行済みの本体結果を返さず、Pushも実行しません。チェックスクリプトの例外や不正な戻り値も同じエラー形式となり、`error.data.status` は `500`、`error.data.result.message` に詳細が入ります。
+
+`nyan_mode=checkOnly` では本体とPushを実行せず、成功時はHTTP 200でチェック結果オブジェクトをJSON-RPCの `result` に格納します。`paramCheck` 未設定時の `result` は `{"success":true,"status":200,"result":null}` です。チェック拒否時は上記のエラー形式になります。
 
 ---
 

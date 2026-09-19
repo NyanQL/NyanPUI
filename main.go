@@ -547,14 +547,14 @@ type JSONRPCResponse struct {
 	JSONRPC string        `json:"jsonrpc"`
 	Result  interface{}   `json:"result,omitempty"`
 	Error   *JSONRPCError `json:"error,omitempty"`
-	ID      interface{}   `json:"id,omitempty"`
+	ID      interface{}   `json:"id"`
 }
 
 type JSONRPCRequest struct {
 	JSONRPC string                 `json:"jsonrpc"`
 	Method  string                 `json:"method"`
 	Params  map[string]interface{} `json:"params"`
-	ID      interface{}            `json:"id"`
+	ID      json.RawMessage        `json:"id"`
 }
 
 type JSONRPCError struct {
@@ -1376,18 +1376,27 @@ func runParamCheck(c *gin.Context, config EndpointConfig, exeDir string, htmlPat
 }
 
 func runParamCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}) (bool, bool) {
+	allowed, response := evaluateParamCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams)
+	if response != nil {
+		writeParamCheckResponse(c, *response)
+		return allowed, true
+	}
+	return allowed, false
+}
+
+// Return the check result separately so each transport can format its response.
+func evaluateParamCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}) (bool, *ParamCheckResponse) {
 	checkOnly := isCheckOnlyMode(allParams)
 	paramCheckPath := strings.TrimSpace(config.ParamCheck)
 	if paramCheckPath == "" {
 		if checkOnly {
-			writeParamCheckResponse(c, ParamCheckResponse{
+			return false, &ParamCheckResponse{
 				Success: true,
 				Status:  http.StatusOK,
 				Result:  nil,
-			})
-			return false, true
+			}
 		}
-		return true, false
+		return true, nil
 	}
 
 	c.Writer.Header().Set("Cache-Control", "no-store")
@@ -1395,23 +1404,22 @@ func runParamCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, conf
 
 	resultValue, err := runJavaScriptValueWithContext(snapshot, c, resolvePath(exeDir, paramCheckPath), htmlPath, allParams)
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return false, true
+		response := newParamCheckError(http.StatusInternalServerError, err.Error())
+		return false, &response
 	}
 
 	checkResponse, err := parseCheckResponse(resultValue, "paramCheck")
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return false, true
+		response := newParamCheckError(http.StatusInternalServerError, err.Error())
+		return false, &response
 	}
 
 	allowed := checkResponse.Success && checkResponse.Status == http.StatusOK
 	if checkOnly || !allowed {
-		writeParamCheckResponse(c, checkResponse)
-		return allowed, true
+		return allowed, &checkResponse
 	}
 
-	return true, false
+	return true, nil
 }
 
 func isCheckOnlyMode(allParams map[string]interface{}) bool {
@@ -1426,31 +1434,39 @@ func runOutCheck(c *gin.Context, config EndpointConfig, exeDir string, htmlPath 
 }
 
 func runOutCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}, response APIResponse) bool {
+	checkResponse := evaluateOutCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams, response)
+	if checkResponse != nil {
+		writeParamCheckResponse(c, *checkResponse)
+		return true
+	}
+	return false
+}
+
+func evaluateOutCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}, response APIResponse) *ParamCheckResponse {
 	outCheckPath := strings.TrimSpace(config.OutCheck)
 	if outCheckPath == "" {
-		return false
+		return nil
 	}
 
 	checkParams := outputCheckParams(allParams, response)
 
 	resultValue, err := runJavaScriptValueWithContext(snapshot, c, resolvePath(exeDir, outCheckPath), htmlPath, checkParams)
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return true
+		response := newParamCheckError(http.StatusInternalServerError, err.Error())
+		return &response
 	}
 
 	checkResponse, err := parseCheckResponse(resultValue, "outCheck")
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return true
+		response := newParamCheckError(http.StatusInternalServerError, err.Error())
+		return &response
 	}
 
 	if checkResponse.Success && checkResponse.Status == http.StatusOK {
-		return false
+		return nil
 	}
 
-	writeParamCheckResponse(c, checkResponse)
-	return true
+	return &checkResponse
 }
 
 func outputCheckParams(allParams map[string]interface{}, response APIResponse) map[string]interface{} {
@@ -2885,9 +2901,8 @@ func handleJSONRPC(c *gin.Context) {
 		htmlPath = resolvePath(exeDir, config.HTML)
 	}
 
-	if allowed, handled := runParamCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams); handled {
-		return
-	} else if !allowed {
+	if _, checkResponse := evaluateParamCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams); checkResponse != nil {
+		writeJSONRPCCheckResponse(c, rpcReq.ID, "paramCheck", *checkResponse)
 		return
 	}
 
@@ -2902,7 +2917,8 @@ func handleJSONRPC(c *gin.Context) {
 		respondJSONRPCError(c, rpcReq.ID, -32603, "Invalid script response", err.Error())
 		return
 	}
-	if runOutCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams, response) {
+	if checkResponse := evaluateOutCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams, response); checkResponse != nil {
+		writeJSONRPCCheckResponse(c, rpcReq.ID, "outCheck", *checkResponse)
 		return
 	}
 
@@ -2916,6 +2932,15 @@ func handleJSONRPC(c *gin.Context) {
 		ID:      rpcReq.ID,
 	}
 	c.JSON(http.StatusOK, rpcResp)
+}
+
+func writeJSONRPCCheckResponse(c *gin.Context, id interface{}, checkName string, response ParamCheckResponse) {
+	if response.Success && response.Status == http.StatusOK {
+		// A successful checkOnly request returns the check result without running the API.
+		c.JSON(http.StatusOK, JSONRPCResponse{JSONRPC: "2.0", Result: response, ID: id})
+		return
+	}
+	respondJSONRPCError(c, id, -32000, checkName+" rejected", response)
 }
 
 func respondJSONRPCError(c *gin.Context, id interface{}, code int, message string, data interface{}) {

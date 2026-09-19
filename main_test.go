@@ -1714,8 +1714,206 @@ func TestJSONRPCOutCheck(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
+	check := assertJSONRPCCheckError(t, rec, "1", "outCheck", false, http.StatusForbidden)
+	if check.Result != "denied" {
+		t.Fatalf("error.data.result = %#v, want denied", check.Result)
+	}
 	if strings.Contains(rec.Body.String(), "PRIVATE_RESULT") {
 		t.Fatalf("outCheck bypassed: %s", rec.Body.String())
+	}
+}
+
+func TestJSONRPCCheckRejections(t *testing.T) {
+	cases := []struct {
+		name        string
+		script      string
+		id          string
+		wantSuccess bool
+		wantStatus  int
+		wantResult  string
+		wantMessage string
+		checkOnly   bool
+	}{
+		{name: "denied", script: `({success:false,status:403,result:{reason:"denied"}});`, id: "9007199254740993", wantStatus: 403, wantResult: `{"reason":"denied"}`},
+		{name: "false_with_200", script: `({success:false,status:200,result:"denied"});`, id: `"request-42"`, wantStatus: 200, wantResult: `"denied"`},
+		{name: "true_with_non_200", script: `({success:true,status:201,result:["denied",3]});`, id: "null", wantSuccess: true, wantStatus: 201, wantResult: `["denied",3]`},
+		{name: "json_string", script: `JSON.stringify({success:false,status:401,result:null});`, id: "0", wantStatus: 401, wantResult: "null"},
+		{name: "exception", script: `throw new Error("check failed");`, id: "42", wantStatus: 500, wantMessage: "check failed"},
+		{name: "malformed_object", script: `({status:403,result:"denied"});`, id: `"request-42"`, wantStatus: 500, wantMessage: "response success must be boolean"},
+		{name: "invalid_status", script: `({success:false,status:700,result:"denied"});`, id: "null", wantStatus: 500, wantMessage: "response status is out of range"},
+		{name: "undefined", script: `undefined;`, id: "42", wantStatus: 500, wantMessage: "must return an object"},
+		{name: "check_only_denied", script: `({success:false,status:403,result:"denied"});`, id: `"check-only"`, wantStatus: 403, wantResult: `"denied"`, checkOnly: true},
+	}
+	for _, checkName := range []string{"paramCheck", "outCheck"} {
+		t.Run(checkName, func(t *testing.T) {
+			for _, tc := range cases {
+				if checkName == "outCheck" && tc.checkOnly {
+					continue
+				}
+				t.Run(tc.name, func(t *testing.T) {
+					dir := t.TempDir()
+					mainMarker := filepath.Join(dir, "main-ran")
+					outMarker := filepath.Join(dir, "out-ran")
+					pushMarker := filepath.Join(dir, "push-ran")
+					script := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); "PRIVATE_RESULT";`, mainMarker))
+					push := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); "pushed";`, pushMarker))
+					paramScript, outScript := `({success:true,status:200,result:null});`, `({success:true,status:200,result:null});`
+					if checkName == "paramCheck" {
+						paramScript = tc.script
+					} else {
+						outScript = tc.script
+					}
+					config := EndpointConfig{
+						Script:     script,
+						ParamCheck: writeFixtureFile(t, paramScript),
+						OutCheck:   writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); `, outMarker)+outScript),
+						Push:       "updates",
+					}
+					router := newRequestRegressionRouter(t, APIConfig{"private": config, "updates": {Script: push}})
+					params := `{}`
+					if tc.checkOnly {
+						params = `{"nyan_mode":"checkOnly"}`
+					}
+					rec := serveJSONRPCCheckRequest(router, tc.id, params)
+					check := assertJSONRPCCheckError(t, rec, tc.id, checkName, tc.wantSuccess, tc.wantStatus)
+					if tc.wantMessage != "" {
+						result, ok := check.Result.(map[string]interface{})
+						if !ok || !strings.Contains(fmt.Sprint(result["message"]), tc.wantMessage) {
+							t.Fatalf("error.data.result = %#v, want message containing %q", check.Result, tc.wantMessage)
+						}
+					} else if result, err := json.Marshal(check.Result); err != nil || string(result) != tc.wantResult {
+						t.Fatalf("error.data.result = %s, want %s; error=%v", result, tc.wantResult, err)
+					}
+					assertJSONRPCExecutionMarker(t, mainMarker, checkName == "outCheck")
+					assertJSONRPCExecutionMarker(t, outMarker, checkName == "outCheck")
+					assertJSONRPCExecutionMarker(t, pushMarker, false)
+					if strings.Contains(rec.Body.String(), "PRIVATE_RESULT") {
+						t.Fatalf("rejected response leaked main script output: %s", rec.Body.String())
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestJSONRPCCheckSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		id             string
+		checkOnly      bool
+		withParamCheck bool
+	}{
+		{name: "full_request", id: "9007199254740993", withParamCheck: true},
+		{name: "check_only_with_check", id: `"check-only"`, checkOnly: true, withParamCheck: true},
+		{name: "check_only_without_check", id: "null", checkOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mainMarker := filepath.Join(dir, "main-ran")
+			paramMarker := filepath.Join(dir, "param-ran")
+			outMarker := filepath.Join(dir, "out-ran")
+			pushMarker := filepath.Join(dir, "push-ran")
+			config := EndpointConfig{
+				Script: writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); "PRIVATE_RESULT";`, mainMarker)),
+				OutCheck: writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran");
+if (nyanAllParams.nyan_output_body !== "PRIVATE_RESULT") { throw new Error("unexpected output"); }
+({success:true,status:200,result:null});`, outMarker)),
+				Push: "updates",
+			}
+			if tc.withParamCheck {
+				config.ParamCheck = writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({success:true,status:200,result:{checked:"yes"}});`, paramMarker))
+			}
+			push := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); "pushed";`, pushMarker))
+			router := newRequestRegressionRouter(t, APIConfig{"private": config, "updates": {Script: push}})
+			params := `{}`
+			if tc.checkOnly {
+				params = `{"nyan_mode":"checkOnly"}`
+			}
+			rec := serveJSONRPCCheckRequest(router, tc.id, params)
+			response := decodeJSONRPCCheckResponse(t, rec, tc.id)
+			if _, exists := response["error"]; exists {
+				t.Fatalf("success has error: %s", rec.Body.String())
+			}
+			if tc.checkOnly {
+				var check ParamCheckResponse
+				if err := json.Unmarshal(response["result"], &check); err != nil {
+					t.Fatalf("invalid checkOnly result: %s; error=%v", rec.Body.String(), err)
+				}
+				if !check.Success || check.Status != http.StatusOK {
+					t.Fatalf("checkOnly result = %#v", check)
+				}
+				wantResult := "null"
+				if tc.withParamCheck {
+					wantResult = `{"checked":"yes"}`
+				}
+				if result, err := json.Marshal(check.Result); err != nil || string(result) != wantResult {
+					t.Fatalf("checkOnly result.result = %s, want %s; error=%v", result, wantResult, err)
+				}
+			} else if string(response["result"]) != `"PRIVATE_RESULT"` {
+				t.Fatalf("result = %s, want PRIVATE_RESULT", response["result"])
+			}
+			assertJSONRPCExecutionMarker(t, paramMarker, tc.withParamCheck)
+			assertJSONRPCExecutionMarker(t, mainMarker, !tc.checkOnly)
+			assertJSONRPCExecutionMarker(t, outMarker, !tc.checkOnly)
+			assertJSONRPCExecutionMarker(t, pushMarker, !tc.checkOnly)
+		})
+	}
+}
+
+func serveJSONRPCCheckRequest(router *gin.Engine, id, params string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/nyan-rpc", strings.NewReader(`{"jsonrpc":"2.0","id":`+id+`,"method":"private","params":`+params+`}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+func decodeJSONRPCCheckResponse(t *testing.T, rec *httptest.ResponseRecorder, id string) map[string]json.RawMessage {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HTTP status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("invalid JSON-RPC response: %s; error=%v", rec.Body.String(), err)
+	}
+	if string(response["jsonrpc"]) != `"2.0"` || string(response["id"]) != id {
+		t.Fatalf("JSON-RPC version or id changed: %s, want id=%s", rec.Body.String(), id)
+	}
+	return response
+}
+
+func assertJSONRPCCheckError(t *testing.T, rec *httptest.ResponseRecorder, id, checkName string, success bool, status int) ParamCheckResponse {
+	t.Helper()
+	response := decodeJSONRPCCheckResponse(t, rec, id)
+	if _, exists := response["result"]; exists {
+		t.Fatalf("error response has top-level result: %s", rec.Body.String())
+	}
+	var rpcError struct {
+		Code    int                `json:"code"`
+		Message string             `json:"message"`
+		Data    ParamCheckResponse `json:"data"`
+	}
+	if err := json.Unmarshal(response["error"], &rpcError); err != nil {
+		t.Fatalf("invalid JSON-RPC error: %s; error=%v", rec.Body.String(), err)
+	}
+	if rpcError.Code != -32000 || rpcError.Message != checkName+" rejected" {
+		t.Fatalf("JSON-RPC error = %#v", rpcError)
+	}
+	if rpcError.Data.Success != success || rpcError.Data.Status != status {
+		t.Fatalf("error.data = %#v, want success=%v status=%d", rpcError.Data, success, status)
+	}
+	return rpcError.Data
+}
+
+func assertJSONRPCExecutionMarker(t *testing.T, path string, want bool) {
+	t.Helper()
+	_, err := os.Stat(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if got := err == nil; got != want {
+		t.Fatalf("script execution marker %s exists=%v, want %v", filepath.Base(path), got, want)
 	}
 }
 
