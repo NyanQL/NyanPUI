@@ -332,6 +332,10 @@ Goの `main.go` はMCP/OAuthのHTTP受付、request由来URL生成、JavaScript 
 
 `nyanOAuthList` は、書き込み中断で残った `.nyanpui-oauth-*.tmp` を一覧から除外します。除外するのは通常ファイルで、既存の権限検査に合格するものだけです。シンボリックリンク、ディレクトリ、不適切な権限のファイルは引き続きエラーになります。この命名規則に一致しない `.json` 以外のファイルもエラーになります。一時ファイル自体は削除しません。
 
+OAuthのJavaScript hookでは、`nyanArgon2idHash(password)` でパスワードハッシュを生成し、`nyanArgon2idVerify(password, encodedHash)` で照合できます。現在の生成設定は `m=65536,t=3,p=2` です。検証で受け付ける設定は生成時の標準設定とは独立して実装で明示し、現在はこの設定に対応しています。対応外の設定や不正なハッシュは `false` を返します。これらの設定を変更する `config.json` の項目はありません。
+
+ハッシュの再生成・保存は自動では行いません。将来、生成設定を変更して既存ハッシュを更新する場合は、検証成功後に入力されたパスワードから再生成し、JavaScript側で保存してください。ログインの許可・拒否や更新の判断もJavaScript側で行います。
+
 NyanPUIには組み込みのOAuthユーザー管理APIはありません。ユーザーの作成・更新・管理が必要な場合は、利用者がJavaScriptなどで実装し、その処理へのアクセス制御も行ってください。ローカルサンプルのOAuth hookは状態ファイルに保存されたユーザーを認証するため、利用前にhookが扱う形式のユーザーデータを別途用意する必要があります。既存のユーザーデータは引き続き利用できます。
 
 旧設定から移行する場合は、`config.json` の `BasicAuth`、MCP定義の `oauth.adminUser`、その参照先の管理API定義を削除してください。`oauth.adminUser` が残ったAPI設定は読み込みエラーになります。管理認証用の `nyanOAuthAdminAuthorized` と、hookへの `operator_username`・`operator_password`・`admin_user_endpoint` の受け渡しも廃止しています。

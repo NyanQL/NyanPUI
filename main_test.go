@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -1975,6 +1976,23 @@ func TestArgon2idHashAndVerify(t *testing.T) {
 		t.Fatalf("hash round trip failed: %v", err)
 	}
 	parts := strings.Split(encoded, "$")
+	profile := argon2idProfiles[currentArgon2idProfile]
+	if len(parts) != 6 || parts[3] != profile.parameters() {
+		t.Fatalf("hash does not use the current generation profile: %q", encoded)
+	}
+	for _, field := range []struct {
+		name    string
+		encoded string
+		length  uint32
+	}{
+		{"salt", parts[4], profile.saltLength},
+		{"digest", parts[5], profile.keyLength},
+	} {
+		decoded, err := base64.RawStdEncoding.DecodeString(field.encoded)
+		if err != nil || len(decoded) != int(field.length) {
+			t.Fatalf("generated %s length=%d, want %d; error=%v", field.name, len(decoded), field.length, err)
+		}
+	}
 	changed := func(index int, value string) string {
 		copyOfParts := append([]string(nil), parts...)
 		copyOfParts[index] = value
@@ -1983,11 +2001,23 @@ func TestArgon2idHashAndVerify(t *testing.T) {
 	for _, tc := range []struct{ name, password, encoded string }{
 		{"wrong_password", "wrong-password", encoded},
 		{"empty_hash", password, ""},
+		{"unexpected_prefix", password, changed(0, "junk")},
+		{"extra_field", password, encoded + "$extra"},
 		{"wrong_algorithm", password, changed(1, "argon2i")},
 		{"wrong_version", password, changed(2, "v=16")},
+		{"zero_work", password, changed(3, "m=0,t=0,p=0")},
 		{"excessive_work", password, changed(3, "m=4294967295,t=4294967295,p=255")},
+		{"parameter_suffix", password, changed(3, parts[3]+",extra=1")},
+		{"parameter_whitespace", password, changed(3, parts[3]+" ")},
 		{"invalid_salt", password, changed(4, "!")},
+		{"invalid_salt_encoding", password, changed(4, strings.Repeat("!", len(parts[4])))},
+		{"short_salt", password, changed(4, "AA")},
+		{"long_salt", password, changed(4, parts[4]+"A")},
+		{"salt_newline", password, changed(4, parts[4][:len(parts[4])-1]+"\n")},
+		{"invalid_digest_encoding", password, changed(5, strings.Repeat("!", len(parts[5])))},
 		{"short_digest", password, changed(5, "AA")},
+		{"long_digest", password, changed(5, parts[5]+"A")},
+		{"digest_newline", password, changed(5, parts[5][:len(parts[5])-1]+"\n")},
 		{"oversize_password", strings.Repeat("x", 4097), encoded},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2001,6 +2031,34 @@ func TestArgon2idHashAndVerify(t *testing.T) {
 			t.Fatal("invalid password was hashed")
 		}
 	}
+}
+
+func TestArgon2idStoredHashCompatibility(t *testing.T) {
+	// Keep this saved hash independent of the current generation profile so a
+	// future default change cannot silently invalidate existing passwords.
+	// Password: fixture-password; salt: 0123456789abcdef; digest length: 32 bytes.
+	const savedHash = "$argon2id$v=19$m=65536,t=3,p=2$MDEyMzQ1Njc4OWFiY2RlZg$8AcZ9tO47h2U7BO3dpzQuEogqm6bqJy8+taXF1/F90g"
+	t.Run("Go", func(t *testing.T) {
+		if !argon2idVerify("fixture-password", savedHash) {
+			t.Fatal("previously saved hash was rejected")
+		}
+		if argon2idVerify("wrong-password", savedHash) {
+			t.Fatal("saved hash accepted the wrong password")
+		}
+	})
+	t.Run("JavaScript", func(t *testing.T) {
+		script := writeFixtureFile(t, fmt.Sprintf(`
+nyanArgon2idVerify("fixture-password", %q) === true &&
+nyanArgon2idVerify("wrong-password", %q) === false;
+`, savedHash, savedHash))
+		value, err := runJavaScriptValueWithSnapshot(&APIConfigSnapshot{}, script, "", map[string]interface{}{"state_directory": t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if value.Export() != true {
+			t.Fatalf("JavaScript saved hash verification failed: %v", value)
+		}
+	})
 }
 
 func TestJavaScriptOAuthStateLifecycle(t *testing.T) {

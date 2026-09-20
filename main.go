@@ -4807,13 +4807,25 @@ var oauthStateMu sync.Mutex
 var oauthStateNamespacePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 var oauthArgon2Slots = make(chan struct{}, 2)
 
-const (
-	argon2Memory      = 64 * 1024
-	argon2Iterations  = 3
-	argon2Parallelism = 2
-	argon2SaltLength  = 16
-	argon2KeyLength   = 32
-)
+type argon2idProfile struct {
+	memory      uint32
+	iterations  uint32
+	parallelism uint8
+	saltLength  uint32
+	keyLength   uint32
+}
+
+func (profile argon2idProfile) parameters() string {
+	return fmt.Sprintf("m=%d,t=%d,p=%d", profile.memory, profile.iterations, profile.parallelism)
+}
+
+// Keep existing profiles unchanged so stored hashes remain verifiable. To change
+// generation settings, append a profile and select its index below.
+var argon2idProfiles = [...]argon2idProfile{
+	{memory: 64 * 1024, iterations: 3, parallelism: 2, saltLength: 16, keyLength: 32},
+}
+
+const currentArgon2idProfile = 0
 
 func setupOAuthStateRuntime(vm *goja.Runtime, root string) {
 	vm.Set("nyanOAuthRead", func(key string) string {
@@ -4870,33 +4882,42 @@ func argon2idHash(password string) (string, error) {
 	if len(password) < 1 || len(password) > 4096 {
 		return "", fmt.Errorf("invalid password")
 	}
-	salt := make([]byte, argon2SaltLength)
+	profile := argon2idProfiles[currentArgon2idProfile]
+	salt := make([]byte, profile.saltLength)
 	if _, err := cryptorand.Read(salt); err != nil {
 		return "", err
 	}
 	oauthArgon2Slots <- struct{}{}
 	defer func() { <-oauthArgon2Slots }()
-	hash := argon2.IDKey([]byte(password), salt, argon2Iterations, argon2Memory, argon2Parallelism, argon2KeyLength)
-	return fmt.Sprintf("$argon2id$v=19$m=%d,t=%d,p=%d$%s$%s", argon2Memory, argon2Iterations, argon2Parallelism, base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(hash)), nil
+	hash := argon2.IDKey([]byte(password), salt, profile.iterations, profile.memory, profile.parallelism, profile.keyLength)
+	return fmt.Sprintf("$argon2id$v=19$%s$%s$%s", profile.parameters(), base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(hash)), nil
 }
 func argon2idVerify(password, encoded string) bool {
 	parts := strings.Split(encoded, "$")
-	if len(parts) != 6 || parts[1] != "argon2id" || parts[2] != "v=19" || len(password) > 4096 {
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" || len(password) > 4096 {
 		return false
 	}
-	var memory, iterations uint32
-	var parallelism uint8
-	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &iterations, &parallelism); err != nil || memory != argon2Memory || iterations != argon2Iterations || parallelism != argon2Parallelism {
+	var profile argon2idProfile
+	supported := false
+	for _, candidate := range argon2idProfiles {
+		if parts[3] == candidate.parameters() &&
+			len(parts[4]) == base64.RawStdEncoding.EncodedLen(int(candidate.saltLength)) &&
+			len(parts[5]) == base64.RawStdEncoding.EncodedLen(int(candidate.keyLength)) {
+			profile, supported = candidate, true
+			break
+		}
+	}
+	if !supported {
 		return false
 	}
 	salt, e1 := base64.RawStdEncoding.DecodeString(parts[4])
 	expected, e2 := base64.RawStdEncoding.DecodeString(parts[5])
-	if e1 != nil || e2 != nil || len(salt) != argon2SaltLength || len(expected) != argon2KeyLength {
+	if e1 != nil || e2 != nil || len(salt) != int(profile.saltLength) || len(expected) != int(profile.keyLength) {
 		return false
 	}
 	oauthArgon2Slots <- struct{}{}
 	defer func() { <-oauthArgon2Slots }()
-	actual := argon2.IDKey([]byte(password), salt, iterations, memory, parallelism, uint32(len(expected)))
+	actual := argon2.IDKey([]byte(password), salt, profile.iterations, profile.memory, profile.parallelism, profile.keyLength)
 	return subtle.ConstantTimeCompare(actual, expected) == 1
 }
 func resolveOAuthStatePath(root, key string, create bool) (string, error) {
