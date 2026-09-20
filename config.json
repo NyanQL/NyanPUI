@@ -16,6 +16,11 @@
     "MaxBackups": 3,
     "MaxAge": 7,
     "Compress": true,
-    "EnableLogging": false
+    "EnableLogging": false,
+    "Level": "info"
+  },
+  "APIHotReload": {
+    "Enabled": true,
+    "Interval": "1s"
   }
 }

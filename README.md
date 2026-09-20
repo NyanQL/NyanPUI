@@ -6,7 +6,8 @@ NyanPUI(にゃんぷい)は、GoLangで作られたサーバーサイドレン�
 * **双方向通信**: gorilla/websocket による WebSocket
 * **プッシュ通知**: 特定エンドポイントの処理結果を WebSocket で配信
 * **定期実行**: `type: "schedule"` による cron 形式の JavaScript ジョブ
-* **CORS**: `Access-Control-Allow-Origin: *` を付与
+* **MCP**: Streamable HTTP、Tool公開、OAuth 2.0 Authorization Code + PKCEに対応
+* **CORS**: 通常APIは従来どおり全Originを許可し、MCPは設定したOriginだけを許可
 
 ## ライセンス
 
@@ -31,7 +32,7 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 ├── main.go              # エントリーポイント
 ├── logs/                # ログファイル出力先
 ├── README.md            # 本ファイル
-└── NyanPUI_XXX          # 実行ファイル（XXX は OS 名）
+└── NyanPUI              # 実行ファイル
 ```
 
 ## 設定ファイル
@@ -46,14 +47,14 @@ NyanPUI は起動時に `api.json` と `config.json` の読み込みパスを指
 3. 実行ファイルと同じディレクトリのデフォルトファイル
 
 ```sh
-./NyanPUI_Mac
-./NyanPUI_Mac --api /path/to/api.json --config /path/to/config.json
-NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./NyanPUI_Mac
+./NyanPUI
+./NyanPUI --api /path/to/api.json --config /path/to/config.json
+NYAN_API_PATH=/path/to/api.json NYAN_CONFIG_PATH=/path/to/config.json ./NyanPUI
 ```
 
 CLI オプションと環境変数には絶対パス、または NyanPUI を起動したカレントディレクトリからの相対パスを指定できます。指定したファイルが存在しない場合、またはディレクトリを指定した場合は起動時にエラーになります。
 
-`api.json` 内の `script` / `html` / `path` / `paramCheck` / `outCheck` の相対パスは、`api.json` が置かれているディレクトリから解決されます。
+各 `api.json` 内の `script` / `html` / `paramCheck` / `outCheck` と、`type: "public"` / `type: "include"` の `path` の相対パスは、その定義を書いた `api.json` が置かれているディレクトリから解決されます。MCP endpointはMCP API名から自動的に決まります。
 `config.json` 内の `certPath` / `keyPath` / `javascript_include` / `log.Filename` の相対パスは、`config.json` が置かれているディレクトリから解決されます。
 
 起動時のログには、読み込んだ `config.json` / `api.json` の絶対パスと、その指定元（`--api`, `--config`, 環境変数, default）が出力されます。`/css`, `/images`, `/js`, `/favicon.ico` の組み込み静的ファイルは、設定ファイルの場所に関係なく実行ファイルと同じディレクトリの `html/` 配下から配信されます。
@@ -65,10 +66,16 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
 | `--api`, `--config` | NyanPUI を起動したカレントディレクトリ |
 | `NYAN_API_PATH`, `NYAN_CONFIG_PATH` | NyanPUI を起動したカレントディレクトリ |
 | デフォルトの `api.json`, `config.json` | 実行ファイルと同じディレクトリ |
-| `api.json` の `script`, `html`, `path`, `paramCheck`, `outCheck` | `api.json` が置かれているディレクトリ |
+| `api.json` の `script`, `html`, `paramCheck`, `outCheck`、`public` / `include` の `path` | その定義を書いた `api.json` が置かれているディレクトリ |
+| JavaScript の `nyanGetFile`, `nyanSaveFile`, `nyanDeleteFile`, `nyanReadFileB64` | 最上位の API 定義ファイルが置かれているディレクトリ |
+| `api.json` の `type: "mcp"` | `path` は指定せず、API名をendpointに使用 |
 | `config.json` の `certPath`, `keyPath`, `javascript_include`, `log.Filename` | `config.json` が置かれているディレクトリ |
 | `api.json` の `connectURL` | URL 文字列として扱うため相対パス解決なし |
 | `/css`, `/images`, `/js`, `/favicon.ico` | 実行ファイルと同じディレクトリの `html/` 配下 |
+
+最上位の API 定義ファイルとは、起動時に `--api`、`NYAN_API_PATH`、またはデフォルトで最初に読み込むファイルです。ファイル名が `api.json` 以外でも同じ扱いです。JavaScript の上記4関数は、多段 `include` のどの API から実行してもこのディレクトリを基準にします。実行ファイルの配置場所やカレントディレクトリには依存せず、絶対パスはそのまま使用します。
+
+従来の `nyanGetFile` / `nyanSaveFile` / `nyanDeleteFile` は実行ファイルのあるディレクトリ、`nyanReadFileB64` はカレントディレクトリを相対パスの基準としていました。最上位の API 定義ファイルと異なる場所を基準にしていたスクリプトは、同じファイルを指すよう相対パスを調整するか、絶対パスを指定してください。
 
 ### config.json
 
@@ -83,16 +90,29 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
   "javascript_include": [
     "javascript/lib/nyanPlateToJson.js"
   ],
+  "APIHotReload": {
+    "Enabled": true,
+    "Interval": "1s"
+  },
   "log": {
     "Filename": "./logs/nyanpui.log",
     "MaxSize": 5,
     "MaxBackups": 3,
     "MaxAge": 7,
     "Compress": true,
-    "EnableLogging": false
+    "EnableLogging": false,
+    "Level": "info"
   }
 }
 ```
+
+### api.json のホットリロード
+
+ルートの `api.json` と、そこからincludeされたすべての `api.json` は既定で1秒ごとに確認され、いずれかの内容が変化した場合にルートから再読み込みされます。`APIHotReload.Enabled` を `false` にすると無効化できます。`Interval` は `500ms`、`1s`、`1m`、`24h` などのGo duration形式で指定し、省略時は `1s` です。0以下または解析できない値は起動エラーになります。
+
+再読み込みではincludeグラフ全体と、すべての `schedule` / `ws_client` 定義を事前検証します。正常な候補だけが一括で公開され、不正な内容の場合は直前の正常な定義を維持します。存在しないinclude候補も監視され、ファイルを作成・修正すると自動復旧します。同じ不正内容のログは状態が変わるまで重複出力しません。
+
+追加、変更、削除は通常API、HTML API、public API、`/nyan`、JSON-RPC、`nyanCallMe`、WebSocket受信処理、pushへ次の処理から反映されます。`schedule` と `ws_client` も動的に開始、更新、停止します。既存のWebSocketサーバー接続は設定変更だけでは切断されません。`ws_client` はscriptまたはdescriptionだけの変更では接続を維持し、`connectURL` の変更時だけ接続先を切り替えます。
 
 ### ログ設定（例）
 
@@ -103,7 +123,8 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
   "MaxBackups": 3,
   "MaxAge": 7,
   "Compress": true,
-  "EnableLogging": false
+  "EnableLogging": false,
+  "Level": "info"
 }
 ```
 
@@ -112,7 +133,20 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
 * **MaxBackups**: ローテーション保持数
 * **MaxAge**: 保持日数
 * **Compress**: gzip 圧縮 (true/false)
-* **EnableLogging**: ログ出力をファイルに書くか（false でターミナル出力）
+* **EnableLogging**: `true` はファイルへの追記、`false` は標準エラーへの出力（ログ自体は無効化しません）
+* **Level**: `debug` / `info` / `warn` / `error`。省略時は `info` で、指定以上の重大度を出力します。不正な値では起動を中止します。変更後は再起動が必要です。
+
+Nyan8・NyanQLと同じく、ログは1行1件のJSON形式で出力します。`time`、`level`、`msg`（処理名）と、処理に応じた項目を記録します。起動時の設定読み込みエラーも標準エラーへ出力し、標準出力はログには使いません。MCPのstdioモードでは標準出力をJSON-RPC応答専用に保ちます。ファイル出力時はアプリケーション・エラーのログが同じローテーション設定を使用し、再起動時にも既存ログを保持します。起動ログは `starting` イベントに `binary_version`、`go_version`、`config_version` を、MCP開始・終了ログは `api` にサーバーの定義名を記録します。
+
+通常の `info` では、起動、設定変更、ジョブ完了、接続状態、警告、エラーを記録します。ジョブ結果は本文ではなく `result_bytes`（結果文字列のバイト数）を記録します。WebSocket接続先は資格情報・パス・クエリ・フラグメントを除いたschemeとhostだけを記録します。リクエスト・WebSocket・Pushの本文、API設定全体、JavaScript全文は自動出力しません。
+
+Nyan8・NyanQLと同じく、全リクエストのURL・ステータス・処理時間を記録するHTTPアクセスログは出力しません。panic時もリクエストのダンプは出力しません。TLSハンドシェイク失敗などHTTPサーバー内部のエラーは、Nyan8と同じ `http_server_error` イベントとしてJSONで記録し、詳細文字列は `debug` 時だけ出力します。
+
+```json
+{"time":"2026-09-09T12:00:00+09:00","level":"INFO","msg":"schedule_completed","job":"daily_update","result_bytes":128}
+```
+
+エラーは処理名と型、取得できる場合はWebSocket終了コードなどを記録します。`debug` では受信メッセージやPushのバイト数、ジョブの次回実行時刻に加え、**エラー詳細文字列とJavaScriptの `console.log(...)`** を出力します。エラー詳細・consoleメッセージはそれぞれ4096バイトまでとし、改行はJSON内でエスケープします。これらの詳細にはパラメータや認証情報が含まれ得るため、調査時に限って `debug` を使用してください。
 
 ## API 定義ファイル (api.json)
 
@@ -133,19 +167,203 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
 }
 ```
 
-* **type**: 種別。省略時は通常 API、`public` は静的ファイル公開、`ws_client` は WebSocket クライアント、`schedule` は定期実行ジョブ
+* **type**: 種別。`api`（または省略）は通常 API、`public` は静的ファイル公開、`ws_client` は WebSocket クライアント、`schedule` は定期実行ジョブ、`include` は別API定義の読込、`mcp` はMCP Server
 * **script**: 実行する JavaScript ファイル（空文字列なら HTML のみ返却）
 * **html**: HTML ファイルパス
-* **path**: `type: "public"` で公開するフォルダパス
+* **path**: `type: "public"` では公開するフォルダ、`type: "include"` では読込先JSON。`type: "mcp"` では指定不可
 * **trigger**: `type: "schedule"` で使う実行トリガー
 * **paramCheck**: API 実行前に実行する JavaScript ファイル
 * **outCheck**: API 出力前に実行する JavaScript ファイル
+* **title**: APIの表示名。MCP Toolとして公開する場合はToolのtitleになり、省略時はAPI名を使用
 * **description**: 説明文
 * **push**: WebSocket で配信するエンドポイント名
 
-省略可能なフィールド: `type`, `script`, `html`, `path`, `connectURL`, `trigger`, `paramCheck`, `outCheck`, `description`, `push`。
+省略可能なフィールド: `type`, `script`, `html`, `path`, `connectURL`, `trigger`, `paramCheck`, `outCheck`, `title`, `description`, `push`。MCP専用フィールドは後述します。
 
-`paramCheck` は `paramcheck`、`outCheck` は `outcheck` の小文字表記でも読み込めます。README では `paramCheck` / `outCheck` を推奨表記とします。
+`paramCheck` は `paramcheck` / `check`、`outCheck` は `outcheck` の別名でも読み込めます。README では `paramCheck` / `outCheck` を推奨表記とします。
+
+## MCP ServerとOAuth
+
+`type: "mcp"` を複数定義でき、既存のNyanPUI APIをToolとして共有できます。transportは定義ごとに `streamable_http` または `stdio` のどちらか1つです。Streamable HTTPはstatelessで、MCP protocol version `2025-11-25` と `2025-06-18`、`initialize`、`ping`、`tools/list`、`tools/call` に対応しています。
+
+現在の接続確認用MCP URLは次のとおりです。
+
+```text
+https://nyanpui.stamps.necomori.asia/server_mcp_http
+```
+
+ChatGPTへはこのURLを登録します。認証画面ではJavaScript hook側で認証するOAuthユーザーを使用します。ユーザーは利用前に別途用意してください。現在のscopeは `nyanpui:read` です。
+
+### MCP設定例
+
+公開環境の `api.vps.json`、OAuth hook、状態ファイル、Ansible設定は環境ごとの運用ファイルとしてGit管理しません。次は構造を示す例です。
+
+```json
+{
+  "sample/json": {
+    "type": "api",
+    "script": "./javascript/sample_json.js",
+    "paramCheck": "./javascript/mcp_sample_input.js",
+    "outCheck": "./javascript/mcp_sample_output.js",
+    "title": "疎通確認データを取得",
+    "description": "固定JSONを返します。",
+    "securitySchemes": [
+      {"type": "oauth2", "scopes": ["nyanpui:read"]}
+    ],
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    }
+  },
+  ".well-known/oauth-authorization-server": {
+    "type": "api",
+    "description": "Authorization Server Metadata"
+  },
+  ".well-known/oauth-protected-resource/server_mcp_http": {
+    "type": "api",
+    "description": "Protected Resource Metadata"
+  },
+  "oauth/authorize": {
+    "type": "api",
+    "script": "./runtime/oauth_policy.js"
+  },
+  "oauth/token": {
+    "type": "api",
+    "script": "./runtime/oauth_policy.js"
+  },
+  "oauth/register": {
+    "type": "api",
+    "script": "./runtime/oauth_policy.js"
+  },
+  "oauth/verify_access": {
+    "type": "api",
+    "script": "./runtime/oauth_policy.js",
+    "scopes": ["nyanpui:read"]
+  },
+  "server_mcp_http": {
+    "type": "mcp",
+    "transport": "streamable_http",
+    "protocolVersions": ["2025-11-25", "2025-06-18"],
+    "allowedOrigins": ["https://chatgpt.com", "https://platform.openai.com"],
+    "redirectURIAllowedPrefixes": ["https://chatgpt.com/connector/oauth/"],
+    "rateLimit": {"requests": 120, "window": "1m"},
+    "maxConcurrent": 8,
+    "oauth": {
+      "authorizationServerMetadata": ".well-known/oauth-authorization-server",
+      "protectedResourceMetadata": ".well-known/oauth-protected-resource/server_mcp_http",
+      "authorize": "oauth/authorize",
+      "token": "oauth/token",
+      "register": "oauth/register",
+      "verifyAccess": "oauth/verify_access"
+    },
+    "tools": ["sample/json"]
+  },
+  "server_mcp_stdio": {
+    "type": "mcp",
+    "transport": "stdio",
+    "tools": ["sample/json"]
+  }
+}
+```
+
+### MCPサーバー定義フィールド
+
+`type: "mcp"` の定義で使用できるフィールドは次のとおりです。ここに通常API用の `script`、`path`、`resource` などを指定すると起動時にエラーになります。
+
+| フィールド | 必須 | 内容 |
+| --- | --- | --- |
+| `type` | 必須 | `mcp` を指定 |
+| `transport` | 必須 | `streamable_http` または `stdio` |
+| `protocolVersions` | 省略可 | 対応するMCP protocol versionの配列。指定可能なのは `2025-11-25` と `2025-06-18`。省略時は両方に対応 |
+| `allowedOrigins` | Streamable HTTPで必須 | HTTPS originの配列。schemeとhostだけを指定し、path、query、fragmentは含めない |
+| `redirectURIAllowedPrefixes` | OAuth使用時に必須 | 許可するHTTPS redirect URI prefixの配列。各prefixは `/` で終える |
+| `rateLimit` | 省略可 | 接続元ごとの呼出し制限。`requests`は1〜10000、`window`は1秒〜24時間のGo duration形式 |
+| `maxConcurrent` | 省略可 | Toolの同時実行数。1〜256。省略時または0は16 |
+| `oauth` | 省略可 | OAuthで使用する通常APIの参照。詳細は後述 |
+| `tools` | 必須 | Toolとして公開する通常API名の配列。1件以上必要 |
+| `instructions` | 省略可 | MCPの `initialize` 応答に含めるサーバー利用説明 |
+
+`streamable_http` のendpointはMCP API名から自動生成されます。`stdio` では `allowedOrigins` は不要で、OAuthは使用できません。
+
+### MCP Toolとして参照する通常API
+
+`tools` に指定できるのは、`type: "api"` またはtypeを省略した通常APIです。参照先には実在する `script` が必要で、Toolの情報は次のフィールドから生成されます。
+
+| 通常APIのフィールド | MCP Toolでの用途 |
+| --- | --- |
+| API名 | Toolの `name`。`title` 省略時のtitleにも使用 |
+| `title` | Toolの `title` |
+| `description` | Toolの `description` |
+| `paramCheck` | 入力JSON Schema。省略時は空のobject schema |
+| `outCheck` | 出力JSON Schema |
+| `securitySchemes` | OAuthなど、Toolが必要とするsecurity scheme |
+| `annotations` | `readOnlyHint`、`destructiveHint`、`idempotentHint`、`openWorldHint` などのTool annotation |
+| `script` | `tools/call` で実行するJavaScript |
+
+OAuthを有効にしたMCPで公開する各Toolは、`securitySchemes` の定義に1件以上の `scopes` が必要です。指定したscopeは、後述する `verifyAccess` APIの `scopes` に含まれている必要があります。
+
+### OAuth設定フィールド
+
+`oauth` を指定する場合は `transport: "streamable_http"` が必要です。各値には役割を担当する通常API名を指定し、同じAPIを複数の役割で共有することはできません。Metadata用の2つを除き、参照先には実在する `script` が必要です。
+
+| フィールド | 必須 | 内容 |
+| --- | --- | --- |
+| `authorizationServerMetadata` | 必須 | Authorization Server Metadataを返すAPI |
+| `protectedResourceMetadata` | 必須 | Protected Resource Metadataを返すAPI |
+| `authorize` | 必須 | 認可endpointのAPI |
+| `token` | 必須 | token endpointのAPI |
+| `register` | 必須 | Dynamic Client Registration API |
+| `verifyAccess` | 必須 | access tokenを検証するAPI。この通常APIの `scopes` にMCPで許可する重複のないscopeを1件以上指定 |
+
+HTTP endpointは `/server_mcp_http` になり、`/?api=server_mcp_http` でも呼び出せます。公開URLはrequestのschemeとHostから生成するため、固定domain、`path`、`resource` は設定しません。Toolの名前、説明、schema、security scheme、annotation、実行scriptは参照先の通常APIから解決されます。
+
+stdioは次のように起動します。stdoutはJSON-RPC専用で、HTTP listener、OAuth、background処理、hot reloadは起動しません。
+
+```sh
+./NyanPUI --mcp-server server_mcp_stdio --api /absolute/path/to/api.json --config /absolute/path/to/config.json
+```
+
+### OAuthの責務と状態保存
+
+Goの `main.go` はMCP/OAuthのHTTP受付、request由来URL生成、JavaScript hook呼出し、hookの結果に基づく処理の許可・拒否と応答を担当します。安全な状態ファイル操作やパスワードハッシュなどの汎用ヘルパーも提供します。ユーザー認証、PKCE検証、認可コードの一回限り消費、access tokenの発行・検証は参照先APIのJavaScript側の責務です。JavaScriptファイル名は固定されません。
+
+状態保存rootは `config.json` の `oauth_state_directory` で指定します。実際の保存先はその下のMCP API名ごとに分離されます。未指定時はMCP定義元の `oauth-state/MCP API名` です。
+
+`nyanOAuthList` は、書き込み中断で残った `.nyanpui-oauth-*.tmp` を一覧から除外します。除外するのは通常ファイルで、既存の権限検査に合格するものだけです。シンボリックリンク、ディレクトリ、不適切な権限のファイルは引き続きエラーになります。この命名規則に一致しない `.json` 以外のファイルもエラーになります。一時ファイル自体は削除しません。
+
+OAuthのJavaScript hookでは、`nyanArgon2idHash(password)` でパスワードハッシュを生成し、`nyanArgon2idVerify(password, encodedHash)` で照合できます。現在の生成設定は `m=65536,t=3,p=2` です。検証で受け付ける設定は生成時の標準設定とは独立して実装で明示し、現在はこの設定に対応しています。対応外の設定や不正なハッシュは `false` を返します。これらの設定を変更する `config.json` の項目はありません。
+
+ハッシュの再生成・保存は自動では行いません。将来、生成設定を変更して既存ハッシュを更新する場合は、検証成功後に入力されたパスワードから再生成し、JavaScript側で保存してください。ログインの許可・拒否や更新の判断もJavaScript側で行います。
+
+NyanPUIには組み込みのOAuthユーザー管理APIはありません。ユーザーの作成・更新・管理が必要な場合は、利用者がJavaScriptなどで実装し、その処理へのアクセス制御も行ってください。ローカルサンプルのOAuth hookは状態ファイルに保存されたユーザーを認証するため、利用前にhookが扱う形式のユーザーデータを別途用意する必要があります。既存のユーザーデータは引き続き利用できます。
+
+旧設定から移行する場合は、`config.json` の `BasicAuth`、MCP定義の `oauth.adminUser`、その参照先の管理API定義を削除してください。`oauth.adminUser` が残ったAPI設定は読み込みエラーになります。管理認証用の `nyanOAuthAdminAuthorized` と、hookへの `operator_username`・`operator_password`・`admin_user_endpoint` の受け渡しも廃止しています。
+
+OAuth discovery endpointは次のとおりです。
+
+| endpoint | 用途 |
+| --- | --- |
+| `/.well-known/oauth-protected-resource/server_mcp_http` | MCPのProtected Resource Metadata |
+| `/.well-known/oauth-authorization-server` | Authorization Server Metadata |
+| `/oauth/register` | Dynamic Client Registration |
+| `/oauth/authorize` | ログイン、同意、認可コード発行 |
+| `/oauth/token` | PKCE検証とaccess token発行 |
+
+### api.jsonの分割と多段include
+
+`type: "include"` を使うとAPI定義を複数ファイルに分割できます。includeのキーがマウント名となり、子ファイルのAPIは `/` 区切りの完全名で公開されます。
+
+```json
+{
+  "health": {"script": "./javascript/health.js"},
+  "sub": {"type": "include", "path": "./sub/api.json"}
+}
+```
+
+子の `sub/api.json` に `getItem` と、さらに `admin` includeがある場合、API名は `sub/getItem`、`sub/admin/...` となります。完全名はHTTP、WebSocket、JSON-RPC、`nyanCallMe`、push、public、schedule、ws_clientで共通です。
+
+include定義に指定できるフィールドは`type`と`path`だけです。循環参照、展開後の重複名、重複JSONキー、マウント名の衝突や `/` を含む不正なマウント名は読み込みエラーになります。includeされない既存API名に `/` を含める書き方は引き続き利用できます。
 
 通常 API は `GET`, `POST`, `PUT`, `DELETE` などのメソッドを受け付けます。`Content-Type: application/json` の JSON body、フォーム値、URL クエリを `nyanAllParams` にまとめて渡します。`api` が未指定の場合は、エンドポイントパスまたは `html` が入ります。
 
@@ -203,7 +421,7 @@ return {
 };
 ```
 
-`success: true` かつ `status: 200` の場合だけ次の処理へ進みます。それ以外は `paramCheck` の結果を JSON として返します。HTTP ステータスも `status` の値になります。
+`success: true` かつ `status: 200` の場合だけ次の処理へ進みます。それ以外は、通常のHTTP呼び出しでは `paramCheck` の結果を JSON として返し、HTTP ステータスも `status` の値になります。JSON-RPC呼び出し時は、後述のJSON-RPCエラー形式で返します。
 
 ```js
 return {
@@ -236,7 +454,7 @@ var path = nyanAllParams.nyan_public_path;         // 例: "docs/a.txt"
 
 ### 出力前チェック（`outCheck`）
 
-`outCheck` を指定すると、通常 API の本体実行後、または `type: "public"` のファイル送信前に JavaScript を実行できます。`outCheck` が成功した場合は本体の実行結果をそのまま出力し、失敗した場合は `outCheck` の結果を JSON として出力します。
+`outCheck` を指定すると、通常 API の本体実行後、または `type: "public"` のファイル送信前に JavaScript を実行できます。`outCheck` が成功した場合は本体の実行結果をそのまま出力し、失敗した場合は `outCheck` の結果を JSON として出力します。JSON-RPC呼び出し時は、後述のJSON-RPCエラー形式で返します。
 
 ```json
 {
@@ -272,7 +490,7 @@ return {
 };
 ```
 
-`success: true` かつ `status: 200` の場合だけ本体の実行結果をそのまま出力します。それ以外は `outCheck` の結果を JSON として返します。HTTP ステータスも `status` の値になります。
+`success: true` かつ `status: 200` の場合だけ本体の実行結果をそのまま出力します。それ以外は、通常のHTTP呼び出しでは `outCheck` の結果を JSON として返し、HTTP ステータスも `status` の値になります。
 
 本体の実行結果は `nyanAllParams.nyan_output` で参照できます。
 
@@ -319,6 +537,35 @@ return {
 };
 ```
 
+### `/nyan`と入出力スキーマ
+
+`GET /nyan`または`GET /nyan/`は通常APIだけを一覧表示します。`public`、`schedule`、`ws_client`は含まれません。`GET /nyan/{API名}`では通常APIの詳細と`inputSchema`、`outputSchema`、`schemaSource`を返します。includeされたAPIも`/nyan/sub/admin/getItem`のような完全名で取得できます。
+
+入力スキーマは`paramCheck`のトップレベルに`nyanInputSchema`、出力スキーマは`outCheck`に`nyanOutputSchema`として宣言します。
+
+```js
+const nyanInputSchema = {
+  type: "object",
+  properties: {id: {type: "integer"}},
+  required: ["id"],
+  additionalProperties: false
+};
+```
+
+```js
+const nyanOutputSchema = {
+  type: "object",
+  properties: {status: {const: 200}},
+  required: ["status"]
+};
+```
+
+入力は`nyanInputSchema`、本体scriptの旧形式`nyanAcceptedParams`、空スキーマの順で解決します。出力は`nyanOutputSchema`、空スキーマの順です。legacy入力を利用した場合は互換性のため`nyanAcceptedParams`も返します。`nyanOutputColumns`は公開しません。
+
+スキーマはJavaScriptを実行せずASTから静的に読み取ります。オブジェクト、配列、文字列、数値、真偽値、`null`を利用できます。関数呼び出し、spread、識別子参照などの動的な定義はスキーマ解決エラーになります。スキーマファイルは詳細リクエストごとに読み直されます。
+
+公開したJSON Schemaによるリクエスト・レスポンスの自動検証は行いません。実際の検証は従来どおり`paramCheck`と`outCheck`が担当します。
+
 ### WebSocket レシーバー（`type: "ws_client"`）
 
 `type: "ws_client"` を指定すると NyanPUI 自身が WebSocket クライアントになり、起動時に常時接続します（HTTP エンドポイントとしては登録されません）。
@@ -337,7 +584,9 @@ return {
 `connectURL` は `env:WS_URL` のように環境変数からも指定できます。
 `script` の相対パスは `api.json` が置かれているディレクトリから解決されます。`connectURL` はファイルパスではないため、相対パス解決の対象ではありません。
 
-受信したメッセージは `script` に渡され、次の値を `nyanAllParams` で参照できます。`script` の戻り値が空でない場合は、接続先 WebSocket にテキストメッセージとして返信します。切断時は 1 秒から最大 30 秒までの指数バックオフで再接続します。
+受信したメッセージは `script` に渡され、次の値を `nyanAllParams` で参照できます。`script` の戻り値が空でない場合は、接続先 WebSocket にテキストメッセージとして返信します。
+
+起動時はすぐに接続を試みます。再接続の待ち時間は1秒から始まり、接続失敗が続くと2秒、4秒、8秒、16秒、最大30秒へ増えます。接続に成功した後の切断では、過去の失敗回数にかかわらず1秒から再接続を試みます。
 
 | キー | 内容 |
 | --- | --- |
@@ -353,9 +602,9 @@ return {
 
 リポジトリ同梱の `api.json` には、NyanPUI 自身の `/push/receive` に接続するサンプル（`ws_client/self_push_receive`）があります。
 
-1. `./NyanPUI` を起動（ログに `Starting WebSocket client ws_client/self_push_receive -> ws://127.0.0.1:8009/push/receive` が出ます）
+1. `log.Level` を `debug` にして `./NyanPUI` を起動（`ws_client_starting` イベントの `client` が `ws_client/self_push_receive`、`origin` が `ws://127.0.0.1:8009` になります）
 2. ブラウザで `http://localhost:8009/push/request` を開く（push が飛びます）
-3. ターミナルに `ws_client ... received ...` が出ればOK
+3. 設定したログ出力先に `ws_client_message_received` イベントが出ればOK
 
 ポートを変更している場合は `api.json` の `connectURL` を合わせてください。
 
@@ -398,14 +647,24 @@ schedule の `script` では通常 API と同じ Goja 環境を使えます。�
 | `nyan_schedule_time` | 実行予定時刻 |
 | `nyan_schedule_description` | `api.json` の説明文 |
 
-同梱の `api.json` には動作確認用の `schedule_debug_every_minute` を追加しています。起動すると1分ごとに `javascript/schedule_debug.js` が実行され、ログへ実行時刻が出力されます。
+同梱の `api.json` には動作確認用の `schedule_debug_every_minute` を追加しています。起動すると1分ごとに `javascript/schedule_debug.js` が実行され、`info` では `schedule_completed` イベントを記録します。`console.log` による実行時刻の詳細は `debug` 時だけ `script_console` イベントとして出力されます。
 
 ## アプリケーションの実行
 
 * `config.json` と `api.json` を編集後、実行ファイルを起動。設定ファイルを別の場所に置く場合は `--api` / `--config`、または `NYAN_API_PATH` / `NYAN_CONFIG_PATH` で指定します。
 * デフォルトで [http://localhost:8009/](http://localhost:8009/) にアクセスするとサンプルが表示されます。 Windows MacOS Linuxで実行可能です。 各自でビルドいただくか、[リリース](https://github.com/NyanQL/NyanPUI/releases)からダウンロードしてください。
-* `/nyan` にアクセスすると、`type: "schedule"` 以外の API 一覧を JSON で取得できます。
+* `/nyan` にアクセスすると通常APIの一覧を、`/nyan/{API名}`では入出力スキーマを含む詳細をJSONで取得できます。
 * `/css`, `/images`, `/js`, `/favicon.ico` は `html/` 配下の静的ファイルとして配信されます。
+
+### 運用上の前提とファイル権限
+
+NyanPUIは、信頼できる管理者が用意したAPI定義とJavaScriptを実行する前提です。スクリプトはNyanPUIの実行ユーザーのOS権限で、`nyanHostExec` によるコマンド実行や、ファイルの読み書き・削除を行えます。
+
+`config.json`、include先を含むAPI定義、スクリプト、共通JavaScriptライブラリ、およびそれらを配置するディレクトリの書き込み権限は、信頼できる管理者に限定してください。これらを書き換える権限は、NyanPUIに実行させる処理を変更できる権限になります。
+
+ファイル操作の相対パス基準は、最上位のAPI定義ファイルがあるディレクトリです。この基準はアクセス範囲を制限するものではなく、絶対パスや `../` も使用できます。実際に操作できる範囲は、OSのアクセス権や実行環境によって決まります。
+
+実行中のAPI定義の変更は、ホットリロードが有効な場合に自動反映されます。JavaScript本体と共通ライブラリは実行のたびに読み込むため、`APIHotReload.Enabled` を `false` にしても、JavaScriptの変更は次回の実行に反映されます。
 
 ## ビルド
 
@@ -430,12 +689,15 @@ schedule の `script` では通常 API と同じ Goja 環境を使えます。�
 * リクエストパラメータ: `nyanAllParams`
 * テンプレート HTML: `nyanHtmlCode`
 * コンソール出力: `console.log()`
+* リクエストヘッダーの取得: `nyanGetRequestHeaders()`
 * Cookie 操作: `nyanGetCookie()` / `nyanSetCookie()`
-* localStorage 操作: `nyanGetItem()` / `nyanSetItem()`
+* プロセス内の共有ストレージ操作: `nyanGetItem()` / `nyanSetItem()` / `nyanRemoveItem()`
 * 外部 APIの呼び出し : `nyanGetAPI()` / `nyanJsonAPI()` / `nyanCallAPI()`
 * ホスト側でコマンドを実行し、結果を取得する: `nyanHostExec()`
 * ファイル読み込み: `nyanGetFile()`
+* ファイルのatomic保存・削除: `nyanSaveFile()` / `nyanDeleteFile()`
 * バイナリをBase64で取得: `nyanReadFileB64()`
+* OAuth等で使う乱数・hash・Base64: `nyanRandomBase64URL()` / `nyanSHA256Base64URL()` / `nyanBase64Decode()`
 * 自身のAPIを内部実行: `nyanCallMe()`
 
 それぞれの使い方は次のとおりです。
@@ -451,8 +713,8 @@ nyanHtmlCode には `api.json` で指定した HTML ファイルの内容が文�
 HTMLコードを加工して出力する場合にはこちらの変数を利用してください。
 
 ### 3. **console.log()**
-console.log はコンソールもしくはログファイルへ内容が出力されます。
-どちらに表示されるかは config.json の `log.EnableLogging` で制御します。
+console.log は `log.Level` が `debug` のときだけ、JSONログの `script_console` イベントとして内容を出力します。
+出力先は config.json の `log.EnableLogging` で制御し、`true` ならログファイル、`false` なら標準エラーへ出力します。
 ```javascript
 console.log("Hello, NyanPUI!");
 ```
@@ -466,15 +728,24 @@ console.log("Cookie Value: " + cookieValue);
 // Cookie の設定
 nyanSetCookie("cookieName", "cookieValue");
 ```
-### 5. **nyanGetItem / nyanSetItem**
-ローカルストレージを操作制御します。
+### 5. **nyanGetItem / nyanSetItem / nyanRemoveItem**
+
+NyanPUIプロセス内のメモリにキーと値を保存します。同じプロセスの各API・JavaScript実行で共有され、API設定の再読込でも保持されます。プロセスを再起動すると消えます。
+
+`nyanSetItem(key, value)` はキーと値を文字列に変換して保存し、同じキーがあれば上書きします。`nyanGetItem(key)` は保存した文字列を返し、キーが存在しなければ `null` を返します。`nyanRemoveItem(key)` は文字列に変換したキーのデータを削除します。存在しないキーの削除や、引数なしの呼び出しでは何もしません。`nyanSetItem` と `nyanRemoveItem` の戻り値は `null` です。
+
 ```javascript
-// ローカルストレージから値を取得
+// 値を保存
+nyanSetItem("itemKey", "itemValue");
+// 値を取得
 var itemValue = nyanGetItem("itemKey");
 console.log("Item Value: " + itemValue);
-// ローカルストレージに値を設定
-nyanSetItem("itemKey", "itemValue");
+// 不要になったデータを削除
+nyanRemoveItem("itemKey");
+console.log(nyanGetItem("itemKey")); // null
 ```
+
+自動削除や有効期限、件数・サイズの上限はありません。動的にキーを増やす場合は、不要になった時点でJavaScript側から削除してください。空文字を保存してもキー自体は削除されません。
 
 ### 6. **nyanGetAPI / nyanJsonAPI / nyanCallAPI**
 外部 API を呼び出します。
@@ -525,22 +796,45 @@ console.log("Command Result: " + result.stdout);
 
 ### 8. **nyanGetFile**
 ファイルを読み込み、内容を文字列として取得します。
-ファイルのパスは実行ファイル(NyanPUI)からの相対パスでも指定できます。
+ファイルのパスは最上位の API 定義ファイルがあるディレクトリからの相対パス、または絶対パスで指定できます。
 指定したファイルが存在しない場合はnullが返ります。
 ```javascript
 var fileContent = nyanGetFile("./path/to/file.txt");
 console.log("File Content: " + fileContent);
 ```
 
-### 9. **nyanReadFileB64**
+### 9. **nyanSaveFile / nyanDeleteFile**
+
+テキストファイルを保存・削除します。相対パスは最上位の API 定義ファイルがあるディレクトリを基準にします。絶対パスも指定できます。
+
+```javascript
+nyanSaveFile("./state/example.json", JSON.stringify({ok: true}));
+nyanDeleteFile("./state/example.json");
+```
+
+`nyanSaveFile` は親ディレクトリをmode 0750で作成し、同じディレクトリの一時ファイルへmode 0600で書き込んだ後、atomic renameします。`nyanDeleteFile` は対象が存在しない場合も成功扱いです。その他のI/OエラーはJavaScript例外になります。
+
+### 10. **nyanRandomBase64URL / nyanSHA256Base64URL / nyanBase64Decode**
+
+OAuth、PKCE、key-valueファイル名などに必要な値を生成・変換します。
+
+```javascript
+var token = nyanRandomBase64URL(32);
+var digest = nyanSHA256Base64URL("value-to-hash");
+var plain = nyanBase64Decode("dXNlcjpwYXNzd29yZA==");
+```
+
+`nyanRandomBase64URL` の引数は乱数のbyte数で、1から1024まで指定できます。省略時は32です。戻り値とSHA-256 digestはpaddingなしBase64URLです。`nyanBase64Decode` は標準Base64文字列をdecodeします。
+
+### 11. **nyanReadFileB64**
 バイナリファイルをBase64文字列として取得します。
-ファイルのパスはカレントディレクトリからの相対パス、または絶対パスで指定できます。存在しない場合は JavaScript 例外になります。
+ファイルのパスは最上位の API 定義ファイルがあるディレクトリからの相対パス、または絶対パスで指定できます。存在しない場合は JavaScript 例外になります。
 ```javascript
 var b64 = nyanReadFileB64("./html/images/nyan.png");
 console.log(b64);
 ```
 
-### 10. **nyanCallMe(data)**
+### 12. **nyanCallMe(data)**
 同一 NyanPUI プロセス内で、自身の API を直接実行します。  
 `nyanGetAPI` / `nyanJsonAPI` と異なり HTTP/HTTPS を経由しないため、証明書設定や `port` に依存しません。
 
@@ -558,15 +852,51 @@ console.log(result);
 * 現在処理中 API 名を解決できない場合（例: `ws_client` から `api` 未指定で呼ぶ場合）は例外になります。
 * 失敗時は JavaScript 側で例外になります。
 
-### 11. **nyanPlate(data, htmlCode)**
+### 13. **nyanPlate(data, htmlCode)**
 
 テンプレート内に `data-nyan*` 属性を記述し、`nyanPlate(data, htmlCode)` で動的置換します。
 詳細については [nyanPlate.js](javascript%2Flib%2FnyanPlate.js) の文頭にコメントで記載していますので
 そちらを参照してください。
+
+### 14. **nyanGetRequestHeaders()**
+
+Nyan8と同じ形式で、現在のHTTPリクエストのヘッダーをオブジェクトとして取得します。通常API、JSON-RPC、`paramCheck` / `outCheck` など、HTTPリクエストに伴うJavaScriptから使用できます。`nyanCallMe()` の呼び出し先にも元のリクエスト情報を引き継ぎます。
+
+```javascript
+const headers = nyanGetRequestHeaders();
+const origin = headers["Origin"] || "";
+const userAgent = headers["User-Agent"] || "";
+```
+
+ヘッダー名は `Origin`、`User-Agent` などの表記に正規化されます。値は文字列で、同名ヘッダーの複数の値はカンマで連結します。取得するのは実際の受信ヘッダーで、クエリーやJSONのパラメーターからは補いません。返されたオブジェクトを書き換えても元のヘッダーは変わりません。`Host` は含みません。
+
+`schedule`、`ws_client`、MCPのstdioなど、HTTPリクエストを伴わない実行では空のオブジェクト `{}` を返します。WebSocket接続時と接続後のチェック処理では、接続時のHTTPリクエストヘッダーを取得します。
+
 ## WebSocket サンプル
 WebSocket による双方向通信とプッシュ通知のサンプルを同梱しています。
 * フロント: `http://localhost:8009/push/test`
 * プッシュ: `http://localhost:8009/push/request` → `ws://localhost:8009/push/receive`
+
+通常HTTPのAPIに `push` を設定すると、`paramCheck`・`outCheck` を通過し、HTTPステータスが200〜399の応答を返した後に、指定先の内容をWebSocket接続へ配信します。文字列・オブジェクト・空の応答・HTMLのみのAPIで共通です。応答の内容や形式は変わりません。
+
+HTTP 4xx・5xxの応答、チェック拒否、スクリプト例外、HTML読み込みや応答変換の失敗、`nyan_mode=checkOnly` の場合はPushを実行しません。本体スクリプトが明示的に `status: 500` などを返した場合も対象です。
+
+### JavaScriptによる接続前のOriginチェック
+
+WebSocketの接続先APIに `paramCheck` を設定すると、接続確立前にチェックを実行します。次のスクリプトでは、指定したOriginのみ許可し、Originがない場合も拒否します。許可する値と、Originがない場合の扱いはJavaScript側で決めてください。
+
+```javascript
+// api.jsonの接続先APIで、このファイルをparamCheckに指定します。
+const origin = nyanGetRequestHeaders()["Origin"] || "";
+const allowed = origin === "https://app.example.com";
+({
+  success: allowed,
+  status: allowed ? 200 : 403,
+  result: allowed ? null : { message: "Origin not allowed" }
+});
+```
+
+拒否するとHTTP 403を返し、WebSocket接続は確立しません。このチェックは同じAPIへの通常HTTPリクエストにも適用されます。チェックを設定しなければ、NyanPUIはWebSocket接続に対するOrigin制限を自動では行いません。
 
 ## JSON-RPC 対応
 JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
@@ -582,12 +912,54 @@ JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
 }
 ```
 
-`method` には `api.json` の API 名を指定します。JSON-RPC では `script` が必須です。`type: "schedule"` は呼び出せません。成功時の `result` は JavaScript の戻り値を文字列化した値です。
+`method` には `api.json` の API 名を指定します。JSON-RPCから呼べるのは `type: "api"` またはtypeを省略した通常APIで、`script` が必須です。`ws_client`、`public`、`schedule`、`mcp` など、それ以外の種別は呼び出せません。
+
+また、いずれかのMCP定義の `oauth` から参照されるAPIは、通常APIとして定義されていてもJSON-RPCからは呼び出せません。対象は `authorizationServerMetadata`、`protectedResourceMetadata`、`authorize`、`token`、`register`、`verifyAccess` の全役割です。対象外のAPIにはHTTP 200でJSON-RPCエラー `-32601`（`Method not found`）を返し、チェック・本体・Pushを実行しません。この制限はホットリロード後の定義にも適用されます。
+
+成功時の `result` は JavaScript の戻り値の型を保ちます。オブジェクト、配列、数値、真偽値は対応するJSONの値になり、`null` または `undefined` は `null` になります。文字列はそのまま文字列として返します。`JSON.stringify(...)` の結果など、JSON形式の文字列を自動で解析することはありません。
+
+例えば、スクリプトが次のオブジェクトを返す場合です。
+
+```javascript
+({ ok: true, count: 3, items: [1, 2, 3] });
+```
+
+JSON-RPCの応答は次のようになります。
+
+```json
+{"jsonrpc":"2.0","result":{"ok":true,"count":3,"items":[1,2,3]},"id":1}
+```
+
+通常HTTP向けの `{status, headers, contentType, body}` 形式を返した場合も、オブジェクト全体が `result` になります。`body` だけを取り出したり、そのヘッダーをJSON-RPCのHTTP応答に設定したりはしません。戻り値をJSONに変換できない場合は、HTTP 200でJSON-RPCエラー `-32603`（`Invalid script response`）を返し、Pushを実行しません。
+
+以前は数値・真偽値・配列・オブジェクトも文字列化していたため、その文字列形式を前提にしたクライアントは修正が必要です。スクリプトが `JSON.stringify(...)` で文字列を返し、クライアントが `JSON.parse(response.result)` で復元する構成は引き続き使用できます。
+
+JSON-RPCでも `paramCheck` と `outCheck` を実行します。チェックが `success: true` かつ `status: 200` を満たさなかった場合、HTTP 200で次のJSON-RPCエラーを返します。`id` はリクエストの値を保持し、`error.code` は `-32000`、`error.message` は `paramCheck rejected` または `outCheck rejected` です。元のチェック結果は `error.data` に保持します。
+
+```json
+{
+  "jsonrpc": "2.0",
+  "error": {
+    "code": -32000,
+    "message": "paramCheck rejected",
+    "data": {
+      "success": false,
+      "status": 403,
+      "result": "denied"
+    }
+  },
+  "id": 1
+}
+```
+
+`paramCheck` の拒否時は本体とPushを実行しません。`outCheck` の拒否時は実行済みの本体結果を返さず、Pushも実行しません。チェックスクリプトの例外や不正な戻り値も同じエラー形式となり、`error.data.status` は `500`、`error.data.result.message` に詳細が入ります。
+
+`nyan_mode=checkOnly` では本体とPushを実行せず、成功時はHTTP 200でチェック結果オブジェクトをJSON-RPCの `result` に格納します。`paramCheck` 未設定時の `result` は `{"success":true,"status":200,"result":null}` です。チェック拒否時は上記のエラー形式になります。
 
 ---
 
 ## JavaScriptのレスポンス形式（拡張）
-JavaScript が文字列を返した場合は従来どおり `text/html; charset=utf-8` として返します。`null` や `undefined` の場合は空ボディになります。
+通常HTTPのAPIでは、JavaScript が文字列を返した場合は従来どおり `text/html; charset=utf-8` として返します。`null` や `undefined` の場合は空ボディになります。
 オブジェクトを返すと、HTTPレスポンスを制御できます。
 
 ```javascript

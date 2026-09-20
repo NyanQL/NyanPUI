@@ -1,19 +1,32 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
+	cryptorand "crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"log/slog"
+	"math"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,23 +34,30 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja/ast"
+	"github.com/dop251/goja/parser"
+	"github.com/dop251/goja/token"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/natefinch/lumberjack"
+	"github.com/santhosh-tekuri/jsonschema/v6"
+	"golang.org/x/crypto/argon2"
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
 )
 
 // Config は設定データを表します。
 type Config struct {
-	Name              string    `json:"name"`
-	Profile           string    `json:"profile"`
-	Version           string    `json:"version"`
-	Port              int       `json:"port"`
-	CertFile          string    `json:"certPath"`
-	KeyFile           string    `json:"keyPath"`
-	JavaScriptInclude []string  `json:"javascript_include"`
-	Log               LogConfig `json:"log"`
+	Name              string             `json:"name"`
+	Profile           string             `json:"profile"`
+	Version           string             `json:"version"`
+	Port              int                `json:"port"`
+	CertFile          string             `json:"certPath"`
+	KeyFile           string             `json:"keyPath"`
+	JavaScriptInclude []string           `json:"javascript_include"`
+	Log               LogConfig          `json:"log"`
+	APIHotReload      APIHotReloadConfig `json:"APIHotReload"`
+	OAuthStateRoot    string             `json:"oauth_state_directory"`
 }
 
 // LogConfig はログ設定を表します。
@@ -48,6 +68,7 @@ type LogConfig struct {
 	MaxAge        int    `json:"MaxAge"`
 	Compress      bool   `json:"Compress"`
 	EnableLogging bool   `json:"EnableLogging"`
+	Level         string `json:"Level,omitempty"`
 }
 
 // ResponseData はAPIのレスポンスデータを表します。
@@ -65,16 +86,98 @@ type ErrorData struct {
 
 // EndpointConfig はエンドポイントの設定を表します。
 type EndpointConfig struct {
-	Type        string        `json:"type,omitempty"`
-	Script      string        `json:"script"`
-	HTML        string        `json:"html"`
-	Path        string        `json:"path,omitempty"`
-	ParamCheck  string        `json:"paramCheck,omitempty"`
-	OutCheck    string        `json:"outCheck,omitempty"`
-	ConnectURL  string        `json:"connectURL,omitempty"`
-	Trigger     TriggerConfig `json:"trigger,omitempty"`
-	Description string        `json:"description"`
-	Push        string        `json:"push,omitempty"`
+	Type                       string                   `json:"type,omitempty"`
+	Script                     string                   `json:"script"`
+	HTML                       string                   `json:"html"`
+	Path                       string                   `json:"path,omitempty"`
+	ParamCheck                 string                   `json:"paramCheck,omitempty"`
+	OutCheck                   string                   `json:"outCheck,omitempty"`
+	ConnectURL                 string                   `json:"connectURL,omitempty"`
+	Trigger                    TriggerConfig            `json:"trigger,omitempty"`
+	Description                string                   `json:"description"`
+	Title                      string                   `json:"title,omitempty"`
+	Push                       string                   `json:"push,omitempty"`
+	Transport                  string                   `json:"transport,omitempty"`
+	ProtocolVersions           []string                 `json:"protocolVersions,omitempty"`
+	Resource                   string                   `json:"resource,omitempty"`
+	AllowedOrigins             []string                 `json:"allowedOrigins,omitempty"`
+	RateLimit                  *MCPRateLimit            `json:"rateLimit,omitempty"`
+	MaxConcurrent              int                      `json:"maxConcurrent,omitempty"`
+	OAuth                      MCPOAuthHooks            `json:"oauth,omitempty"`
+	Tools                      []MCPToolConfig          `json:"tools,omitempty"`
+	Instructions               string                   `json:"instructions,omitempty"`
+	RedirectURIAllowedPrefixes []string                 `json:"redirectURIAllowedPrefixes,omitempty"`
+	SecuritySchemes            []map[string]interface{} `json:"securitySchemes,omitempty"`
+	Scopes                     []string                 `json:"scopes,omitempty"`
+	Annotations                map[string]interface{}   `json:"annotations,omitempty"`
+	legacyTransports           bool
+	unknownFields              []string
+	presentFields              map[string]bool
+}
+
+type MCPRateLimit struct {
+	Requests int    `json:"requests"`
+	Window   string `json:"window"`
+}
+
+type MCPOAuthHooks struct {
+	AuthorizationServerMetadata  string   `json:"authorizationServerMetadata,omitempty"`
+	ProtectedResourceMetadataAPI string   `json:"protectedResourceMetadata,omitempty"`
+	Authorize                    string   `json:"authorize,omitempty"`
+	Token                        string   `json:"token,omitempty"`
+	Register                     string   `json:"register,omitempty"`
+	VerifyAccess                 string   `json:"verifyAccess,omitempty"`
+	Scopes                       []string `json:"scopes,omitempty"`
+	RedirectURIAllowedPrefixes   []string `json:"redirectURIAllowedPrefixes,omitempty"`
+}
+
+func (oauth *MCPOAuthHooks) UnmarshalJSON(data []byte) error {
+	type alias MCPOAuthHooks
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return err
+	}
+	allowed := map[string]bool{"authorizationServerMetadata": true, "protectedResourceMetadata": true, "authorize": true, "token": true, "register": true, "verifyAccess": true}
+	for key := range object {
+		if !allowed[key] {
+			return fmt.Errorf("unknown OAuth field %s", key)
+		}
+	}
+	*oauth = MCPOAuthHooks(decoded)
+	return nil
+}
+
+type MCPToolConfig struct {
+	Name            string                   `json:"name"`
+	API             string                   `json:"api"`
+	Title           string                   `json:"title"`
+	Description     string                   `json:"description"`
+	InputSchema     map[string]interface{}   `json:"inputSchema"`
+	OutputSchema    map[string]interface{}   `json:"outputSchema"`
+	SecuritySchemes []map[string]interface{} `json:"securitySchemes,omitempty"`
+	Annotations     map[string]interface{}   `json:"annotations,omitempty"`
+	legacyObject    bool
+}
+
+func (tool *MCPToolConfig) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := json.Unmarshal(data, &name); err == nil {
+		name = strings.TrimSpace(name)
+		tool.Name, tool.API = name, name
+		return nil
+	}
+	type alias MCPToolConfig
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*tool = MCPToolConfig(decoded)
+	tool.legacyObject = true
+	return nil
 }
 
 type TriggerConfig struct {
@@ -86,8 +189,10 @@ func (e *EndpointConfig) UnmarshalJSON(data []byte) error {
 	type endpointConfigAlias EndpointConfig
 	var raw struct {
 		endpointConfigAlias
-		ParamCheckLower string `json:"paramcheck"`
-		OutCheckLower   string `json:"outcheck"`
+		ParamCheckLower string          `json:"paramcheck"`
+		Check           string          `json:"check"`
+		OutCheckLower   string          `json:"outcheck"`
+		Transports      json.RawMessage `json:"transports"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -97,13 +202,315 @@ func (e *EndpointConfig) UnmarshalJSON(data []byte) error {
 	if strings.TrimSpace(e.ParamCheck) == "" {
 		e.ParamCheck = raw.ParamCheckLower
 	}
+	if strings.TrimSpace(e.ParamCheck) == "" {
+		e.ParamCheck = raw.Check
+	}
 	if strings.TrimSpace(e.OutCheck) == "" {
 		e.OutCheck = raw.OutCheckLower
+	}
+	e.legacyTransports = len(raw.Transports) != 0
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err == nil {
+		e.presentFields = make(map[string]bool, len(object))
+		for key := range object {
+			e.presentFields[key] = true
+		}
+		allowed := map[string]bool{"type": true, "script": true, "html": true, "path": true, "paramCheck": true, "paramcheck": true, "check": true, "outCheck": true, "outcheck": true, "connectURL": true, "trigger": true, "description": true, "title": true, "push": true, "transport": true, "protocolVersions": true, "allowedOrigins": true, "rateLimit": true, "maxConcurrent": true, "oauth": true, "tools": true, "instructions": true, "redirectURIAllowedPrefixes": true, "securitySchemes": true, "scopes": true, "annotations": true, "transports": true}
+		for key := range object {
+			if !allowed[key] {
+				e.unknownFields = append(e.unknownFields, key)
+			}
+		}
+		sort.Strings(e.unknownFields)
 	}
 	return nil
 }
 
 type APIConfig map[string]EndpointConfig
+
+const apiTypeInclude = "include"
+
+// APIConfigSnapshot is one immutable, fully validated generation of api.json.
+// Published snapshots are never mutated after publication.
+type APIConfigSnapshot struct {
+	RootPath   string
+	Config     APIConfig
+	Sources    map[string]string
+	FileStates map[string]APIFileState
+	Schedules  map[string]scheduleJobConfig
+	WSClients  map[string]wsClientConfig
+}
+
+type APIFileState struct {
+	Exists bool
+	Hash   [sha256.Size]byte
+}
+
+type apiConfigLoadResult struct {
+	Snapshot *APIConfigSnapshot
+}
+
+const (
+	schemaSourceParamCheck   = "paramCheck"
+	schemaSourceOutCheck     = "outCheck"
+	schemaSourceScriptLegacy = "scriptLegacy"
+	schemaSourceUnknown      = "unknown"
+	maxMCPToolResultBytes    = 2 << 20
+	maxMCPResponseBytes      = 4 << 20
+	mcpProtocol20250618      = "2025-06-18"
+	mcpProtocol20251125      = "2025-11-25"
+)
+
+func validateMCPConfiguration(config APIConfig) error {
+	oauthOwners := map[string]string{}
+	for name, endpoint := range config {
+		if strings.TrimSpace(endpoint.Type) != apiTypeMCP {
+			continue
+		}
+		if _, err := canonicalAPIEndpointPath(name); err != nil {
+			return fmt.Errorf("MCP endpoint %s has an invalid API name: %w", name, err)
+		}
+		if endpoint.legacyTransports {
+			return fmt.Errorf("MCP endpoint %s uses removed field transports", name)
+		}
+		if len(endpoint.unknownFields) != 0 {
+			return fmt.Errorf("MCP endpoint %s contains unknown field %s", name, endpoint.unknownFields[0])
+		}
+		mcpFields := map[string]bool{"type": true, "transport": true, "protocolVersions": true, "allowedOrigins": true, "redirectURIAllowedPrefixes": true, "rateLimit": true, "maxConcurrent": true, "oauth": true, "tools": true, "instructions": true}
+		for field := range endpoint.presentFields {
+			if !mcpFields[field] {
+				return fmt.Errorf("MCP endpoint %s contains unsupported field %s", name, field)
+			}
+		}
+		if strings.TrimSpace(endpoint.Path) != "" || strings.TrimSpace(endpoint.Resource) != "" {
+			return fmt.Errorf("MCP endpoint %s must not define path or resource", name)
+		}
+		if endpoint.Transport != "streamable_http" && endpoint.Transport != "stdio" {
+			return fmt.Errorf("MCP endpoint %s must define transport as streamable_http or stdio", name)
+		}
+		if endpoint.Transport == "streamable_http" && len(endpoint.AllowedOrigins) == 0 {
+			return fmt.Errorf("MCP endpoint %s must define allowedOrigins", name)
+		}
+		if endpoint.Transport == "streamable_http" {
+			seenOrigins := map[string]bool{}
+			for _, origin := range endpoint.AllowedOrigins {
+				parsed, err := url.Parse(origin)
+				if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+					return fmt.Errorf("MCP endpoint %s has invalid allowedOrigins", name)
+				}
+				canonical := strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host)
+				if seenOrigins[canonical] {
+					return fmt.Errorf("MCP endpoint %s has duplicate allowedOrigins", name)
+				}
+				seenOrigins[canonical] = true
+			}
+		}
+		if len(endpoint.ProtocolVersions) == 0 {
+			endpoint.ProtocolVersions = []string{mcpProtocol20251125, mcpProtocol20250618}
+		}
+		versions := map[string]struct{}{}
+		for _, version := range endpoint.ProtocolVersions {
+			if version != mcpProtocol20250618 && version != mcpProtocol20251125 {
+				return fmt.Errorf("MCP endpoint %s contains unsupported protocolVersion %s", name, version)
+			}
+			if _, exists := versions[version]; exists {
+				return fmt.Errorf("MCP endpoint %s contains duplicate protocolVersion %s", name, version)
+			}
+			versions[version] = struct{}{}
+		}
+		if endpoint.RateLimit != nil {
+			window, err := time.ParseDuration(endpoint.RateLimit.Window)
+			if endpoint.RateLimit.Requests < 1 || endpoint.RateLimit.Requests > 10000 || err != nil || window < time.Second || window > 24*time.Hour {
+				return fmt.Errorf("MCP endpoint %s has an invalid rateLimit", name)
+			}
+		}
+		if endpoint.MaxConcurrent < 0 || endpoint.MaxConcurrent > 256 {
+			return fmt.Errorf("MCP endpoint %s has an invalid maxConcurrent", name)
+		}
+		if len(endpoint.Tools) == 0 {
+			return fmt.Errorf("MCP endpoint %s must define at least one Tool", name)
+		}
+		toolNames := map[string]struct{}{}
+		for index, tool := range endpoint.Tools {
+			if tool.legacyObject {
+				return fmt.Errorf("MCP endpoint %s tools must contain API names, not Tool objects", name)
+			}
+			if tool.Name == "" || tool.API == "" {
+				return fmt.Errorf("MCP endpoint %s contains an incomplete Tool", name)
+			}
+			if _, exists := toolNames[tool.Name]; exists {
+				return fmt.Errorf("MCP endpoint %s contains duplicate Tool %s", name, tool.Name)
+			}
+			toolNames[tool.Name] = struct{}{}
+			backing, ok := config[tool.API]
+			if !ok {
+				return fmt.Errorf("MCP Tool %s references unknown API %s", tool.Name, tool.API)
+			}
+			if strings.TrimSpace(backing.Type) != "" && strings.TrimSpace(backing.Type) != "api" {
+				return fmt.Errorf("MCP Tool %s must reference a normal API", tool.Name)
+			}
+			info, err := os.Stat(backing.Script)
+			if strings.TrimSpace(backing.Script) == "" || err != nil || !info.Mode().IsRegular() {
+				return fmt.Errorf("MCP Tool %s script is not a regular file", tool.Name)
+			}
+			schema, err := resolveAPISchema(backing)
+			if err != nil {
+				return fmt.Errorf("MCP Tool %s schema: %w", tool.Name, err)
+			}
+			if schema.Input == nil {
+				schema.Input = map[string]interface{}{"type": "object"}
+			}
+			tool.Title, tool.Description = backing.Title, backing.Description
+			if tool.Title == "" {
+				tool.Title = tool.Name
+			}
+			tool.InputSchema, tool.OutputSchema = schema.Input, schema.Output
+			tool.SecuritySchemes, tool.Annotations = backing.SecuritySchemes, backing.Annotations
+			if _, err := compileMCPJSONSchema(tool.InputSchema); err != nil {
+				return fmt.Errorf("MCP Tool %s has invalid inputSchema: %w", tool.Name, err)
+			}
+			if tool.OutputSchema != nil {
+				if _, err := compileMCPJSONSchema(tool.OutputSchema); err != nil {
+					return fmt.Errorf("MCP Tool %s has invalid outputSchema: %w", tool.Name, err)
+				}
+			}
+			endpoint.Tools[index] = tool
+		}
+		if mcpOAuthConfigured(endpoint.OAuth) {
+			if endpoint.Transport != "streamable_http" {
+				return fmt.Errorf("MCP endpoint %s OAuth requires streamable_http", name)
+			}
+			if len(endpoint.RedirectURIAllowedPrefixes) == 0 {
+				return fmt.Errorf("MCP endpoint %s OAuth requires redirectURIAllowedPrefixes", name)
+			}
+			refs := []struct {
+				role, api string
+			}{{"authorizationServerMetadata", endpoint.OAuth.AuthorizationServerMetadata}, {"protectedResourceMetadata", endpoint.OAuth.ProtectedResourceMetadataAPI}, {"authorize", endpoint.OAuth.Authorize}, {"token", endpoint.OAuth.Token}, {"register", endpoint.OAuth.Register}, {"verifyAccess", endpoint.OAuth.VerifyAccess}}
+			seen := map[string]bool{}
+			for _, ref := range refs {
+				if ref.api == "" {
+					return fmt.Errorf("MCP endpoint %s OAuth requires %s", name, ref.role)
+				}
+				api, ok := config[ref.api]
+				if !ok || (api.Type != "" && api.Type != "api") {
+					return fmt.Errorf("MCP endpoint %s OAuth %s references invalid API %s", name, ref.role, ref.api)
+				}
+				if seen[ref.api] {
+					return fmt.Errorf("MCP endpoint %s OAuth roles must reference distinct APIs", name)
+				}
+				seen[ref.api] = true
+				if owner := oauthOwners[ref.api]; owner != "" && owner != name {
+					return fmt.Errorf("OAuth API %s is owned by multiple MCP endpoints", ref.api)
+				}
+				oauthOwners[ref.api] = name
+				if ref.role != "authorizationServerMetadata" && ref.role != "protectedResourceMetadata" {
+					info, err := os.Stat(api.Script)
+					if api.Script == "" || err != nil || !info.Mode().IsRegular() {
+						return fmt.Errorf("MCP endpoint %s OAuth %s script is not a regular file", name, ref.role)
+					}
+				}
+			}
+			verify := config[endpoint.OAuth.VerifyAccess]
+			if err := validateUniqueNonemptyStrings(verify.Scopes); err != nil || len(verify.Scopes) == 0 {
+				return fmt.Errorf("MCP endpoint %s verifyAccess must define valid scopes", name)
+			}
+			endpoint.OAuth.Scopes = append([]string(nil), verify.Scopes...)
+			endpoint.OAuth.RedirectURIAllowedPrefixes = append([]string(nil), endpoint.RedirectURIAllowedPrefixes...)
+			for _, prefix := range endpoint.RedirectURIAllowedPrefixes {
+				u, err := url.Parse(prefix)
+				if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path == "" || !strings.HasSuffix(u.Path, "/") || u.EscapedPath() != u.Path {
+					return fmt.Errorf("MCP endpoint %s has unsafe redirect URI prefix", name)
+				}
+			}
+			allowedScopes := map[string]bool{}
+			for _, scope := range verify.Scopes {
+				allowedScopes[scope] = true
+			}
+			for _, tool := range endpoint.Tools {
+				required := mcpToolScopes(tool)
+				if len(required) == 0 {
+					return fmt.Errorf("MCP Tool %s OAuth securitySchemes must define scopes", tool.Name)
+				}
+				for _, scope := range required {
+					if !allowedScopes[scope] {
+						return fmt.Errorf("MCP Tool %s requires unsupported scope %s", tool.Name, scope)
+					}
+				}
+			}
+		}
+		config[name] = endpoint
+	}
+	return nil
+}
+
+func validateUniqueNonemptyStrings(values []string) error {
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			return fmt.Errorf("values must be non-empty and unique")
+		}
+		seen[value] = true
+	}
+	return nil
+}
+
+func mcpOAuthConfigured(oauth MCPOAuthHooks) bool {
+	return oauth.AuthorizationServerMetadata != "" || oauth.ProtectedResourceMetadataAPI != "" || oauth.Authorize != "" || oauth.Token != "" || oauth.Register != "" || oauth.VerifyAccess != ""
+}
+
+func canonicalAPIEndpointPath(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") || strings.ContainsAny(name, "\\?#\r\n\t") {
+		return "", fmt.Errorf("invalid API name")
+	}
+	for _, part := range strings.Split(name, "/") {
+		if part == "" || part == "." || part == ".." {
+			return "", fmt.Errorf("invalid API name")
+		}
+	}
+	path := "/" + name
+	if (&url.URL{Path: path}).EscapedPath() != path {
+		return "", fmt.Errorf("invalid API name")
+	}
+	switch path {
+	case "/", "/favicon.ico", "/nyan", "/nyan-rpc":
+		return "", fmt.Errorf("reserved API name")
+	}
+	return path, nil
+}
+
+type rejectingMCPJSONSchemaLoader struct{}
+
+func (rejectingMCPJSONSchemaLoader) Load(location string) (interface{}, error) {
+	return nil, fmt.Errorf("external JSON Schema resource is not allowed: %s", location)
+}
+
+func compileMCPJSONSchema(schema map[string]interface{}) (*jsonschema.Schema, error) {
+	compiler := jsonschema.NewCompiler()
+	compiler.DefaultDraft(jsonschema.Draft2020)
+	compiler.UseLoader(rejectingMCPJSONSchemaLoader{})
+	const location = "urn:nyanpui:mcp-schema"
+	if err := compiler.AddResource(location, schema); err != nil {
+		return nil, err
+	}
+	return compiler.Compile(location)
+}
+
+func validateMCPJSONSchemaValue(schema map[string]interface{}, value interface{}) error {
+	compiled, err := compileMCPJSONSchema(schema)
+	if err != nil {
+		return err
+	}
+	return compiled.Validate(value)
+}
+
+type APISchema struct {
+	Input        map[string]interface{}
+	Output       map[string]interface{}
+	InputSource  string
+	OutputSource string
+}
 
 type NyanResponse struct {
 	Name    string             `json:"name"`
@@ -128,14 +535,14 @@ type JSONRPCResponse struct {
 	JSONRPC string        `json:"jsonrpc"`
 	Result  interface{}   `json:"result,omitempty"`
 	Error   *JSONRPCError `json:"error,omitempty"`
-	ID      interface{}   `json:"id,omitempty"`
+	ID      interface{}   `json:"id"`
 }
 
 type JSONRPCRequest struct {
 	JSONRPC string                 `json:"jsonrpc"`
 	Method  string                 `json:"method"`
 	Params  map[string]interface{} `json:"params"`
-	ID      interface{}            `json:"id"`
+	ID      json.RawMessage        `json:"id"`
 }
 
 type JSONRPCError struct {
@@ -161,7 +568,7 @@ type APIResponse struct {
 var globalConfig Config
 
 // ビルド時に -ldflags "-X main.buildVersion=..." で上書き可能
-var buildVersion = "v0.0.14"
+var buildVersion = "v0.0.15"
 
 type serviceFilePath struct {
 	Path   string
@@ -173,13 +580,40 @@ type serviceFilePaths struct {
 	Config serviceFilePath
 }
 
+type startupOptions struct {
+	Paths     serviceFilePaths
+	MCPServer string
+}
+
 // api.jsonから取得する設定
-var apiConfig APIConfig
+var (
+	apiConfigMu        sync.RWMutex
+	apiConfig          APIConfig // compatibility alias; always matches apiSnapshot.Config
+	apiSnapshot        *APIConfigSnapshot
+	backgroundRuntimes *backgroundRuntimeManager
+)
+
+type mcpRateBucket struct {
+	StartedAt time.Time
+	Window    time.Duration
+	Count     int
+}
+
+var mcpRateBuckets = struct {
+	sync.Mutex
+	Buckets     map[string]mcpRateBucket
+	LastCleanup time.Time
+}{Buckets: make(map[string]mcpRateBucket)}
+
+var mcpConcurrencyLimiters = struct {
+	sync.Mutex
+	Limiters map[string]chan struct{}
+	Current  map[string]bool
+}{Limiters: make(map[string]chan struct{})}
 
 // ストレージ
 var storage = make(map[string]string)
-
-var ginContext *gin.Context
+var storageMu sync.RWMutex
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -191,72 +625,95 @@ var upgrader = websocket.Upgrader{
 
 var wsConnections = struct {
 	sync.RWMutex
-	conns map[string][]*websocket.Conn
+	conns map[string][]*serverWebSocket
 }{
-	conns: make(map[string][]*websocket.Conn),
+	conns: make(map[string][]*serverWebSocket),
+}
+
+type serverWebSocket struct {
+	*websocket.Conn
+	writeMu sync.Mutex
+}
+
+func (conn *serverWebSocket) WriteMessage(messageType int, data []byte) error {
+	conn.writeMu.Lock()
+	defer conn.writeMu.Unlock()
+	return conn.Conn.WriteMessage(messageType, data)
 }
 
 // main はメイン関数です。
 func main() {
+	// stdout is reserved for MCP protocol responses, including during startup.
+	log.SetOutput(os.Stderr)
+	log.SetFlags(0)
+	log.SetPrefix("")
 	// 実行ファイルのディレクトリを取得
 	exePath, err := os.Executable()
 	if err != nil {
-		log.Fatal("Failed to get executable path:", err)
+		fatalServiceError("executable_path_failed", err)
 	}
 	exeDir := filepath.Dir(exePath)
 
-	paths, err := resolveServiceFilePaths(exeDir, os.Args[1:])
+	options, err := resolveStartupOptions(exeDir, os.Args[1:])
 	if err != nil {
-		log.Fatal(err)
+		fatalServiceError("startup_options_failed", err)
 	}
+	paths := options.Paths
+	mcpStdio := options.MCPServer != ""
 
 	// システム設定をロード
 	config, err := loadConfig(paths.Config.Path)
 	if err != nil {
-		log.Fatal("Error loading config:", err)
+		fatalServiceError("config_load_failed", err)
 	}
 	configBaseDir := filepath.Dir(paths.Config.Path)
 	apiBaseDir := filepath.Dir(paths.API.Path)
 	adjustConfigPaths(configBaseDir, &config)
 	globalConfig = config
+	if err := setupLogger(configBaseDir); err != nil {
+		fatalServiceError("log_level_invalid", err)
+	}
+	// Suppress Gin's unstructured route and listener diagnostics.
+	gin.DefaultWriter = io.Discard
+	gin.DefaultErrorWriter = io.Discard
+	serviceLog(slog.LevelInfo, "starting", "binary_version", buildVersion, "go_version", runtime.Version(), "config_version", globalConfig.Version)
+	serviceLog(slog.LevelInfo, "config_loaded", "file", paths.Config.Path, "source", paths.Config.Source)
 
-	// ログ設定を初期化
-	if globalConfig.Log.EnableLogging {
-		// ファイルへのログ出力のみ行う
-		initLogger(globalConfig.Log, exeDir)
-		// Gin のログ設定もファイルへのみ出力するようにする
-		logFile := resolvePath(exeDir, globalConfig.Log.Filename)
-		f, err := os.Create(logFile)
-		if err != nil {
-			log.Printf("Failed to create log file: %v", err)
-		} else {
-			gin.DefaultWriter = f
+	// API設定をロードし、background定義を公開前に全件検証する。
+	initialConfig, err := readAPIConfigGraph(paths.API.Path, apiBaseDir)
+	if err != nil {
+		fatalServiceError("api_config_load_failed", err, "file", paths.API.Path)
+	}
+	publishAPISnapshot(initialConfig.Snapshot)
+	serviceLog(slog.LevelInfo, "api_config_loaded", "file", paths.API.Path, "source", paths.API.Source, "api_count", len(initialConfig.Snapshot.Config))
+	if mcpStdio {
+		mcp, selectErr := selectMCPStdioServer(initialConfig.Snapshot, options.MCPServer)
+		if selectErr != nil {
+			fatalServiceError("mcp_stdio_selection_failed", selectErr)
 		}
+		serviceLog(slog.LevelInfo, "mcp_stdio_starting", "api", options.MCPServer)
+		if serveErr := serveMCPStdio(os.Stdin, os.Stdout, initialConfig.Snapshot, mcp); serveErr != nil {
+			fatalServiceError("mcp_stdio_failed", serveErr)
+		}
+		serviceLog(slog.LevelInfo, "mcp_stdio_stopped", "api", options.MCPServer)
+		return
+	}
+	apiHotReloadInterval, err := parseAPIHotReloadInterval(config.APIHotReload.Interval)
+	if err != nil {
+		fatalServiceError("api_hot_reload_interval_invalid", err)
+	}
+	backgroundRuntimes = newBackgroundRuntimeManager()
+	backgroundRuntimes.reconcile(initialConfig.Snapshot.Schedules, initialConfig.Snapshot.WSClients)
+	if config.APIHotReload.Enabled {
+		serviceLog(slog.LevelInfo, "api_hot_reload_enabled", "interval", apiHotReloadInterval.String())
+		go watchAPIConfigGraph(paths.API.Path, apiBaseDir, apiHotReloadInterval, initialConfig.Snapshot.FileStates)
 	} else {
-		// ログをターミナル（標準出力）のみに出力する
-		log.SetOutput(os.Stdout)
-		gin.DefaultWriter = os.Stdout
-	}
-
-	log.Printf("Binary version: %s", buildVersion)
-	log.Printf("Config file: %s (source: %s)", paths.Config.Path, paths.Config.Source)
-	log.Printf("API file: %s (source: %s)", paths.API.Path, paths.API.Source)
-	log.Printf("Config version: %s", globalConfig.Version)
-
-	// API設定をロード
-	if err := loadAPIConfig(paths.API.Path, apiBaseDir); err != nil {
-		log.Fatal("Error loading API configuration:", err)
-	}
-
-	if err := startWebSocketClients(exeDir); err != nil {
-		log.Printf("Failed to start WebSocket clients: %v", err)
-	}
-	if err := startScheduleJobs(exeDir); err != nil {
-		log.Printf("Failed to start schedule jobs: %v", err)
+		serviceLog(slog.LevelInfo, "api_hot_reload_disabled")
 	}
 
 	gin.DisableConsoleColor()
-	r := gin.Default()
+	r := gin.New()
+	r.Use(serviceRecovery())
 	r.SetTrustedProxies(nil)
 	r.Use(CORSMiddleware())
 	r.StaticFile("/favicon.ico", resolvePath(exeDir, "./html/favicon.ico"))
@@ -265,35 +722,17 @@ func main() {
 	r.Static("/js", resolvePath(exeDir, "./html/js"))
 
 	r.GET("/nyan", handleNyan)
+	r.GET("/nyan/*apiName", handleNyanDetail)
 	r.POST("/nyan-rpc", handleJSONRPC)
 
-	// 各APIエンドポイントを設定
-	for endpoint := range apiConfig {
-		config := apiConfig[endpoint] // ループ変数をローカル変数にコピー
-		switch strings.TrimSpace(config.Type) {
-		case apiTypeWSClient:
-			continue
-		case apiTypeSchedule:
-			continue
-		case apiTypePublic:
-			registerPublicEndpoint(r, endpoint, config, exeDir)
-			continue
-		}
-		r.Any("/"+endpoint, func(c *gin.Context) {
-			handleAPIRequestOrWebSocket(c, config)
-		})
-	}
-
 	r.Any("/", func(c *gin.Context) {
+		if dispatchMCPOrOAuth(c) {
+			return
+		}
 		// クエリパラメータ "api" をチェック
 		apiName := c.Query("api")
 		if apiName != "" {
-			if config, ok := apiConfig[apiName]; ok {
-				if strings.TrimSpace(config.Type) == apiTypeSchedule {
-					c.JSON(http.StatusNotFound, gin.H{"error": "API not found"})
-					return
-				}
-				handleAPIRequestOrWebSocket(c, config)
+			if handleAPIRequestOrWebSocket(c, apiName) {
 				return
 			} else {
 				c.JSON(http.StatusNotFound, gin.H{"error": "API not found"})
@@ -301,23 +740,40 @@ func main() {
 			}
 		}
 		// "api" パラメータがなければ、デフォルトで "html" を使用
-		handleAPIRequestOrWebSocket(c, apiConfig["html"])
+		if !handleAPIRequestOrWebSocket(c, "html") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "API not found"})
+		}
+	})
+
+	r.NoRoute(func(c *gin.Context) {
+		if dispatchMCPOrOAuth(c) {
+			return
+		}
+		if dispatchDynamicEndpoint(c) {
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "API not found"})
 	})
 
 	// HTTPSサーバーを起動するかどうかを判断
 	certFile := resolvePath(exeDir, globalConfig.CertFile)
 	keyFile := resolvePath(exeDir, globalConfig.KeyFile)
+	server := &http.Server{
+		Addr:     fmt.Sprintf(":%d", globalConfig.Port),
+		Handler:  r.Handler(),
+		ErrorLog: httpServerErrorLogger(),
+	}
 	if globalConfig.CertFile != "" && globalConfig.KeyFile != "" {
-		log.Printf("Starting HTTPS server at %d", globalConfig.Port)
-		err = r.RunTLS(fmt.Sprintf(":%d", globalConfig.Port), certFile, keyFile)
+		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "https", "port", globalConfig.Port)
+		err = server.ListenAndServeTLS(certFile, keyFile)
 		if err != nil {
-			log.Fatal("Failed to start HTTPS server:", err)
+			fatalServiceError("https_server_failed", err)
 		}
 	} else {
-		log.Printf("Starting HTTP server at %d", globalConfig.Port)
-		err = r.Run(fmt.Sprintf(":%d", globalConfig.Port))
+		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "http", "port", globalConfig.Port)
+		err = server.ListenAndServe()
 		if err != nil {
-			log.Fatal("Failed to start HTTP server:", err)
+			fatalServiceError("http_server_failed", err)
 		}
 	}
 }
@@ -338,12 +794,21 @@ func resolvePathFromBase(baseDir, pathValue string) string {
 }
 
 func resolveServiceFilePaths(execDir string, args []string) (serviceFilePaths, error) {
+	options, err := resolveStartupOptions(execDir, args)
+	return options.Paths, err
+}
+
+func resolveStartupOptions(execDir string, args []string) (startupOptions, error) {
 	flags := flag.NewFlagSet("NyanPUI", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	apiFlag := flags.String("api", "", "path to api.json")
 	configFlag := flags.String("config", "", "path to config.json")
+	mcpServerFlag := flags.String("mcp-server", "", "MCP API name selected for stdio mode")
 	if err := flags.Parse(args); err != nil {
-		return serviceFilePaths{}, err
+		return startupOptions{}, err
+	}
+	if flags.NArg() != 0 {
+		return startupOptions{}, fmt.Errorf("unexpected command arguments: %s", strings.Join(flags.Args(), " "))
 	}
 
 	apiPath, apiSource := chooseServiceFilePath(*apiFlag, "NYAN_API_PATH", filepath.Join(execDir, "api.json"), "--api")
@@ -351,17 +816,17 @@ func resolveServiceFilePaths(execDir string, args []string) (serviceFilePaths, e
 
 	resolvedAPIPath, err := resolveExistingServiceFilePath(apiPath, "api", apiSource)
 	if err != nil {
-		return serviceFilePaths{}, err
+		return startupOptions{}, err
 	}
 	resolvedConfigPath, err := resolveExistingServiceFilePath(configPath, "config", configSource)
 	if err != nil {
-		return serviceFilePaths{}, err
+		return startupOptions{}, err
 	}
 
-	return serviceFilePaths{
+	return startupOptions{Paths: serviceFilePaths{
 		API:    serviceFilePath{Path: resolvedAPIPath, Source: apiSource},
 		Config: serviceFilePath{Path: resolvedConfigPath, Source: configSource},
-	}, nil
+	}, MCPServer: strings.TrimSpace(*mcpServerFlag)}, nil
 }
 
 func chooseServiceFilePath(cliValue, envName, defaultPath, cliSource string) (string, string) {
@@ -396,6 +861,7 @@ func adjustConfigPaths(configBaseDir string, config *Config) {
 	config.CertFile = resolvePathFromBase(configBaseDir, config.CertFile)
 	config.KeyFile = resolvePathFromBase(configBaseDir, config.KeyFile)
 	config.Log.Filename = resolvePathFromBase(configBaseDir, config.Log.Filename)
+	config.OAuthStateRoot = resolvePathFromBase(configBaseDir, config.OAuthStateRoot)
 	for i, includePath := range config.JavaScriptInclude {
 		config.JavaScriptInclude[i] = resolvePathFromBase(configBaseDir, includePath)
 	}
@@ -404,6 +870,7 @@ func adjustConfigPaths(configBaseDir string, config *Config) {
 // loadConfig は設定ファイルを読み込みます。
 func loadConfig(filename string) (Config, error) {
 	var config Config
+	applyConfigDefaults(&config)
 
 	// 設定ファイルを読み込む
 	data, err := os.ReadFile(filename)
@@ -420,39 +887,51 @@ func loadConfig(filename string) (Config, error) {
 
 // apiの設定を読み込みます。
 func loadAPIConfig(filePath string, apiBaseDir string) error {
-	data, err := os.ReadFile(filePath)
+	loaded, err := readAPIConfigGraph(filePath, apiBaseDir)
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(data, &apiConfig); err != nil {
-		return err
-	}
-	adjustAPIConfigPaths(apiBaseDir)
+	publishAPISnapshot(loaded.Snapshot)
 	return nil
 }
 
-func adjustAPIConfigPaths(apiBaseDir string) {
-	for apiKey, endpoint := range apiConfig {
+func adjustAPIConfigPaths(config APIConfig, apiBaseDir string) {
+	for apiKey, endpoint := range config {
 		endpoint.Script = resolvePathFromBase(apiBaseDir, endpoint.Script)
 		endpoint.HTML = resolvePathFromBase(apiBaseDir, endpoint.HTML)
-		endpoint.Path = resolvePathFromBase(apiBaseDir, endpoint.Path)
+		if strings.TrimSpace(endpoint.Type) != apiTypeMCP {
+			endpoint.Path = resolvePathFromBase(apiBaseDir, endpoint.Path)
+		}
 		endpoint.ParamCheck = resolvePathFromBase(apiBaseDir, endpoint.ParamCheck)
 		endpoint.OutCheck = resolvePathFromBase(apiBaseDir, endpoint.OutCheck)
-		apiConfig[apiKey] = endpoint
+		config[apiKey] = endpoint
 	}
 }
 
 // handleAPIRequestOrWebSocket はAPIリクエストまたはWebSocketリクエストを処理します。
-func handleAPIRequestOrWebSocket(c *gin.Context, config EndpointConfig) {
-	if websocket.IsWebSocketUpgrade(c.Request) {
-		handleWebSocket(c, config)
-	} else {
-		handleAPIRequest(c, config)
+func handleAPIRequestOrWebSocket(c *gin.Context, apiName string) bool {
+	snapshot := currentAPISnapshot()
+	if snapshot == nil {
+		return false
 	}
+	config, ok := snapshot.Config[apiName]
+	if !ok || !isRequestAPI(config) {
+		return false
+	}
+	if websocket.IsWebSocketUpgrade(c.Request) {
+		handleWebSocketWithSnapshot(c, snapshot, apiName, config)
+	} else {
+		handleAPIRequestWithSnapshot(c, snapshot, config)
+	}
+	return true
 }
 
 // handleAPIRequest はAPIリクエストを処理します。
 func handleAPIRequest(c *gin.Context, config EndpointConfig) {
+	handleAPIRequestWithSnapshot(c, currentAPISnapshot(), config)
+}
+
+func handleAPIRequestWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, config EndpointConfig) {
 	// HTTP/2サーバープッシュの処理は削除
 
 	// 実行ファイルのディレクトリを取得
@@ -462,9 +941,6 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 		return
 	}
 	exeDir := filepath.Dir(exePath)
-
-	ginContext = c
-	defer func() { ginContext = nil }()
 
 	allParams, err := collectRequestParams(c, "")
 	if err != nil {
@@ -479,12 +955,13 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 		htmlPath = resolvePath(exeDir, config.HTML)
 	}
 
-	if allowed, handled := runParamCheck(c, config, exeDir, htmlPath, allParams); handled {
+	if allowed, handled := runParamCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams); handled {
 		return
 	} else if !allowed {
 		return
 	}
 
+	var response APIResponse
 	// scriptが空の場合、HTMLファイルの内容をそのまま返す
 	if config.Script == "" {
 		htmlContent, err := os.ReadFile(htmlPath)
@@ -492,67 +969,67 @@ func handleAPIRequest(c *gin.Context, config EndpointConfig) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load HTML file"})
 			return
 		}
-		response := APIResponse{
+		response = APIResponse{
 			Status:      http.StatusOK,
 			ContentType: "text/html; charset=utf-8",
 			Headers:     map[string]string{},
 			Body:        htmlContent,
 		}
-		if handled := runOutCheck(c, config, exeDir, htmlPath, allParams, response); handled {
+	} else {
+		// JavaScriptを実行し、結果を取得
+		resultValue, err := runJavaScriptValueWithContext(snapshot, c, scriptPath, htmlPath, allParams)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		writeAPIResponse(c, response)
-		return
+
+		response, _, err = responseFromJSValue(resultValue)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
-	// JavaScriptを実行し、結果を取得
-	resultValue, err := runJavaScriptValue(scriptPath, htmlPath, allParams)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	response, handledJSResponse, err := responseFromJSValue(resultValue)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	if handled := runOutCheck(c, config, exeDir, htmlPath, allParams, response); handled {
+	if handled := runOutCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams, response); handled {
 		return
 	}
 
 	writeAPIResponse(c, response)
-	if handledJSResponse {
-		return
+	// 応答形式によらず、エラーでない最終応答の場合だけPushを実行する。
+	if response.Status >= http.StatusOK && response.Status < http.StatusBadRequest {
+		performPushWithContext(snapshot, c, config, allParams)
 	}
-
-	// push 設定がある場合、対象のWebSocket接続に対してプッシュ
-	// API リクエスト完了後の push 処理
-	performPush(config, allParams)
-
 }
 
-// handleWebSocket はWebSocketリクエストを処理します。
-func handleWebSocket(c *gin.Context, config EndpointConfig) {
-	endpoint := c.Request.URL.Path[1:] // 例: "/html2" -> "html2"
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+func handleWebSocketWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, endpoint string, config EndpointConfig) {
+	allParams, err := collectRequestParams(c, endpoint)
 	if err != nil {
-		log.Printf("Failed to set websocket upgrade: %v", err)
-		sendHTMLErrorResponse(c.Writer, "WebSocket upgrade failed")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request parameters"})
 		return
 	}
-	// 登録処理
+	exePath, err := os.Executable()
+	if err != nil {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+	exeDir := filepath.Dir(exePath)
+	if allowed, handled := runParamCheckWithSnapshot(c, snapshot, config, exeDir, config.HTML, allParams); handled || !allowed {
+		return
+	}
+	rawConn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err, "endpoint", endpoint)
+		return
+	}
+	conn := &serverWebSocket{Conn: rawConn}
 	wsConnections.Lock()
 	wsConnections.conns[endpoint] = append(wsConnections.conns[endpoint], conn)
 	wsConnections.Unlock()
-
-	// 接続終了時に削除する
 	defer func() {
 		wsConnections.Lock()
 		conns := wsConnections.conns[endpoint]
-		for i, c := range conns {
-			if c == conn {
+		for i, candidate := range conns {
+			if candidate == conn {
 				wsConnections.conns[endpoint] = append(conns[:i], conns[i+1:]...)
 				break
 			}
@@ -560,80 +1037,94 @@ func handleWebSocket(c *gin.Context, config EndpointConfig) {
 		wsConnections.Unlock()
 		conn.Close()
 	}()
-
 	for {
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("Error reading message: %v", err)
-			sendWebSocketHTMLError(conn, messageType, "Error reading message")
+			logWebSocketDisconnect("websocket_disconnected", endpoint, err)
 			break
 		}
-		log.Printf("Received message on %s: %s", endpoint, message)
-
-		// 受信したメッセージを JSON としてパース
+		serviceLog(slog.LevelDebug, "websocket_message_received", "endpoint", endpoint, "bytes", len(message))
 		var req map[string]string
 		if err := json.Unmarshal(message, &req); err != nil {
-			log.Printf("Invalid JSON received: %v", err)
-			// JSON パースに失敗した場合はエコーするか、エラーメッセージを返す
-			conn.WriteMessage(messageType, []byte("Invalid JSON"))
+			_ = conn.WriteMessage(messageType, []byte("Invalid JSON"))
 			continue
 		}
-
-		// "api" キーがあるかチェック
-		if apiName, ok := req["api"]; ok {
-			// apiConfig から対象の設定を取得
-			apiCfg, found := apiConfig[apiName]
-			if !found {
-				errMsg := fmt.Sprintf("API %s not found", apiName)
-				conn.WriteMessage(messageType, []byte(errMsg))
-				continue
-			}
-			// 例として、スクリプトが空の場合は HTML ファイルの内容を返す実装
-			exePath, err := os.Executable()
-			if err != nil {
-				conn.WriteMessage(messageType, []byte("Server error"))
-				continue
-			}
-			exeDir := filepath.Dir(exePath)
-			htmlPath := resolvePath(exeDir, apiCfg.HTML)
-			content, err := os.ReadFile(htmlPath)
-			if err != nil {
-				errMsg := fmt.Sprintf("Failed to read HTML file for API %s: %v", apiName, err)
-				conn.WriteMessage(messageType, []byte(errMsg))
-				continue
-			}
-			// 取得した内容を返信
-			if err := conn.WriteMessage(websocket.TextMessage, content); err != nil {
-				log.Printf("Error writing message for API %s: %v", apiName, err)
-			}
-		} else {
-			// "api" キーが無い場合はエコーするか、適宜処理を追加
+		apiName, requested := req["api"]
+		if !requested {
 			if err := conn.WriteMessage(messageType, message); err != nil {
-				log.Printf("Error writing echo message: %v", err)
+				break
 			}
+			continue
+		}
+		snapshot := currentAPISnapshot()
+		if snapshot == nil {
+			_ = conn.WriteMessage(messageType, []byte("API configuration is not loaded"))
+			continue
+		}
+		apiCfg, found := snapshot.Config[apiName]
+		if !found || !isRequestAPI(apiCfg) {
+			_ = conn.WriteMessage(messageType, []byte(fmt.Sprintf("API %s not found", apiName)))
+			continue
+		}
+		params := cloneParams(allParams)
+		for key, value := range req {
+			params[key] = value
+		}
+		if err := validateExternalRequestParams(params); err != nil {
+			_ = conn.WriteMessage(messageType, []byte("Invalid request parameters"))
+			continue
+		}
+		htmlPath := resolvePathFromBase(exeDir, apiCfg.HTML)
+		if !checkWebSocketScript(conn, snapshot, c, apiCfg.ParamCheck, exeDir, htmlPath, params, "paramCheck") {
+			continue
+		}
+		if isCheckOnlyMode(params) {
+			encoded, _ := json.Marshal(ParamCheckResponse{Success: true, Status: http.StatusOK})
+			_ = conn.WriteMessage(websocket.TextMessage, encoded)
+			continue
+		}
+		content, err := os.ReadFile(htmlPath)
+		if err != nil {
+			_ = conn.WriteMessage(messageType, []byte(fmt.Sprintf("Failed to read HTML file for API %s: %v", apiName, err)))
+			continue
+		}
+		response := APIResponse{Status: http.StatusOK, ContentType: "text/html; charset=utf-8", Headers: map[string]string{}, Body: content}
+		if !checkWebSocketScript(conn, snapshot, c, apiCfg.OutCheck, exeDir, htmlPath, outputCheckParams(params, response), "outCheck") {
+			continue
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, content); err != nil {
+			break
 		}
 	}
 }
 
-// sendWebSocketHTMLError はWebSocket接続にHTML形式のエラーメッセージを送信します。
-func sendWebSocketHTMLError(conn *websocket.Conn, messageType int, errorMessage string) {
-	errorHTML := fmt.Sprintf("<html><body><h1>Error</h1><p>%s</p></body></html>", errorMessage)
-	if err := conn.WriteMessage(messageType, []byte(errorHTML)); err != nil {
-		log.Printf("Error writing error message: %v", err)
+func checkWebSocketScript(conn *serverWebSocket, snapshot *APIConfigSnapshot, requestContext *gin.Context, checkPath, exeDir, htmlPath string, params map[string]interface{}, checkName string) bool {
+	if strings.TrimSpace(checkPath) == "" {
+		return true
 	}
-}
-
-// sendHTMLErrorResponse はWebSocketアップグレードの際に発生したエラーをHTMLでクライアントに送信します。
-func sendHTMLErrorResponse(w http.ResponseWriter, errorMessage string) {
-	w.Header().Set("Content-Type", "text/html")
-	w.WriteHeader(http.StatusInternalServerError)
-	errorHTML := fmt.Sprintf("<html><body><h1>Error</h1><p>%s</p></body></html>", errorMessage)
-	w.Write([]byte(errorHTML))
+	value, err := runJavaScriptValueWithContext(snapshot, requestContext, resolvePath(exeDir, checkPath), htmlPath, params)
+	response := ParamCheckResponse{}
+	if err == nil {
+		response, err = parseCheckResponse(value, checkName)
+	}
+	if err != nil {
+		response = newParamCheckError(http.StatusInternalServerError, err.Error())
+	}
+	if response.Success && response.Status == http.StatusOK {
+		return true
+	}
+	encoded, _ := json.Marshal(response)
+	_ = conn.WriteMessage(websocket.TextMessage, encoded)
+	return false
 }
 
 // runJavaScript はJavaScriptを実行します。
 func runJavaScript(scriptPath string, htmlPath string, allParams map[string]interface{}) (string, error) {
-	value, err := runJavaScriptValue(scriptPath, htmlPath, allParams)
+	return runJavaScriptWithSnapshot(currentAPISnapshot(), scriptPath, htmlPath, allParams)
+}
+
+func runJavaScriptWithSnapshot(snapshot *APIConfigSnapshot, scriptPath string, htmlPath string, allParams map[string]interface{}) (string, error) {
+	value, err := runJavaScriptValueWithSnapshot(snapshot, scriptPath, htmlPath, allParams)
 	if err != nil {
 		return "", err
 	}
@@ -657,13 +1148,19 @@ func resolveCurrentAPINameFromContext(c *gin.Context) string {
 	return strings.TrimPrefix(path, "/")
 }
 
-// callNyanAPIFromVM は、JavaScript(VM) から api.json 定義の API を内部実行します。
-func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (interface{}, error) {
+func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allParams map[string]interface{}) (interface{}, error) {
+	return callNyanAPIFromVMWithContext(snapshot, nil, apiName, allParams)
+}
+
+func callNyanAPIFromVMWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Context, apiName string, allParams map[string]interface{}) (interface{}, error) {
 	if strings.TrimSpace(apiName) == "" {
 		return nil, fmt.Errorf("api name is required")
 	}
 
-	apiCfg, found := apiConfig[apiName]
+	if snapshot == nil {
+		return nil, fmt.Errorf("API configuration is not loaded")
+	}
+	apiCfg, found := snapshot.Config[apiName]
 	if !found {
 		return nil, fmt.Errorf("API config not found: %s", apiName)
 	}
@@ -683,7 +1180,7 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (interf
 	}
 	params["api"] = apiName
 
-	resultValue, err := runJavaScriptValue(apiCfg.Script, apiCfg.HTML, params)
+	resultValue, err := runJavaScriptValueWithContext(snapshot, requestContext, apiCfg.Script, apiCfg.HTML, params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to run API %s: %w", apiName, err)
 	}
@@ -701,7 +1198,16 @@ func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (interf
 	return exported, nil
 }
 
-func runJavaScriptValue(scriptPath string, htmlPath string, allParams map[string]interface{}) (goja.Value, error) {
+func runJavaScriptValueWithSnapshot(snapshot *APIConfigSnapshot, scriptPath string, htmlPath string, allParams map[string]interface{}) (goja.Value, error) {
+	return runJavaScriptValueWithContext(snapshot, nil, scriptPath, htmlPath, allParams)
+}
+
+func runJavaScriptValueWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Context, scriptPath string, htmlPath string, allParams map[string]interface{}) (_ goja.Value, runErr error) {
+	defer func() {
+		if runErr != nil {
+			logServiceError(slog.LevelError, "script_failed", runErr, "file", scriptPath)
+		}
+	}()
 	// 実行ファイルのディレクトリを取得
 	exePath, err := os.Executable()
 	if err != nil {
@@ -713,17 +1219,20 @@ func runJavaScriptValue(scriptPath string, htmlPath string, allParams map[string
 	scriptPath = resolvePath(exeDir, scriptPath)
 
 	// goja ランタイムのセットアップ（リクエストごとに新しいランタイムを作る）
-	runtime := setupGojaRuntime()
+	runtime := setupGojaRuntimeWithContext(snapshot, requestContext)
+	if stateRoot, ok := allParams["state_directory"].(string); ok && stateRoot != "" {
+		setupOAuthStateRuntime(runtime, stateRoot)
+	}
 
 	// ライブラリの JavaScript ファイルを読み込み
 	var jsLibCode string
 	for _, includePath := range globalConfig.JavaScriptInclude {
 		includePath = resolvePath(exeDir, includePath)
 		code, err := os.ReadFile(includePath)
-		log.Print("Include file:", includePath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read included JS file %s: %v", includePath, err)
 		}
+		serviceLog(slog.LevelDebug, "script_include_loaded", "file", includePath)
 		jsLibCode += string(code) + "\n"
 	}
 
@@ -735,7 +1244,6 @@ func runJavaScriptValue(scriptPath string, htmlPath string, allParams map[string
 		htmlPath = resolvePath(exeDir, htmlPath)
 		htmlCodeBytes, err := os.ReadFile(htmlPath)
 		if err != nil {
-			log.Printf("Failed to load HTML file at path: %s, error: %v", htmlPath, err)
 			return nil, fmt.Errorf("failed to load HTML file: %v", err)
 		}
 		escapedHTML := strconv.Quote(string(htmlCodeBytes))
@@ -779,7 +1287,9 @@ func collectRequestParams(c *gin.Context, defaultAPI string) (map[string]interfa
 		}
 	}
 
-	c.Request.ParseForm()
+	if err := c.Request.ParseForm(); err != nil {
+		return nil, err
+	}
 	for key, value := range c.Request.PostForm {
 		allParams[key] = value[0]
 	}
@@ -797,46 +1307,66 @@ func collectRequestParams(c *gin.Context, defaultAPI string) (map[string]interfa
 		}
 	}
 
+	if err := validateExternalRequestParams(allParams); err != nil {
+		return nil, err
+	}
 	return allParams, nil
 }
 
-func runParamCheck(c *gin.Context, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}) (bool, bool) {
+func validateExternalRequestParams(params map[string]interface{}) error {
+	for _, key := range []string{"mcp_principal", "mcp_tool"} {
+		if _, exists := params[key]; exists {
+			return fmt.Errorf("request contains reserved parameter %s", key)
+		}
+	}
+	return nil
+}
+
+func runParamCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}) (bool, bool) {
+	allowed, response := evaluateParamCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams)
+	if response != nil {
+		writeParamCheckResponse(c, *response)
+		return allowed, true
+	}
+	return allowed, false
+}
+
+// Return the check result separately so each transport can format its response.
+func evaluateParamCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}) (bool, *ParamCheckResponse) {
 	checkOnly := isCheckOnlyMode(allParams)
 	paramCheckPath := strings.TrimSpace(config.ParamCheck)
 	if paramCheckPath == "" {
 		if checkOnly {
-			writeParamCheckResponse(c, ParamCheckResponse{
+			return false, &ParamCheckResponse{
 				Success: true,
 				Status:  http.StatusOK,
 				Result:  nil,
-			})
-			return false, true
+			}
 		}
-		return true, false
+		return true, nil
 	}
 
 	c.Writer.Header().Set("Cache-Control", "no-store")
 	c.Writer.Header().Set("Pragma", "no-cache")
 
-	resultValue, err := runJavaScriptValue(resolvePath(exeDir, paramCheckPath), htmlPath, allParams)
+	resultValue, err := runJavaScriptValueWithContext(snapshot, c, resolvePath(exeDir, paramCheckPath), htmlPath, allParams)
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return false, true
+		response := newParamCheckError(http.StatusInternalServerError, err.Error())
+		return false, &response
 	}
 
 	checkResponse, err := parseCheckResponse(resultValue, "paramCheck")
 	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return false, true
+		response := newParamCheckError(http.StatusInternalServerError, err.Error())
+		return false, &response
 	}
 
 	allowed := checkResponse.Success && checkResponse.Status == http.StatusOK
 	if checkOnly || !allowed {
-		writeParamCheckResponse(c, checkResponse)
-		return allowed, true
+		return allowed, &checkResponse
 	}
 
-	return true, false
+	return true, nil
 }
 
 func isCheckOnlyMode(allParams map[string]interface{}) bool {
@@ -846,12 +1376,43 @@ func isCheckOnlyMode(allParams map[string]interface{}) bool {
 	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(allParams["nyan_mode"])), "checkOnly")
 }
 
-func runOutCheck(c *gin.Context, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}, response APIResponse) bool {
+func runOutCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}, response APIResponse) bool {
+	checkResponse := evaluateOutCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams, response)
+	if checkResponse != nil {
+		writeParamCheckResponse(c, *checkResponse)
+		return true
+	}
+	return false
+}
+
+func evaluateOutCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}, response APIResponse) *ParamCheckResponse {
 	outCheckPath := strings.TrimSpace(config.OutCheck)
 	if outCheckPath == "" {
-		return false
+		return nil
 	}
 
+	checkParams := outputCheckParams(allParams, response)
+
+	resultValue, err := runJavaScriptValueWithContext(snapshot, c, resolvePath(exeDir, outCheckPath), htmlPath, checkParams)
+	if err != nil {
+		response := newParamCheckError(http.StatusInternalServerError, err.Error())
+		return &response
+	}
+
+	checkResponse, err := parseCheckResponse(resultValue, "outCheck")
+	if err != nil {
+		response := newParamCheckError(http.StatusInternalServerError, err.Error())
+		return &response
+	}
+
+	if checkResponse.Success && checkResponse.Status == http.StatusOK {
+		return nil
+	}
+
+	return &checkResponse
+}
+
+func outputCheckParams(allParams map[string]interface{}, response APIResponse) map[string]interface{} {
 	checkParams := cloneParams(allParams)
 	checkParams["nyan_output"] = map[string]interface{}{
 		"status":          response.Status,
@@ -867,24 +1428,7 @@ func runOutCheck(c *gin.Context, config EndpointConfig, exeDir string, htmlPath 
 	checkParams["nyan_output_body"] = string(response.Body)
 	checkParams["nyan_output_body_base64"] = base64.StdEncoding.EncodeToString(response.Body)
 
-	resultValue, err := runJavaScriptValue(resolvePath(exeDir, outCheckPath), htmlPath, checkParams)
-	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return true
-	}
-
-	checkResponse, err := parseCheckResponse(resultValue, "outCheck")
-	if err != nil {
-		writeParamCheckResponse(c, newParamCheckError(http.StatusInternalServerError, err.Error()))
-		return true
-	}
-
-	if checkResponse.Success && checkResponse.Status == http.StatusOK {
-		return false
-	}
-
-	writeParamCheckResponse(c, checkResponse)
-	return true
+	return checkParams
 }
 
 func cloneParams(params map[string]interface{}) map[string]interface{} {
@@ -952,6 +1496,14 @@ func writeParamCheckResponse(c *gin.Context, resp ParamCheckResponse) {
 }
 
 func responseFromJSValue(value goja.Value) (APIResponse, bool, error) {
+	var exported interface{}
+	if value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
+		exported = value.Export()
+	}
+	return responseFromExportedJSValue(value, exported)
+}
+
+func responseFromExportedJSValue(value goja.Value, exported interface{}) (APIResponse, bool, error) {
 	response := APIResponse{
 		Status:      http.StatusOK,
 		ContentType: "text/html; charset=utf-8",
@@ -963,7 +1515,6 @@ func responseFromJSValue(value goja.Value) (APIResponse, bool, error) {
 		return response, false, nil
 	}
 
-	exported := value.Export()
 	respMap, ok := exported.(map[string]interface{})
 	if !ok {
 		response.Body = []byte(value.String())
@@ -1073,89 +1624,99 @@ const (
 	apiTypeWSClient = "ws_client"
 	apiTypePublic   = "public"
 	apiTypeSchedule = "schedule"
+	apiTypeMCP      = "mcp"
 )
 
-func registerPublicEndpoint(r *gin.Engine, endpoint string, config EndpointConfig, exeDir string) {
-	routePath := "/" + strings.Trim(strings.TrimSpace(endpoint), "/")
-	if routePath == "/" {
-		log.Printf("public endpoint %q is invalid: endpoint name must not be empty", endpoint)
-		return
+func isRequestAPI(config EndpointConfig) bool {
+	switch strings.TrimSpace(config.Type) {
+	case apiTypeWSClient, apiTypePublic, apiTypeSchedule, apiTypeMCP:
+		return false
+	default:
+		return true
+	}
+}
+
+// dispatchDynamicEndpoint resolves the request against one immutable API snapshot.
+func dispatchDynamicEndpoint(c *gin.Context) bool {
+	requestPath := strings.TrimPrefix(c.Request.URL.Path, "/")
+	snapshot := currentAPISnapshot()
+	if snapshot == nil {
+		return false
+	}
+	config := snapshot.Config
+	if endpoint, ok := config[requestPath]; ok && isRequestAPI(endpoint) {
+		if websocket.IsWebSocketUpgrade(c.Request) {
+			handleWebSocketWithSnapshot(c, snapshot, requestPath, endpoint)
+		} else {
+			handleAPIRequestWithSnapshot(c, snapshot, endpoint)
+		}
+		return true
 	}
 
+	endpointName := ""
+	var endpoint EndpointConfig
+	for name, candidate := range config {
+		if strings.TrimSpace(candidate.Type) != apiTypePublic {
+			continue
+		}
+		cleanName := strings.Trim(strings.TrimSpace(name), "/")
+		if requestPath == cleanName || strings.HasPrefix(requestPath, cleanName+"/") {
+			if len(cleanName) > len(endpointName) {
+				endpointName, endpoint = cleanName, candidate
+			}
+		}
+	}
+	if endpointName == "" {
+		return false
+	}
+	servePublicEndpointWithSnapshot(c, snapshot, endpointName, endpoint)
+	return true
+}
+
+func servePublicEndpointWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, endpoint string, config EndpointConfig) {
 	publicPath := strings.TrimSpace(config.Path)
 	if publicPath == "" {
-		log.Printf("public endpoint %s: path is missing", endpoint)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "public path is missing"})
+		return
 	}
-
-	basePath := resolvePath(exeDir, publicPath)
-	handler := func(c *gin.Context) {
-		if publicPath == "" {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "public path is missing"})
-			return
-		}
-
-		requestedPath := strings.TrimPrefix(c.Param("filepath"), "/")
-		allParams, err := collectRequestParams(c, endpoint)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON data"})
-			return
-		}
-		allParams["nyan_public_endpoint"] = endpoint
-		allParams["nyan_public_path"] = requestedPath
-
-		ginContext = c
-		defer func() { ginContext = nil }()
-
-		if allowed, handled := runParamCheck(c, config, exeDir, "", allParams); handled {
-			return
-		} else if !allowed {
-			return
-		}
-
-		if requestedPath == "" || !filepath.IsLocal(requestedPath) {
+	requestPath := strings.TrimPrefix(c.Request.URL.Path, "/")
+	requestedPath := strings.TrimPrefix(strings.TrimPrefix(requestPath, endpoint), "/")
+	allParams, err := collectRequestParams(c, endpoint)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON data"})
+		return
+	}
+	allParams["nyan_public_endpoint"] = endpoint
+	allParams["nyan_public_path"] = requestedPath
+	if allowed, handled := runParamCheckWithSnapshot(c, snapshot, config, filepath.Dir(publicPath), "", allParams); handled || !allowed {
+		return
+	}
+	if requestedPath == "" || !filepath.IsLocal(requestedPath) {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	filePath := filepath.Join(publicPath, requestedPath)
+	info, err := os.Stat(filePath)
+	if err != nil || info.IsDir() {
+		if err != nil && !os.IsNotExist(err) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read public file"})
+		} else {
 			c.Status(http.StatusNotFound)
-			return
 		}
-
-		filePath := filepath.Join(basePath, requestedPath)
-		fileInfo, err := os.Stat(filePath)
+		return
+	}
+	if strings.TrimSpace(config.OutCheck) != "" {
+		content, err := os.ReadFile(filePath)
 		if err != nil {
-			if os.IsNotExist(err) {
-				c.Status(http.StatusNotFound)
-				return
-			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read public file"})
 			return
 		}
-		if fileInfo.IsDir() {
-			c.Status(http.StatusNotFound)
+		response := APIResponse{Status: http.StatusOK, ContentType: http.DetectContentType(content), Headers: map[string]string{}, Body: content}
+		if runOutCheckWithSnapshot(c, snapshot, config, filepath.Dir(publicPath), "", allParams, response) {
 			return
 		}
-
-		if strings.TrimSpace(config.OutCheck) != "" {
-			fileContent, err := os.ReadFile(filePath)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read public file"})
-				return
-			}
-			response := APIResponse{
-				Status:      http.StatusOK,
-				ContentType: http.DetectContentType(fileContent),
-				Headers:     map[string]string{},
-				Body:        fileContent,
-			}
-			if handled := runOutCheck(c, config, exeDir, "", allParams, response); handled {
-				return
-			}
-		}
-
-		c.File(filePath)
 	}
-
-	r.GET(routePath, handler)
-	r.HEAD(routePath, handler)
-	r.GET(routePath+"/*filepath", handler)
-	r.HEAD(routePath+"/*filepath", handler)
+	c.File(filePath)
 }
 
 type wsClientConfig struct {
@@ -1328,89 +1889,6 @@ func (s cronSchedule) matches(t time.Time) bool {
 		s.months[int(t.Month())]
 }
 
-func startScheduleJobs(execDir string) error {
-	var firstErr error
-	for name, cfg := range apiConfig {
-		if strings.TrimSpace(cfg.Type) != apiTypeSchedule {
-			continue
-		}
-
-		scriptPath := strings.TrimSpace(cfg.Script)
-		trigger := cfg.Trigger
-		trigger.Type = strings.TrimSpace(trigger.Type)
-		trigger.Value = strings.TrimSpace(trigger.Value)
-
-		if scriptPath == "" {
-			err := fmt.Errorf("schedule %s: script is missing", name)
-			log.Print(err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if trigger.Type != "cron" {
-			err := fmt.Errorf("schedule %s: unsupported trigger type %q", name, trigger.Type)
-			log.Print(err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-
-		schedule, err := parseCronSchedule(trigger.Value)
-		if err != nil {
-			err = fmt.Errorf("schedule %s: invalid cron trigger %q: %w", name, trigger.Value, err)
-			log.Print(err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-
-		jobCfg := scheduleJobConfig{
-			name:        name,
-			scriptPath:  resolvePath(execDir, scriptPath),
-			trigger:     trigger,
-			description: cfg.Description,
-			schedule:    schedule,
-		}
-
-		log.Printf("Starting schedule job %s with cron %q", jobCfg.name, jobCfg.trigger.Value)
-		go runScheduleJob(jobCfg)
-	}
-
-	return firstErr
-}
-
-func runScheduleJob(cfg scheduleJobConfig) {
-	for {
-		next := cfg.schedule.next(time.Now())
-		if next.IsZero() {
-			log.Printf("Schedule job %s has no next run time", cfg.name)
-			return
-		}
-
-		log.Printf("Schedule job %s next run at %s", cfg.name, next.Format(time.RFC3339))
-		timer := time.NewTimer(time.Until(next))
-		<-timer.C
-
-		allParams := map[string]interface{}{
-			"api":                        cfg.name,
-			"nyan_job_name":              cfg.name,
-			"nyan_schedule_trigger_type": cfg.trigger.Type,
-			"nyan_schedule_trigger":      cfg.trigger.Value,
-			"nyan_schedule_time":         next.Format(time.RFC3339),
-			"nyan_schedule_description":  cfg.description,
-		}
-		result, err := runJavaScript(cfg.scriptPath, "", allParams)
-		if err != nil {
-			log.Printf("Schedule job %s failed: %v", cfg.name, err)
-			continue
-		}
-		log.Printf("Schedule job %s completed: %s", cfg.name, result)
-	}
-}
-
 // connectURL が env:XXXX 形式なら環境変数 XXXX で解決する。空や未設定はエラー。
 func resolveConnectURL(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
@@ -1429,133 +1907,6 @@ func resolveConnectURL(raw string) (string, error) {
 		return val, nil
 	}
 	return raw, nil
-}
-
-// startWebSocketClients は api.json に定義された ws_client を起動します。
-func startWebSocketClients(execDir string) error {
-	var firstErr error
-	for name, cfg := range apiConfig {
-		if strings.TrimSpace(cfg.Type) != apiTypeWSClient {
-			continue
-		}
-
-		scriptPath := strings.TrimSpace(cfg.Script)
-		connectURLRaw := strings.TrimSpace(cfg.ConnectURL)
-
-		if scriptPath == "" {
-			err := fmt.Errorf("ws_client %s: script is missing", name)
-			log.Print(err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if connectURLRaw == "" {
-			err := fmt.Errorf("ws_client %s: connectURL is missing", name)
-			log.Print(err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-
-		connectURL, err := resolveConnectURL(connectURLRaw)
-		if err != nil {
-			log.Printf("ws_client %s: %v", name, err)
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-
-		wsCfg := wsClientConfig{
-			name:        name,
-			scriptPath:  scriptPath,
-			connectURL:  connectURL,
-			description: cfg.Description,
-		}
-
-		log.Printf("Starting WebSocket client %s -> %s", wsCfg.name, wsCfg.connectURL)
-		go runWebSocketClient(wsCfg)
-	}
-
-	return firstErr
-}
-
-// 常時接続を維持し、切断時は指数バックオフで再接続します。
-func runWebSocketClient(cfg wsClientConfig) {
-	backoff := time.Second
-	for {
-		err := connectAndListenWebSocket(cfg)
-		if err != nil {
-			log.Printf("WebSocket client %s disconnected: %v", cfg.name, err)
-		}
-
-		time.Sleep(backoff)
-		if backoff < 30*time.Second {
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
-		}
-	}
-}
-
-func connectAndListenWebSocket(cfg wsClientConfig) error {
-	conn, _, err := websocket.DefaultDialer.Dial(cfg.connectURL, nil)
-	if err != nil {
-		return fmt.Errorf("dial failed: %w", err)
-	}
-	defer conn.Close()
-
-	log.Printf("WebSocket client %s connected", cfg.name)
-
-	for {
-		msgType, data, err := conn.ReadMessage()
-		if err != nil {
-			return fmt.Errorf("read error: %w", err)
-		}
-		if msgType == websocket.CloseMessage {
-			return fmt.Errorf("close message received: %s", string(data))
-		}
-
-		log.Printf("ws_client %s received %s: %s", cfg.name, websocketMessageTypeLabel(msgType), string(data))
-
-		allParams := map[string]interface{}{
-			"api":             cfg.name,
-			"ws_client":       cfg.name,
-			"ws_message_type": websocketMessageTypeLabel(msgType),
-			"ws_message_text": string(data),
-			"ws_connect_url":  cfg.connectURL,
-			"ws_description":  cfg.description,
-		}
-
-		if msgType == websocket.BinaryMessage {
-			allParams["ws_message_base64"] = base64.StdEncoding.EncodeToString(data)
-		}
-
-		if msgType == websocket.TextMessage {
-			var decoded interface{}
-			if err := json.Unmarshal(data, &decoded); err == nil {
-				allParams["ws_message_json"] = decoded
-			}
-		}
-
-		result, err := runJavaScript(cfg.scriptPath, "", allParams)
-		if err != nil {
-			log.Printf("ws_client %s script error: %v", cfg.name, err)
-			continue
-		}
-
-		trimmed := strings.TrimSpace(result)
-		if trimmed == "" {
-			continue
-		}
-
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(trimmed)); err != nil {
-			return fmt.Errorf("send error: %w", err)
-		}
-	}
 }
 
 func websocketMessageTypeLabel(t int) string {
@@ -1577,8 +1928,11 @@ func websocketMessageTypeLabel(t int) string {
 
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if isMCPOrOAuthHTTPRequest(c.Request) {
+			c.Next()
+			return
+		}
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
 
@@ -1591,13 +1945,27 @@ func CORSMiddleware() gin.HandlerFunc {
 	}
 }
 
-// loadHTMLFile は指定されたHTMLファイルを読み込み、その内容を文字列として返します。
-func loadHTMLFile(filePath string) (string, error) {
-	htmlBytes, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", err
+func isMCPOrOAuthHTTPRequest(request *http.Request) bool {
+	snapshot := currentAPISnapshot()
+	if snapshot == nil || request == nil || request.URL == nil {
+		return false
 	}
-	return string(htmlBytes), nil
+	name := strings.Trim(request.URL.Path, "/")
+	if request.URL.Path == "/" {
+		name = request.URL.Query().Get("api")
+	}
+	for mcpName, mcp := range snapshot.Config {
+		if mcp.Type != apiTypeMCP || mcp.Transport != "streamable_http" {
+			continue
+		}
+		if name == mcpName {
+			return true
+		}
+		if _, ok := mcpOAuthRoleForAPI(mcp, name); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func getAPI(url, username, password string) (string, error) {
@@ -1660,32 +2028,154 @@ func jsonAPI(url string, jsonData []byte, username, password string, headers map
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
 	return string(body), nil
 }
 
-// ログの設定を有効化する。
-func initLogger(logConfig LogConfig, baseDir string) {
-	logFile := resolvePath(baseDir, logConfig.Filename)
-	if logConfig.EnableLogging {
+var serviceLogLevel slog.LevelVar // INFO unless configured otherwise.
+var serviceLogger = slog.New(slog.NewJSONHandler(serviceLogWriter{}, &slog.HandlerOptions{Level: &serviceLogLevel}))
+
+// Keep the standard logger's synchronized writer so file rotation and output
+// capture use the same destination. The JSON handler escapes untrusted strings.
+type serviceLogWriter struct{}
+
+func (serviceLogWriter) Write(data []byte) (int, error) {
+	err := log.Output(3, strings.TrimSuffix(string(data), "\n"))
+	return len(data), err
+}
+
+func serviceLog(level slog.Level, event string, fields ...interface{}) {
+	serviceLogger.Log(context.Background(), level, event, fields...)
+}
+
+func logServiceError(level slog.Level, event string, err error, fields ...interface{}) {
+	if err != nil {
+		cause := err
+		for next := errors.Unwrap(cause); next != nil; next = errors.Unwrap(cause) {
+			cause = next
+		}
+		fields = append(fields, "error_type", fmt.Sprintf("%T", cause))
+		var state interface{ SQLState() string }
+		if errors.As(err, &state) {
+			fields = append(fields, "sqlstate", state.SQLState())
+		}
+		var closeError *websocket.CloseError
+		if errors.As(err, &closeError) {
+			fields = append(fields, "close_code", closeError.Code)
+		}
+		// Driver errors and JavaScript exceptions can contain request values.
+		// Full diagnostic text is an explicit debug-only choice, even on errors.
+		if serviceLogLevel.Level() <= slog.LevelDebug {
+			fields = append(fields, "error_detail", boundedLogText(err.Error()))
+		}
+	}
+	serviceLog(level, event, fields...)
+}
+
+func fatalServiceError(event string, err error, fields ...interface{}) {
+	logServiceError(slog.LevelError, event, err, fields...)
+	os.Exit(1)
+}
+
+func logWebSocketDisconnect(event, name string, err error) {
+	level := slog.LevelWarn
+	var closeError *websocket.CloseError
+	if errors.Is(err, net.ErrClosed) || (errors.As(err, &closeError) && (closeError.Code == websocket.CloseNormalClosure || closeError.Code == websocket.CloseGoingAway)) {
+		level = slog.LevelDebug
+	}
+	logServiceError(level, event, err, "endpoint", name)
+}
+
+func boundedLogText(value string) string {
+	const maxLogTextBytes = 4096
+	if len(value) > maxLogTextBytes {
+		return value[:maxLogTextBytes] + "...[truncated]"
+	}
+	return value
+}
+
+func logURLOrigin(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "ws" && parsed.Scheme != "wss") {
+		return "[invalid URL]"
+	}
+	// Userinfo, paths, queries and fragments can all contain credentials.
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+func setupLogger(configBaseDir string) error {
+	level := slog.LevelInfo
+	switch strings.ToLower(strings.TrimSpace(globalConfig.Log.Level)) {
+	case "", "info":
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		return errors.New("log.Level must be debug, info, warn, or error")
+	}
+	logFilePath := resolvePathFromBase(configBaseDir, globalConfig.Log.Filename)
+	if globalConfig.Log.EnableLogging {
 		log.SetOutput(&lumberjack.Logger{
-			Filename:   logFile,
-			MaxSize:    logConfig.MaxSize,    // megabytes
-			MaxBackups: logConfig.MaxBackups, // number of backups
-			MaxAge:     logConfig.MaxAge,     // days
-			Compress:   logConfig.Compress,
+			Filename:   logFilePath,
+			MaxSize:    globalConfig.Log.MaxSize,
+			MaxBackups: globalConfig.Log.MaxBackups,
+			MaxAge:     globalConfig.Log.MaxAge,
+			Compress:   globalConfig.Log.Compress,
 		})
 	} else {
-		// ログを無効にする場合は、標準出力を無効にする（例: io.Discard へ出力する）
-		log.SetOutput(io.Discard)
+		log.SetOutput(os.Stderr)
 	}
+	log.SetFlags(0)
+	log.SetPrefix("")
+	serviceLogLevel.Set(level)
+	return nil
+}
+
+// net/http diagnostics must also honor the output, level and error privacy policy.
+type httpErrorLogWriter struct{}
+
+func (httpErrorLogWriter) Write(data []byte) (int, error) {
+	logServiceError(slog.LevelError, "http_server_error", errors.New(strings.TrimSpace(string(data))))
+	return len(data), nil
+}
+
+func httpServerErrorLogger() *log.Logger {
+	return log.New(httpErrorLogWriter{}, "", 0)
+}
+
+func serviceRecovery() gin.HandlerFunc {
+	// A nil writer prevents Gin from dumping request headers and source code.
+	// Gin still handles broken connections without writing to the dead socket.
+	return gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, recovered interface{}) {
+		if err, ok := recovered.(error); ok {
+			logServiceError(slog.LevelError, "http_panic", err, "route", c.FullPath())
+		} else {
+			fields := []interface{}{"route", c.FullPath(), "error_type", fmt.Sprintf("%T", recovered)}
+			if serviceLogLevel.Level() <= slog.LevelDebug {
+				fields = append(fields, "error_detail", boundedLogText(fmt.Sprint(recovered)))
+			}
+			serviceLog(slog.LevelError, "http_panic", fields...)
+		}
+		c.AbortWithStatus(http.StatusInternalServerError)
+	})
 }
 
 // setupGojaRuntime は goja のランタイムをセットアップします。
 func setupGojaRuntime() *goja.Runtime {
+	return setupGojaRuntimeWithSnapshot(currentAPISnapshot())
+}
+
+func setupGojaRuntimeWithSnapshot(snapshot *APIConfigSnapshot) *goja.Runtime {
+	return setupGojaRuntimeWithContext(snapshot, nil)
+}
+
+func setupGojaRuntimeWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Context) *goja.Runtime {
 	vm := goja.New()
 
 	// getAPI 関数の登録
@@ -1699,7 +2189,7 @@ func setupGojaRuntime() *goja.Runtime {
 
 		result, err := getAPI(url, username, password)
 		if err != nil {
-			log.Println("getAPI error:", err)
+			logServiceError(slog.LevelError, "http_client_request_failed", err)
 			return vm.ToValue("")
 		}
 		return vm.ToValue(result)
@@ -1744,16 +2234,27 @@ func setupGojaRuntime() *goja.Runtime {
 	vm.Set("nyanJsonAPI", jsonAPIFunc)
 	vm.Set("nyanCallAPI", jsonAPIFunc)
 
+	vm.Set("nyanGetRequestHeaders", func() map[string]string {
+		headers := make(map[string]string)
+		if requestContext == nil || requestContext.Request == nil {
+			return headers
+		}
+		for name, values := range requestContext.Request.Header {
+			headers[name] = strings.Join(values, ",")
+		}
+		return headers
+	})
+
 	// getCookie, setCookie, setItem, getItem も同様に登録する
 	vm.Set("nyanGetCookie", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
 			return vm.ToValue("")
 		}
 		cookieName := call.Argument(0).String()
-		if ginContext != nil {
-			cookieValue, err := ginContext.Cookie(cookieName)
+		if requestContext != nil {
+			cookieValue, err := requestContext.Cookie(cookieName)
 			if err != nil {
-				log.Printf("Error retrieving cookie: %v", err)
+				logServiceError(slog.LevelDebug, "cookie_unavailable", err)
 				return vm.ToValue("")
 			}
 			return vm.ToValue(cookieValue)
@@ -1767,11 +2268,10 @@ func setupGojaRuntime() *goja.Runtime {
 		}
 		cookieName := call.Argument(0).String()
 		cookieValue := call.Argument(1).String()
-		if ginContext != nil {
-			ginContext.SetCookie(cookieName, cookieValue, 3600, "/", "", false, true)
-			log.Printf("Set-Cookie: %s=%s", cookieName, cookieValue)
+		if requestContext != nil {
+			requestContext.SetCookie(cookieName, cookieValue, 3600, "/", "", requestContext.Request.TLS != nil, true)
 		} else {
-			log.Println("ginContext is not set")
+			serviceLog(slog.LevelDebug, "http_request_context_unavailable")
 		}
 		return vm.ToValue(nil)
 	})
@@ -1782,7 +2282,9 @@ func setupGojaRuntime() *goja.Runtime {
 		}
 		key := call.Argument(0).String()
 		value := call.Argument(1).String()
+		storageMu.Lock()
 		storage[key] = value
+		storageMu.Unlock()
 		return vm.ToValue(nil)
 	})
 
@@ -1791,14 +2293,66 @@ func setupGojaRuntime() *goja.Runtime {
 			return vm.ToValue(nil)
 		}
 		key := call.Argument(0).String()
-		if val, ok := storage[key]; ok {
+		storageMu.RLock()
+		val, ok := storage[key]
+		storageMu.RUnlock()
+		if ok {
 			return vm.ToValue(val)
 		}
 		return vm.ToValue(nil)
 	})
 
-	vm.Set("nyanGetFile", nyanGetFile(vm))
-	vm.Set("nyanReadFileB64", nyanReadFileB64(vm))
+	vm.Set("nyanRemoveItem", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			return vm.ToValue(nil)
+		}
+		key := call.Argument(0).String()
+		storageMu.Lock()
+		delete(storage, key)
+		storageMu.Unlock()
+		return vm.ToValue(nil)
+	})
+
+	// Keep file operations anchored to the root API definition captured by this VM.
+	fileBaseDir := ""
+	if snapshot != nil && filepath.IsAbs(snapshot.RootPath) {
+		fileBaseDir = filepath.Dir(snapshot.RootPath)
+	}
+	vm.Set("nyanGetFile", nyanGetFile(vm, fileBaseDir))
+	vm.Set("nyanSaveFile", nyanSaveFile(vm, fileBaseDir))
+	vm.Set("nyanDeleteFile", nyanDeleteFile(vm, fileBaseDir))
+	vm.Set("nyanReadFileB64", nyanReadFileB64(vm, fileBaseDir))
+	vm.Set("nyanRandomBase64URL", func(call goja.FunctionCall) goja.Value {
+		count := 32
+		if len(call.Arguments) > 0 {
+			count = int(call.Arguments[0].ToInteger())
+		}
+		if count < 1 || count > 1024 {
+			panic(vm.NewTypeError("random byte count is outside the allowed range"))
+		}
+		buffer := make([]byte, count)
+		if _, err := io.ReadFull(cryptorand.Reader, buffer); err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(base64.RawURLEncoding.EncodeToString(buffer))
+	})
+	vm.Set("nyanSHA256Base64URL", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.NewTypeError("nyanSHA256Base64URL requires a string"))
+		}
+		digest := sha256.Sum256([]byte(call.Arguments[0].String()))
+		return vm.ToValue(base64.RawURLEncoding.EncodeToString(digest[:]))
+	})
+	vm.Set("nyanBase64Decode", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.NewTypeError("nyanBase64Decode requires a string"))
+		}
+		decoded, err := base64.StdEncoding.DecodeString(call.Arguments[0].String())
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(string(decoded))
+	})
 	vm.Set("nyanCallMe", func(call goja.FunctionCall) goja.Value {
 		apiName := ""
 		params := map[string]interface{}{}
@@ -1822,13 +2376,13 @@ func setupGojaRuntime() *goja.Runtime {
 			}
 		}
 		if strings.TrimSpace(apiName) == "" {
-			apiName = resolveCurrentAPINameFromContext(ginContext)
+			apiName = resolveCurrentAPINameFromContext(requestContext)
 		}
 		if strings.TrimSpace(apiName) == "" {
 			panic(vm.ToValue("nyanCallMe: api is required"))
 		}
 
-		result, err := callNyanAPIFromVM(apiName, params)
+		result, err := callNyanAPIFromVMWithContext(snapshot, requestContext, apiName, params)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
@@ -1838,13 +2392,36 @@ func setupGojaRuntime() *goja.Runtime {
 		return vm.ToValue(result)
 	})
 
-	// console.log の登録
-	console := map[string]func(...interface{}){
-		"log": func(args ...interface{}) {
-			log.Println(args...)
+	vm.Set("console", map[string]interface{}{
+		"log": func(call goja.FunctionCall) goja.Value {
+			if serviceLogLevel.Level() > slog.LevelDebug {
+				return goja.Undefined()
+			}
+			var args []string
+			jsonStringifyVal := vm.Get("JSON").ToObject(vm).Get("stringify")
+			jsonStringify, ok := goja.AssertFunction(jsonStringifyVal)
+			if !ok {
+				serviceLog(slog.LevelWarn, "script_console_stringify_unavailable")
+				return goja.Undefined()
+			}
+			for _, arg := range call.Arguments {
+				exported := arg.Export()
+				switch exported.(type) {
+				case map[string]interface{}, []interface{}:
+					s, err := jsonStringify(goja.Undefined(), arg)
+					if err == nil {
+						args = append(args, s.String())
+					} else {
+						args = append(args, arg.String())
+					}
+				default:
+					args = append(args, arg.String())
+				}
+			}
+			serviceLog(slog.LevelDebug, "script_console", "message", boundedLogText(strings.Join(args, " ")))
+			return goja.Undefined()
 		},
-	}
-	vm.Set("console", console)
+	})
 
 	vm.Set("nyanHostExec", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
@@ -1870,11 +2447,8 @@ func execGoja(commandLine string) string {
 		cmdStr = "sh"
 		args = []string{"-c", commandLine}
 	}
-	result, err := runCommand(cmdStr, args...)
-	if err != nil {
-		// エラーが発生しても ExecResult 自体は返す
-		// エラー詳細は result.Stderr や ExitCode に含まれる
-	}
+	// Command failures are represented by ExecResult, including stderr and exit code.
+	result, _ := runCommand(cmdStr, args...)
 	data, _ := json.Marshal(result)
 	return string(data)
 }
@@ -1954,8 +2528,8 @@ func cp932ToUTF8(data []byte) (string, error) {
 // handleNyan は /nyan へのリクエストを処理します。
 func handleNyan(c *gin.Context) {
 	apis := make(map[string]ApiData)
-	for apiName, cfg := range apiConfig {
-		if strings.TrimSpace(cfg.Type) == apiTypeSchedule {
+	for apiName, cfg := range currentAPIConfig() {
+		if !isRequestAPI(cfg) {
 			continue
 		}
 		apis[apiName] = ApiData{
@@ -1974,21 +2548,53 @@ func handleNyan(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-func nyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+// handleNyanDetail publishes documentation schemas for one normal API.
+func handleNyanDetail(c *gin.Context) {
+	apiName := strings.TrimPrefix(c.Param("apiName"), "/")
+	if apiName == "" {
+		handleNyan(c)
+		return
+	}
+	config, exists := currentAPIConfig()[apiName]
+	if !exists || !isRequestAPI(config) {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("API not found: %s", apiName)})
+		return
+	}
+	schema, err := resolveAPISchema(config)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to resolve API schemas: %s", apiName), "detail": err.Error()})
+		return
+	}
+	result := gin.H{
+		"api": apiName, "type": "api", "description": config.Description,
+		"inputSchema": schema.Input, "outputSchema": schema.Output,
+		"schemaSource": gin.H{"input": schema.InputSource, "output": schema.OutputSource},
+	}
+	if schema.InputSource == schemaSourceScriptLegacy {
+		if params, found, readErr := readStaticLegacyAcceptedParams(config.Script); readErr == nil && found {
+			result["nyanAcceptedParams"] = params
+		}
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func resolveJavaScriptFilePath(vm *goja.Runtime, baseDir, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	if baseDir == "" {
+		panic(vm.NewTypeError("root API configuration path is unavailable for relative file paths"))
+	}
+	return filepath.Join(baseDir, path)
+}
+
+func nyanGetFile(vm *goja.Runtime, baseDir string) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		// 引数のチェック
 		if len(call.Arguments) < 1 {
 			panic(vm.NewTypeError("nyanGetFileには1つの引数（ファイルパス）が必要です"))
 		}
-		relativePath := call.Arguments[0].String()
-
-		// 実行中のバイナリのディレクトリからの相対パスに解決
-		exePath, err := os.Executable()
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		exeDir := filepath.Dir(exePath)
-		fullPath := filepath.Join(exeDir, relativePath)
+		fullPath := resolveJavaScriptFilePath(vm, baseDir, call.Arguments[0].String())
 
 		// ディレクトリ指定なら null
 		if fi, err := os.Stat(fullPath); err == nil && fi.IsDir() {
@@ -2010,20 +2616,65 @@ func nyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 	}
 }
 
-func nyanReadFileB64(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+func nyanSaveFile(vm *goja.Runtime, baseDir string) func(call goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 2 {
+			panic(vm.NewTypeError("nyanSaveFileにはファイルパスと内容が必要です"))
+		}
+		path := resolveJavaScriptFilePath(vm, baseDir, call.Arguments[0].String())
+		if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		temporary, err := os.CreateTemp(filepath.Dir(path), ".nyan-save-*")
+		if err != nil {
+			panic(vm.ToValue(err.Error()))
+		}
+		temporaryPath := temporary.Name()
+		cleanup := func() { _ = temporary.Close(); _ = os.Remove(temporaryPath) }
+		if err := temporary.Chmod(0600); err != nil {
+			cleanup()
+			panic(vm.ToValue(err.Error()))
+		}
+		if _, err := temporary.Write([]byte(call.Arguments[1].String())); err != nil {
+			cleanup()
+			panic(vm.ToValue(err.Error()))
+		}
+		if err := temporary.Sync(); err != nil {
+			cleanup()
+			panic(vm.ToValue(err.Error()))
+		}
+		if err := temporary.Close(); err != nil {
+			_ = os.Remove(temporaryPath)
+			panic(vm.ToValue(err.Error()))
+		}
+		if err := os.Rename(temporaryPath, path); err != nil {
+			_ = os.Remove(temporaryPath)
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(true)
+	}
+}
+
+func nyanDeleteFile(vm *goja.Runtime, baseDir string) func(call goja.FunctionCall) goja.Value {
+	return func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			panic(vm.NewTypeError("nyanDeleteFile requires a file path"))
+		}
+		path := resolveJavaScriptFilePath(vm, baseDir, call.Arguments[0].String())
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			panic(vm.ToValue(err.Error()))
+		}
+		return vm.ToValue(true)
+	}
+}
+
+func nyanReadFileB64(vm *goja.Runtime, baseDir string) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
 			panic(vm.NewTypeError("nyanReadFileB64には1つの引数（ファイルパス）が必要です"))
 		}
-		path := call.Arguments[0].String()
-
-		abs := path
-		if !filepath.IsAbs(path) {
-			wd, _ := os.Getwd()
-			abs = filepath.Join(wd, path)
-		}
-
-		content, err := os.ReadFile(abs)
+		path := resolveJavaScriptFilePath(vm, baseDir, call.Arguments[0].String())
+		content, err := os.ReadFile(path)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
@@ -2032,10 +2683,31 @@ func nyanReadFileB64(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 	}
 }
 
+// Only ordinary APIs are callable through the public JSON-RPC endpoint.
+// OAuth APIs must run through their dedicated handlers with server-owned context.
+func isJSONRPCCallableAPI(config APIConfig, name string) bool {
+	endpoint, exists := config[name]
+	if !exists {
+		return false
+	}
+	switch strings.TrimSpace(endpoint.Type) {
+	case "", "api":
+	default:
+		return false
+	}
+	for _, candidate := range config {
+		if strings.TrimSpace(candidate.Type) != apiTypeMCP {
+			continue
+		}
+		if _, isOAuthRole := mcpOAuthRoleForAPI(candidate, name); isOAuthRole {
+			return false
+		}
+	}
+	return true
+}
+
 func handleJSONRPC(c *gin.Context) {
-	log.Print("handleJSONRPC called")
-	ginContext = c
-	defer func() { ginContext = nil }()
+	serviceLog(slog.LevelDebug, "jsonrpc_request_received")
 
 	// 1) リクエストボディを読み込み、JSONRPCRequest にパース
 	var rpcReq JSONRPCRequest
@@ -2063,15 +2735,16 @@ func handleJSONRPC(c *gin.Context) {
 	}
 
 	// 3) api.json から、リクエストされたAPI設定を取得
-	config, exists := apiConfig[rpcReq.Method]
-	if !exists {
-		respondJSONRPCError(c, rpcReq.ID, -32601, fmt.Sprintf("API not found: %s", rpcReq.Method), nil)
+	snapshot := currentAPISnapshot()
+	if snapshot == nil {
+		respondJSONRPCError(c, rpcReq.ID, -32603, "API configuration is not loaded", nil)
 		return
 	}
-	if strings.TrimSpace(config.Type) == apiTypeSchedule {
-		respondJSONRPCError(c, rpcReq.ID, -32601, fmt.Sprintf("API not found: %s", rpcReq.Method), nil)
+	if !isJSONRPCCallableAPI(snapshot.Config, rpcReq.Method) {
+		respondJSONRPCError(c, rpcReq.ID, -32601, "Method not found", nil)
 		return
 	}
+	config := snapshot.Config[rpcReq.Method]
 
 	// 4) JSON-RPC では HTML 出力は想定しないため、script が必須とする
 	if config.Script == "" {
@@ -2080,12 +2753,19 @@ func handleJSONRPC(c *gin.Context) {
 	}
 
 	// 5) 必要なら URL や POST のパラメータもマージ（handleAPIRequest と同様）
-	c.Request.ParseForm()
+	if err := c.Request.ParseForm(); err != nil {
+		respondJSONRPCError(c, rpcReq.ID, -32602, "Invalid params", nil)
+		return
+	}
 	for k, v := range c.Request.PostForm {
 		allParams[k] = v[0]
 	}
 	for k, v := range c.Request.URL.Query() {
 		allParams[k] = v[0]
+	}
+	if err := validateExternalRequestParams(allParams); err != nil {
+		respondJSONRPCError(c, rpcReq.ID, -32602, "Invalid params", err.Error())
+		return
 	}
 
 	// 6) 実行ファイルのディレクトリを解決し、スクリプトのパスを決定
@@ -2101,29 +2781,71 @@ func handleJSONRPC(c *gin.Context) {
 		htmlPath = resolvePath(exeDir, config.HTML)
 	}
 
-	if allowed, handled := runParamCheck(c, config, exeDir, htmlPath, allParams); handled {
-		return
-	} else if !allowed {
+	if _, checkResponse := evaluateParamCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams); checkResponse != nil {
+		writeJSONRPCCheckResponse(c, rpcReq.ID, "paramCheck", *checkResponse)
 		return
 	}
 
 	// 7) メインのスクリプト実行（runJavaScript は既存関数）
-	resultStr, err := runJavaScript(scriptPath, htmlPath, allParams)
+	resultValue, err := runJavaScriptValueWithContext(snapshot, c, scriptPath, htmlPath, allParams)
 	if err != nil {
 		respondJSONRPCError(c, rpcReq.ID, -32603, "Script execution error", err.Error())
 		return
 	}
+	result, response, err := jsonRPCResultFromJSValue(resultValue)
+	if err != nil {
+		respondJSONRPCError(c, rpcReq.ID, -32603, "Invalid script response", err.Error())
+		return
+	}
+	if checkResponse := evaluateOutCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams, response); checkResponse != nil {
+		writeJSONRPCCheckResponse(c, rpcReq.ID, "outCheck", *checkResponse)
+		return
+	}
 
 	// 8) Push 処理（必要な場合）
-	performPush(config, allParams)
+	performPushWithContext(snapshot, c, config, allParams)
 
 	// 10) JSON-RPC 成功レスポンスを構築して返却
 	rpcResp := JSONRPCResponse{
 		JSONRPC: "2.0",
-		Result:  resultStr,
+		Result:  result,
 		ID:      rpcReq.ID,
 	}
 	c.JSON(http.StatusOK, rpcResp)
+}
+
+func jsonRPCResultFromJSValue(value goja.Value) (result json.RawMessage, response APIResponse, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if exception, ok := recovered.(*goja.Exception); ok {
+				result, err = nil, exception
+			} else {
+				panic(recovered)
+			}
+		}
+	}()
+
+	// Reuse one export for the result and HTTP response fields used by outCheck.
+	var exported interface{}
+	if value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
+		exported = value.Export()
+	}
+	// Pre-encode before Push, including a non-nil "null" result for empty values.
+	result, err = json.Marshal(exported)
+	if err != nil {
+		return nil, response, err
+	}
+	response, _, err = responseFromExportedJSValue(value, exported)
+	return result, response, err
+}
+
+func writeJSONRPCCheckResponse(c *gin.Context, id interface{}, checkName string, response ParamCheckResponse) {
+	if response.Success && response.Status == http.StatusOK {
+		// A successful checkOnly request returns the check result without running the API.
+		c.JSON(http.StatusOK, JSONRPCResponse{JSONRPC: "2.0", Result: response, ID: id})
+		return
+	}
+	respondJSONRPCError(c, id, -32000, checkName+" rejected", response)
 }
 
 func respondJSONRPCError(c *gin.Context, id interface{}, code int, message string, data interface{}) {
@@ -2139,50 +2861,2267 @@ func respondJSONRPCError(c *gin.Context, id interface{}, code int, message strin
 	})
 }
 
-// performPush は指定された config に対して push 処理を行います。
-func performPush(config EndpointConfig, allParams map[string]interface{}) {
+func performPushWithSnapshot(snapshot *APIConfigSnapshot, config EndpointConfig, allParams map[string]interface{}) {
+	performPushWithContext(snapshot, nil, config, allParams)
+}
+
+func performPushWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Context, config EndpointConfig, allParams map[string]interface{}) {
 	if config.Push == "" {
 		return
 	}
-	pushConfig, ok := apiConfig[config.Push]
+	if snapshot == nil {
+		return
+	}
+	pushConfig, ok := snapshot.Config[config.Push]
 	if !ok {
-		log.Printf("Push target %s not found in apiConfig", config.Push)
+		serviceLog(slog.LevelWarn, "push_target_not_found", "channel", config.Push)
 		return
 	}
 	exePath, err := os.Executable()
 	if err != nil {
-		log.Printf("Failed to get executable path for push: %v", err)
+		logServiceError(slog.LevelError, "push_executable_path_failed", err)
 		return
 	}
 	exeDir := filepath.Dir(exePath)
 	scriptPath := resolvePath(exeDir, pushConfig.Script)
-	htmlPath := resolvePath(exeDir, pushConfig.HTML)
+	htmlPath := resolvePathFromBase(exeDir, pushConfig.HTML)
 	var pushResult string
 	if pushConfig.Script == "" {
 		content, err := os.ReadFile(htmlPath)
 		if err != nil {
-			log.Printf("Failed to read push HTML file %s: %v", htmlPath, err)
+			logServiceError(slog.LevelError, "push_html_load_failed", err, "channel", config.Push)
 			return
 		}
 		pushResult = string(content)
 	} else {
-		result, err := runJavaScript(scriptPath, htmlPath, allParams)
+		result, err := runJavaScriptValueWithContext(snapshot, requestContext, scriptPath, htmlPath, allParams)
 		if err != nil {
-			log.Printf("Failed to run push script: %v", err)
+			logServiceError(slog.LevelError, "push_script_failed", err, "channel", config.Push)
 			return
 		}
-		pushResult = result
+		pushResult = result.String()
 	}
 	if pushResult != "" {
 		wsConnections.RLock()
-		pushConns := wsConnections.conns[config.Push]
+		pushConns := append([]*serverWebSocket(nil), wsConnections.conns[config.Push]...)
 		wsConnections.RUnlock()
 		for _, conn := range pushConns {
 			if err := conn.WriteMessage(websocket.TextMessage, []byte(pushResult)); err != nil {
-				log.Printf("Error pushing message to %s: %v", config.Push, err)
+				logServiceError(slog.LevelWarn, "push_send_failed", err, "channel", config.Push)
 			} else {
-				log.Printf("Push message sent to %s", config.Push)
+				serviceLog(slog.LevelDebug, "push_sent", "channel", config.Push, "bytes", len(pushResult))
 			}
 		}
 	}
+}
+
+func parseStaticJavaScriptValue(filename, source string) (interface{}, error) {
+	program, err := parser.ParseFile(nil, filename, "("+source+");", 0)
+	if err != nil {
+		return nil, fmt.Errorf("parse static JavaScript value: %w", err)
+	}
+	if len(program.Body) != 1 {
+		return nil, fmt.Errorf("parse static JavaScript value: expected one expression")
+	}
+	statement, ok := program.Body[0].(*ast.ExpressionStatement)
+	if !ok {
+		return nil, fmt.Errorf("parse static JavaScript value: expected an expression, got %T", program.Body[0])
+	}
+	return convertStaticJavaScriptValue(statement.Expression, "$")
+}
+
+func convertStaticJavaScriptValue(expression ast.Expression, path string) (interface{}, error) {
+	switch value := expression.(type) {
+	case *ast.ObjectLiteral:
+		result := make(map[string]interface{}, len(value.Value))
+		for _, rawProperty := range value.Value {
+			property, ok := rawProperty.(*ast.PropertyKeyed)
+			if !ok {
+				return nil, fmt.Errorf("static JavaScript value at %s: unsupported property %T", path, rawProperty)
+			}
+			if property.Computed || property.Kind != ast.PropertyKindValue {
+				return nil, fmt.Errorf("static JavaScript value at %s: dynamic properties are not supported", path)
+			}
+			keyLiteral, ok := property.Key.(*ast.StringLiteral)
+			if !ok {
+				return nil, fmt.Errorf("static JavaScript value at %s: property names must be strings", path)
+			}
+			key := keyLiteral.Value.String()
+			if _, exists := result[key]; exists {
+				return nil, fmt.Errorf("static JavaScript value at %s: duplicate property %q", path, key)
+			}
+			converted, err := convertStaticJavaScriptValue(property.Value, path+"."+key)
+			if err != nil {
+				return nil, err
+			}
+			result[key] = converted
+		}
+		return result, nil
+	case *ast.ArrayLiteral:
+		result := make([]interface{}, len(value.Value))
+		for index, item := range value.Value {
+			if item == nil {
+				return nil, fmt.Errorf("static JavaScript value at %s[%d]: array holes are not supported", path, index)
+			}
+			converted, err := convertStaticJavaScriptValue(item, fmt.Sprintf("%s[%d]", path, index))
+			if err != nil {
+				return nil, err
+			}
+			result[index] = converted
+		}
+		return result, nil
+	case *ast.StringLiteral:
+		return value.Value.String(), nil
+	case *ast.NumberLiteral:
+		return staticJavaScriptNumber(value.Value, path)
+	case *ast.BooleanLiteral:
+		return value.Value, nil
+	case *ast.NullLiteral:
+		return nil, nil
+	case *ast.UnaryExpression:
+		if value.Postfix || (value.Operator != token.MINUS && value.Operator != token.PLUS) {
+			return nil, fmt.Errorf("static JavaScript value at %s: unary operator is not supported", path)
+		}
+		numberLiteral, ok := value.Operand.(*ast.NumberLiteral)
+		if !ok {
+			return nil, fmt.Errorf("static JavaScript value at %s: unary requires a numeric literal", path)
+		}
+		number, err := staticJavaScriptNumber(numberLiteral.Value, path)
+		if err != nil || value.Operator == token.PLUS {
+			return number, err
+		}
+		switch number := number.(type) {
+		case int64:
+			return -number, nil
+		case float64:
+			return -number, nil
+		}
+	}
+	return nil, fmt.Errorf("static JavaScript value at %s: expressions of type %T are not supported", path, expression)
+}
+
+func staticJavaScriptNumber(value interface{}, path string) (interface{}, error) {
+	switch number := value.(type) {
+	case int64:
+		return number, nil
+	case float64:
+		if math.IsInf(number, 0) || math.IsNaN(number) {
+			return nil, fmt.Errorf("static JavaScript value at %s: non-finite number", path)
+		}
+		return number, nil
+	default:
+		return nil, fmt.Errorf("static JavaScript value at %s: numeric value %T is not JSON-compatible", path, value)
+	}
+}
+
+func extractStaticJavaScriptConstant(filename string, source []byte, constantName string) (interface{}, bool, error) {
+	program, err := parser.ParseFile(nil, filename, source, 0)
+	if err != nil {
+		return nil, false, fmt.Errorf("parse JavaScript file %s: %w", filename, err)
+	}
+	var initializer ast.Expression
+	for _, statement := range program.Body {
+		switch declaration := statement.(type) {
+		case *ast.LexicalDeclaration:
+			for _, binding := range declaration.List {
+				identifier, ok := binding.Target.(*ast.Identifier)
+				if !ok || identifier.Name.String() != constantName {
+					continue
+				}
+				if declaration.Token != token.CONST {
+					return nil, false, fmt.Errorf("JavaScript file %s: %s must be declared with const", filename, constantName)
+				}
+				if initializer != nil {
+					return nil, false, fmt.Errorf("JavaScript file %s: duplicate declaration of %s", filename, constantName)
+				}
+				if binding.Initializer == nil {
+					return nil, false, fmt.Errorf("JavaScript file %s: %s has no initializer", filename, constantName)
+				}
+				initializer = binding.Initializer
+			}
+		case *ast.VariableStatement:
+			for _, binding := range declaration.List {
+				if identifier, ok := binding.Target.(*ast.Identifier); ok && identifier.Name.String() == constantName {
+					return nil, false, fmt.Errorf("JavaScript file %s: %s must be declared with const", filename, constantName)
+				}
+			}
+		}
+	}
+	if initializer == nil {
+		return nil, false, nil
+	}
+	converted, err := convertStaticJavaScriptValue(initializer, constantName)
+	if err != nil {
+		return nil, false, fmt.Errorf("JavaScript file %s: %w", filename, err)
+	}
+	return converted, true, nil
+}
+
+func readStaticJavaScriptObjectConstant(filePath, constantName string) (map[string]interface{}, bool, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, false, err
+	}
+	value, found, err := extractStaticJavaScriptConstant(filePath, data, constantName)
+	if err != nil || !found {
+		return nil, found, err
+	}
+	object, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, false, fmt.Errorf("JavaScript file %s: %s must be a static object literal", filePath, constantName)
+	}
+	return object, true, nil
+}
+
+func readOptionalStaticJavaScriptObjectConstant(filePath, constantName string) (map[string]interface{}, bool, error) {
+	if _, err := os.Stat(filePath); err != nil {
+		return nil, false, nil
+	}
+	return readStaticJavaScriptObjectConstant(filePath, constantName)
+}
+
+func readStaticLegacyAcceptedParams(filePath string) (map[string]interface{}, bool, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, false, err
+	}
+	value, found, err := extractStaticJavaScriptConstant(filePath, data, "nyanAcceptedParams")
+	if err != nil || !found {
+		return nil, found, err
+	}
+	params, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, false, fmt.Errorf("nyanAcceptedParams must be a static object literal")
+	}
+	return params, true, nil
+}
+
+func resolveAPISchema(config EndpointConfig) (APISchema, error) {
+	resolved := APISchema{Input: map[string]interface{}{}, Output: map[string]interface{}{}, InputSource: schemaSourceUnknown, OutputSource: schemaSourceUnknown}
+	if config.ParamCheck != "" {
+		input, found, err := readOptionalStaticJavaScriptObjectConstant(config.ParamCheck, "nyanInputSchema")
+		if err != nil {
+			return APISchema{}, fmt.Errorf("input schema from paramCheck: %w", err)
+		}
+		if found {
+			resolved.Input, resolved.InputSource = input, schemaSourceParamCheck
+		}
+	}
+	if config.OutCheck != "" {
+		output, found, err := readOptionalStaticJavaScriptObjectConstant(config.OutCheck, "nyanOutputSchema")
+		if err != nil {
+			return APISchema{}, fmt.Errorf("output schema from outCheck: %w", err)
+		}
+		if found {
+			resolved.Output, resolved.OutputSource = output, schemaSourceOutCheck
+		}
+	}
+	if config.Script != "" && resolved.InputSource == schemaSourceUnknown {
+		params, found, err := readStaticLegacyAcceptedParams(config.Script)
+		if err == nil && found {
+			resolved.Input, resolved.InputSource = legacyInputSchema(params), schemaSourceScriptLegacy
+		}
+	}
+	return resolved, nil
+}
+
+func legacyInputSchema(params map[string]interface{}) map[string]interface{} {
+	properties := make(map[string]interface{}, len(params))
+	for name, value := range params {
+		properties[name] = legacyValueSchema(value)
+	}
+	return map[string]interface{}{"type": "object", "properties": properties, "additionalProperties": true}
+}
+
+func legacyValueSchema(value interface{}) map[string]interface{} {
+	schema := map[string]interface{}{}
+	switch value := value.(type) {
+	case string:
+		schema["type"] = "string"
+	case bool:
+		schema["type"] = "boolean"
+	case int64, int, int32:
+		schema["type"] = "integer"
+	case float64:
+		if math.Trunc(value) == value {
+			schema["type"] = "integer"
+		} else {
+			schema["type"] = "number"
+		}
+	case map[string]interface{}:
+		properties := map[string]interface{}{}
+		for name, item := range value {
+			properties[name] = legacyValueSchema(item)
+		}
+		schema["type"], schema["properties"], schema["additionalProperties"] = "object", properties, true
+	case []interface{}:
+		schema["type"] = "array"
+		if len(value) > 0 {
+			schema["items"] = legacyValueSchema(value[0])
+		} else {
+			schema["items"] = map[string]interface{}{}
+		}
+	default:
+		return schema
+	}
+	schema["examples"] = []interface{}{value}
+	return schema
+}
+
+const defaultAPIHotReloadCheckInterval = time.Second
+
+type APIHotReloadConfig struct {
+	Enabled  bool   `json:"Enabled"`
+	Interval string `json:"Interval"`
+}
+
+func applyConfigDefaults(target *Config) {
+	target.APIHotReload.Enabled = true
+	target.APIHotReload.Interval = defaultAPIHotReloadCheckInterval.String()
+}
+
+func parseAPIHotReloadInterval(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultAPIHotReloadCheckInterval, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	if interval <= 0 {
+		return 0, fmt.Errorf("must be greater than zero")
+	}
+	return interval, nil
+}
+
+func decodeAPIConfig(data []byte, apiBaseDir string) (APIConfig, error) {
+	if err := validateNoDuplicateJSONKeys(data); err != nil {
+		return nil, fmt.Errorf("decode api JSON: %w", err)
+	}
+	var config APIConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("decode api JSON: %w", err)
+	}
+	if config == nil {
+		return nil, fmt.Errorf("decode api JSON: top-level value must be an object")
+	}
+	adjustAPIConfigPaths(config, apiBaseDir)
+	if err := validateMCPConfiguration(config); err != nil {
+		return nil, err
+	}
+	return config, nil
+}
+
+func currentAPISnapshot() *APIConfigSnapshot {
+	apiConfigMu.RLock()
+	snapshot := apiSnapshot
+	apiConfigMu.RUnlock()
+	return snapshot
+}
+
+func currentAPIConfig() APIConfig {
+	apiConfigMu.RLock()
+	config := apiConfig
+	apiConfigMu.RUnlock()
+	return config
+}
+
+func setAPIConfig(config APIConfig) {
+	if config == nil {
+		publishAPISnapshot(nil)
+		return
+	}
+	schedules, _ := buildScheduleJobConfigs(config)
+	wsClients, _ := buildWSClientConfigs(config)
+	publishAPISnapshot(&APIConfigSnapshot{Config: config, Sources: map[string]string{}, FileStates: map[string]APIFileState{}, Schedules: schedules, WSClients: wsClients})
+}
+
+func publishAPISnapshot(snapshot *APIConfigSnapshot) {
+	apiConfigMu.Lock()
+	apiSnapshot = snapshot
+	if snapshot == nil {
+		apiConfig = nil
+	} else {
+		apiConfig = snapshot.Config
+	}
+	reconcileMCPConcurrencyLimiters(apiConfig)
+	apiConfigMu.Unlock()
+}
+
+type apiIncludeDefinition struct {
+	Type string `json:"type"`
+	Path string `json:"path"`
+}
+
+type apiGraphLoader struct {
+	definitions APIConfig
+	sources     map[string]string
+	states      map[string]APIFileState
+}
+
+func readAPIConfigGraph(rootPath, apiBaseDir string) (*apiConfigLoadResult, error) {
+	rootPath = resolvePathFromBase(apiBaseDir, rootPath)
+	rootPath, err := filepath.Abs(rootPath)
+	if err != nil {
+		return nil, err
+	}
+	loader := &apiGraphLoader{definitions: APIConfig{}, sources: map[string]string{}, states: map[string]APIFileState{}}
+	result := &apiConfigLoadResult{Snapshot: &APIConfigSnapshot{RootPath: rootPath, Config: loader.definitions, Sources: loader.sources, FileStates: loader.states}}
+	rootData, rootIdentity, err := loader.readFile(rootPath)
+	if err != nil {
+		return result, err
+	}
+	if err := loader.loadFile(rootPath, rootIdentity, rootData, "", nil); err != nil {
+		return result, err
+	}
+	if err := validateMCPConfiguration(loader.definitions); err != nil {
+		return result, err
+	}
+	schedules, err := buildScheduleJobConfigs(loader.definitions)
+	if err != nil {
+		return result, err
+	}
+	wsClients, err := buildWSClientConfigs(loader.definitions)
+	if err != nil {
+		return result, err
+	}
+	if err := verifyAPIFileStates(loader.states); err != nil {
+		return result, err
+	}
+	snapshot := &APIConfigSnapshot{RootPath: rootPath, Config: loader.definitions, Sources: loader.sources, FileStates: loader.states, Schedules: schedules, WSClients: wsClients}
+	result.Snapshot = snapshot
+	return result, nil
+}
+
+func (loader *apiGraphLoader) readFile(path string) ([]byte, string, error) {
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return nil, "", err
+	}
+	identity := absPath
+	if canonical, canonicalErr := filepath.EvalSymlinks(absPath); canonicalErr == nil {
+		identity = canonical
+	}
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		loader.states[identity] = APIFileState{Exists: false}
+		return nil, identity, fmt.Errorf("read api file %s: %w", absPath, err)
+	}
+	loader.states[identity] = APIFileState{Exists: true, Hash: sha256.Sum256(data)}
+	return data, identity, nil
+}
+
+func (loader *apiGraphLoader) loadFile(path, identity string, data []byte, prefix string, stack []string) error {
+	for _, active := range stack {
+		if active == identity {
+			return fmt.Errorf("include cycle detected at %s", path)
+		}
+	}
+	if err := validateNoDuplicateJSONKeys(data); err != nil {
+		return fmt.Errorf("decode api JSON %s: %w", path, err)
+	}
+	var definitions map[string]json.RawMessage
+	if err := json.Unmarshal(data, &definitions); err != nil {
+		return fmt.Errorf("decode api JSON %s: %w", path, err)
+	}
+	if definitions == nil {
+		return fmt.Errorf("decode api JSON %s: top-level value must be an object", path)
+	}
+	names := make([]string, 0, len(definitions))
+	for name := range definitions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	mounts := map[string]struct{}{}
+	for _, name := range names {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(definitions[name], &object); err != nil || object == nil {
+			if err == nil {
+				err = fmt.Errorf("definition must be an object")
+			}
+			return fmt.Errorf("decode API definition %q in %s: %w", name, path, err)
+		}
+		var header struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(definitions[name], &header); err != nil {
+			return fmt.Errorf("decode API definition %q in %s: %w", name, path, err)
+		}
+		if strings.TrimSpace(header.Type) == apiTypeInclude {
+			if err := validateIncludeMountName(name); err != nil {
+				return err
+			}
+			mounts[name] = struct{}{}
+		}
+	}
+	for mount := range mounts {
+		for _, name := range names {
+			if name != mount && strings.HasPrefix(name, mount+"/") {
+				return fmt.Errorf("include mount %q conflicts with API name %q in %s", mount, name, path)
+			}
+		}
+	}
+	for _, name := range names {
+		raw := definitions[name]
+		var header struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(raw, &header)
+		if strings.TrimSpace(header.Type) == apiTypeInclude {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &fields); err != nil {
+				return err
+			}
+			for field := range fields {
+				if field != "type" && field != "path" {
+					return fmt.Errorf("include %q: unsupported field %q; only type and path are allowed", name, field)
+				}
+			}
+			var include apiIncludeDefinition
+			if err := json.Unmarshal(raw, &include); err != nil {
+				return fmt.Errorf("include %q: %w", name, err)
+			}
+			if strings.TrimSpace(include.Path) == "" {
+				return fmt.Errorf("include %q: path is empty", name)
+			}
+			childPath := resolvePathFromBase(filepath.Dir(path), include.Path)
+			childData, childIdentity, err := loader.readFile(childPath)
+			if err != nil {
+				return fmt.Errorf("include %q in %s: %w", name, path, err)
+			}
+			if err := loader.loadFile(childPath, childIdentity, childData, joinAPIName(prefix, name), append(stack, identity)); err != nil {
+				return err
+			}
+			continue
+		}
+		var endpoint EndpointConfig
+		if err := json.Unmarshal(raw, &endpoint); err != nil {
+			return fmt.Errorf("decode API definition %q in %s: %w", name, path, err)
+		}
+		endpointConfig := APIConfig{name: endpoint}
+		adjustAPIConfigPaths(endpointConfig, filepath.Dir(path))
+		fullName := joinAPIName(prefix, name)
+		if _, exists := loader.definitions[fullName]; exists {
+			return fmt.Errorf("duplicate expanded API name %q", fullName)
+		}
+		loader.definitions[fullName] = endpointConfig[name]
+		loader.sources[fullName] = path
+	}
+	return nil
+}
+
+func validateIncludeMountName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.TrimSpace(name) != name || strings.Contains(name, "/") {
+		return fmt.Errorf("invalid include mount name %q", name)
+	}
+	return nil
+}
+
+func joinAPIName(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	return prefix + "/" + name
+}
+
+func validateNoDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := consumeJSONValue(decoder, "$", nil); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("multiple top-level JSON values")
+		}
+		return err
+	}
+	return nil
+}
+
+func consumeJSONValue(decoder *json.Decoder, path string, first json.Token) error {
+	token := first
+	var err error
+	if token == nil {
+		token, err = decoder.Token()
+		if err != nil {
+			return err
+		}
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := map[string]struct{}{}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("invalid object key at %s", path)
+			}
+			if _, exists := seen[key]; exists {
+				return fmt.Errorf("duplicate key %q at %s", key, path)
+			}
+			seen[key] = struct{}{}
+			if err := consumeJSONValue(decoder, path+"."+key, nil); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	case '[':
+		index := 0
+		for decoder.More() {
+			if err := consumeJSONValue(decoder, fmt.Sprintf("%s[%d]", path, index), nil); err != nil {
+				return err
+			}
+			index++
+		}
+		_, err = decoder.Token()
+		return err
+	default:
+		return nil
+	}
+}
+
+func observeAPIFileStates(states map[string]APIFileState) map[string]APIFileState {
+	observed := make(map[string]APIFileState, len(states))
+	for path := range states {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			observed[path] = APIFileState{Exists: false}
+		} else {
+			observed[path] = APIFileState{Exists: true, Hash: sha256.Sum256(data)}
+		}
+	}
+	return observed
+}
+
+func verifyAPIFileStates(expected map[string]APIFileState) error {
+	observed := observeAPIFileStates(expected)
+	if !reflect.DeepEqual(observed, expected) {
+		return fmt.Errorf("api files changed while configuration was being loaded")
+	}
+	return nil
+}
+
+func reloadAPIConfigGraphIfChanged(path, apiBaseDir string, watched map[string]APIFileState) (map[string]APIFileState, bool, error) {
+	observed := observeAPIFileStates(watched)
+	if reflect.DeepEqual(observed, watched) {
+		return watched, false, nil
+	}
+	loaded, err := readAPIConfigGraph(path, apiBaseDir)
+	if err != nil {
+		if loaded != nil && loaded.Snapshot != nil {
+			for filePath, state := range loaded.Snapshot.FileStates {
+				observed[filePath] = state
+			}
+		}
+		return observed, false, err
+	}
+	current := currentAPISnapshot()
+	if current != nil && reflect.DeepEqual(current.Config, loaded.Snapshot.Config) && reflect.DeepEqual(current.Sources, loaded.Snapshot.Sources) {
+		return loaded.Snapshot.FileStates, false, nil
+	}
+	publishAPISnapshot(loaded.Snapshot)
+	if backgroundRuntimes != nil {
+		backgroundRuntimes.reconcile(loaded.Snapshot.Schedules, loaded.Snapshot.WSClients)
+	}
+	return loaded.Snapshot.FileStates, true, nil
+}
+
+func watchAPIConfigGraph(path, apiBaseDir string, interval time.Duration, initialStates map[string]APIFileState) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	watched := initialStates
+	lastError := ""
+	for range ticker.C {
+		states, reloaded, err := reloadAPIConfigGraphIfChanged(path, apiBaseDir, watched)
+		watched = states
+		if err != nil {
+			if err.Error() != lastError {
+				logServiceError(slog.LevelError, "api_hot_reload_failed", err, "file", path, "active_config_retained", true)
+			}
+			lastError = err.Error()
+			continue
+		}
+		lastError = ""
+		if reloaded {
+			serviceLog(slog.LevelInfo, "api_hot_reload_succeeded", "api_count", len(currentAPIConfig()))
+		}
+	}
+}
+
+type backgroundRuntimeManager struct {
+	mu        sync.Mutex
+	schedules map[string]*scheduleRuntime
+	wsClients map[string]*wsClientRuntime
+}
+
+type scheduleRuntime struct {
+	mu      sync.Mutex
+	desired *scheduleJobConfig
+	wake    chan struct{}
+	done    chan struct{}
+	stopped bool
+}
+
+type wsClientRuntime struct {
+	mu         sync.Mutex
+	desired    *wsClientConfig
+	wake       chan struct{}
+	done       chan struct{}
+	stopped    bool
+	conn       *websocket.Conn
+	dialCancel context.CancelFunc
+}
+
+func newBackgroundRuntimeManager() *backgroundRuntimeManager {
+	return &backgroundRuntimeManager{schedules: make(map[string]*scheduleRuntime), wsClients: make(map[string]*wsClientRuntime)}
+}
+
+func (manager *backgroundRuntimeManager) reconcile(schedules map[string]scheduleJobConfig, wsClients map[string]wsClientConfig) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	for name, runtime := range manager.schedules {
+		if _, exists := schedules[name]; !exists {
+			if _, changed := runtime.update(nil); changed {
+				serviceLog(slog.LevelInfo, "schedule_stopping", "job", name)
+			}
+		}
+	}
+	for name, cfg := range schedules {
+		if runtime, exists := manager.schedules[name]; exists {
+			if accepted, changed := runtime.update(&cfg); accepted {
+				if changed {
+					serviceLog(slog.LevelInfo, "schedule_updated", "job", name, "cron", cfg.trigger.Value)
+				}
+				continue
+			}
+		}
+		runtime := newScheduleRuntime(cfg)
+		manager.schedules[name] = runtime
+		serviceLog(slog.LevelInfo, "schedule_starting", "job", name, "cron", cfg.trigger.Value)
+		go manager.runSchedule(name, runtime)
+	}
+	for name, runtime := range manager.wsClients {
+		if _, exists := wsClients[name]; !exists {
+			if _, changed, _ := runtime.update(nil); changed {
+				serviceLog(slog.LevelInfo, "ws_client_stopping", "client", name)
+			}
+		}
+	}
+	for name, cfg := range wsClients {
+		if runtime, exists := manager.wsClients[name]; exists {
+			if accepted, changed, reconnect := runtime.update(&cfg); accepted {
+				if changed {
+					serviceLog(slog.LevelInfo, "ws_client_updated", "client", name, "reconnect", reconnect)
+				}
+				continue
+			}
+		}
+		runtime := newWSClientRuntime(cfg)
+		manager.wsClients[name] = runtime
+		serviceLog(slog.LevelInfo, "ws_client_starting", "client", name, "origin", logURLOrigin(cfg.connectURL))
+		go manager.runWSClient(name, runtime)
+	}
+}
+
+func (manager *backgroundRuntimeManager) runSchedule(name string, runtime *scheduleRuntime) {
+	runtime.run()
+	manager.mu.Lock()
+	if manager.schedules[name] == runtime {
+		delete(manager.schedules, name)
+	}
+	manager.mu.Unlock()
+}
+
+func (manager *backgroundRuntimeManager) runWSClient(name string, runtime *wsClientRuntime) {
+	runtime.run()
+	manager.mu.Lock()
+	if manager.wsClients[name] == runtime {
+		delete(manager.wsClients, name)
+	}
+	manager.mu.Unlock()
+}
+
+func buildScheduleJobConfigs(config APIConfig) (map[string]scheduleJobConfig, error) {
+	result := make(map[string]scheduleJobConfig)
+	for name, endpoint := range config {
+		if strings.TrimSpace(endpoint.Type) != apiTypeSchedule {
+			continue
+		}
+		if strings.TrimSpace(endpoint.Script) == "" {
+			return nil, fmt.Errorf("schedule %s: script is missing", name)
+		}
+		trigger := endpoint.Trigger
+		trigger.Type, trigger.Value = strings.TrimSpace(trigger.Type), strings.TrimSpace(trigger.Value)
+		if trigger.Type != "cron" {
+			return nil, fmt.Errorf("schedule %s: unsupported trigger type %q", name, trigger.Type)
+		}
+		schedule, err := parseCronSchedule(trigger.Value)
+		if err != nil {
+			return nil, fmt.Errorf("schedule %s: invalid cron trigger %q: %w", name, trigger.Value, err)
+		}
+		result[name] = scheduleJobConfig{name: name, scriptPath: endpoint.Script, trigger: trigger, description: endpoint.Description, schedule: schedule}
+	}
+	return result, nil
+}
+
+func buildWSClientConfigs(config APIConfig) (map[string]wsClientConfig, error) {
+	result := make(map[string]wsClientConfig)
+	for name, endpoint := range config {
+		if strings.TrimSpace(endpoint.Type) != apiTypeWSClient {
+			continue
+		}
+		if strings.TrimSpace(endpoint.Script) == "" {
+			return nil, fmt.Errorf("ws_client %s: script is missing", name)
+		}
+		connectURL, err := resolveConnectURL(endpoint.ConnectURL)
+		if err != nil {
+			return nil, fmt.Errorf("ws_client %s: %w", name, err)
+		}
+		result[name] = wsClientConfig{name: name, scriptPath: endpoint.Script, connectURL: connectURL, description: endpoint.Description}
+	}
+	return result, nil
+}
+
+func signalRuntime(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func newScheduleRuntime(cfg scheduleJobConfig) *scheduleRuntime {
+	copy := cfg
+	return &scheduleRuntime{desired: &copy, wake: make(chan struct{}, 1), done: make(chan struct{})}
+}
+
+func sameScheduleTiming(a, b scheduleJobConfig) bool {
+	return a.name == b.name && a.scriptPath == b.scriptPath && a.trigger == b.trigger
+}
+func sameScheduleConfig(a, b scheduleJobConfig) bool {
+	return sameScheduleTiming(a, b) && a.description == b.description
+}
+
+func (runtime *scheduleRuntime) update(cfg *scheduleJobConfig) (bool, bool) {
+	runtime.mu.Lock()
+	if runtime.stopped {
+		runtime.mu.Unlock()
+		return false, false
+	}
+	if cfg == nil {
+		if runtime.desired == nil {
+			runtime.mu.Unlock()
+			return true, false
+		}
+		runtime.desired = nil
+		runtime.mu.Unlock()
+		signalRuntime(runtime.wake)
+		return true, true
+	}
+	if runtime.desired != nil && sameScheduleConfig(*runtime.desired, *cfg) {
+		runtime.mu.Unlock()
+		return true, false
+	}
+	wake := runtime.desired == nil || !sameScheduleTiming(*runtime.desired, *cfg)
+	copy := *cfg
+	runtime.desired = &copy
+	runtime.mu.Unlock()
+	if wake {
+		signalRuntime(runtime.wake)
+	}
+	return true, true
+}
+
+func (runtime *scheduleRuntime) current(stop bool) (scheduleJobConfig, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.desired == nil {
+		if stop {
+			runtime.stopped = true
+		}
+		return scheduleJobConfig{}, false
+	}
+	return *runtime.desired, true
+}
+
+func (runtime *scheduleRuntime) run() {
+	defer close(runtime.done)
+	for {
+		cfg, active := runtime.current(true)
+		if !active {
+			return
+		}
+		next := cfg.schedule.next(time.Now())
+		if next.IsZero() {
+			serviceLog(slog.LevelWarn, "schedule_no_next_run", "job", cfg.name)
+			<-runtime.wake
+			continue
+		}
+		serviceLog(slog.LevelDebug, "schedule_next_run", "job", cfg.name, "next_run", next)
+		timer := time.NewTimer(time.Until(next))
+		select {
+		case <-runtime.wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			continue
+		case <-timer.C:
+		}
+		latest, active := runtime.current(false)
+		if !active || !sameScheduleTiming(cfg, latest) {
+			continue
+		}
+		params := map[string]interface{}{"api": latest.name, "nyan_job_name": latest.name, "nyan_schedule_trigger_type": latest.trigger.Type, "nyan_schedule_trigger": latest.trigger.Value, "nyan_schedule_time": next.Format(time.RFC3339), "nyan_schedule_description": latest.description}
+		if result, err := runJavaScript(latest.scriptPath, "", params); err != nil {
+			logServiceError(slog.LevelError, "schedule_failed", err, "job", latest.name)
+		} else {
+			serviceLog(slog.LevelInfo, "schedule_completed", "job", latest.name, "result_bytes", len(result))
+		}
+	}
+}
+
+func newWSClientRuntime(cfg wsClientConfig) *wsClientRuntime {
+	copy := cfg
+	return &wsClientRuntime{desired: &copy, wake: make(chan struct{}, 1), done: make(chan struct{})}
+}
+
+func (runtime *wsClientRuntime) update(cfg *wsClientConfig) (bool, bool, bool) {
+	runtime.mu.Lock()
+	if runtime.stopped {
+		runtime.mu.Unlock()
+		return false, false, false
+	}
+	if cfg == nil {
+		if runtime.desired == nil {
+			runtime.mu.Unlock()
+			return true, false, false
+		}
+		runtime.desired = nil
+		conn, cancel := runtime.conn, runtime.dialCancel
+		runtime.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if conn != nil {
+			_ = conn.Close()
+		}
+		signalRuntime(runtime.wake)
+		return true, true, false
+	}
+	if runtime.desired != nil && *runtime.desired == *cfg {
+		runtime.mu.Unlock()
+		return true, false, false
+	}
+	reconnect := runtime.desired == nil || runtime.desired.connectURL != cfg.connectURL
+	copy := *cfg
+	runtime.desired = &copy
+	conn, cancel := runtime.conn, runtime.dialCancel
+	runtime.mu.Unlock()
+	if reconnect {
+		if cancel != nil {
+			cancel()
+		}
+		if conn != nil {
+			_ = conn.Close()
+		}
+		signalRuntime(runtime.wake)
+	}
+	return true, true, reconnect
+}
+
+func (runtime *wsClientRuntime) current(stop bool) (wsClientConfig, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.desired == nil {
+		if stop {
+			runtime.stopped = true
+		}
+		return wsClientConfig{}, false
+	}
+	return *runtime.desired, true
+}
+
+func (runtime *wsClientRuntime) beginDial(cfg wsClientConfig) (context.Context, context.CancelFunc, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.stopped || runtime.desired == nil || runtime.desired.connectURL != cfg.connectURL {
+		return nil, nil, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime.dialCancel = cancel
+	return ctx, cancel, true
+}
+
+func (runtime *wsClientRuntime) finishDial(cancel context.CancelFunc) {
+	runtime.mu.Lock()
+	runtime.dialCancel = nil
+	runtime.mu.Unlock()
+	cancel()
+}
+func (runtime *wsClientRuntime) acceptConnection(conn *websocket.Conn, url string) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.stopped || runtime.desired == nil || runtime.desired.connectURL != url {
+		return false
+	}
+	runtime.conn = conn
+	return true
+}
+func (runtime *wsClientRuntime) clearConnection(conn *websocket.Conn) {
+	runtime.mu.Lock()
+	if runtime.conn == conn {
+		runtime.conn = nil
+	}
+	runtime.mu.Unlock()
+}
+
+func (runtime *wsClientRuntime) run() {
+	defer close(runtime.done)
+	backoff := time.Second
+	for {
+		cfg, active := runtime.current(true)
+		if !active {
+			return
+		}
+		connected, err := runtime.connectAndListen(cfg)
+		latest, active := runtime.current(true)
+		if !active {
+			return
+		}
+		if latest.connectURL != cfg.connectURL {
+			select {
+			case <-runtime.wake:
+			default:
+			}
+			backoff = time.Second
+			continue
+		}
+		if err != nil {
+			logWebSocketDisconnect("ws_client_disconnected", cfg.name, err)
+		}
+		if connected {
+			backoff = time.Second
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-runtime.wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			backoff = time.Second
+		case <-timer.C:
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+		}
+	}
+}
+
+// connectAndListen reports whether a connection was established, even if it later failed.
+func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) (bool, error) {
+	ctx, cancel, ok := runtime.beginDial(cfg)
+	if !ok {
+		return false, nil
+	}
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, cfg.connectURL, nil)
+	runtime.finishDial(cancel)
+	if err != nil {
+		return false, fmt.Errorf("dial failed: %w", err)
+	}
+	if !runtime.acceptConnection(conn, cfg.connectURL) {
+		_ = conn.Close()
+		return false, nil
+	}
+	serviceLog(slog.LevelInfo, "ws_client_connected", "client", cfg.name)
+	defer runtime.clearConnection(conn)
+	defer conn.Close()
+	for {
+		msgType, data, err := conn.ReadMessage()
+		if err != nil {
+			return true, fmt.Errorf("read error: %w", err)
+		}
+		latest, active := runtime.current(false)
+		if !active || latest.connectURL != cfg.connectURL {
+			return true, nil
+		}
+		serviceLog(slog.LevelDebug, "ws_client_message_received", "client", latest.name, "message_type", websocketMessageTypeLabel(msgType), "bytes", len(data))
+		params := map[string]interface{}{"api": latest.name, "ws_client": latest.name, "ws_message_type": websocketMessageTypeLabel(msgType), "ws_message_text": string(data), "ws_connect_url": latest.connectURL, "ws_description": latest.description}
+		if msgType == websocket.BinaryMessage {
+			params["ws_message_base64"] = base64.StdEncoding.EncodeToString(data)
+		}
+		if msgType == websocket.TextMessage {
+			var decoded interface{}
+			if json.Unmarshal(data, &decoded) == nil {
+				params["ws_message_json"] = decoded
+			}
+		}
+		result, err := runJavaScript(latest.scriptPath, "", params)
+		if err != nil {
+			logServiceError(slog.LevelError, "ws_client_script_failed", err, "client", latest.name)
+			continue
+		}
+		if result = strings.TrimSpace(result); result != "" {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(result)); err != nil {
+				return true, fmt.Errorf("send error: %w", err)
+			}
+		}
+	}
+}
+
+// MCP/OAuth execution is intentionally delegated to JavaScript. Go only
+// transports request data to the configured hook and serializes its result.
+type mcpRPCRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
+}
+
+type mcpRuntimeURLs struct{ Origin, Resource, Issuer, AuthorizationServerMetadata, ProtectedResourceMetadata, AuthorizationEndpoint, TokenEndpoint, RegistrationEndpoint string }
+
+var mcpDNSLabelPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+
+func deriveMCPRuntimeURLs(request *http.Request, name string, mcp EndpointConfig) (mcpRuntimeURLs, error) {
+	if request == nil || request.URL == nil {
+		return mcpRuntimeURLs{}, fmt.Errorf("request URL unavailable")
+	}
+	scheme := strings.ToLower(request.URL.Scheme)
+	if scheme == "" {
+		if request.TLS != nil {
+			scheme = "https"
+		} else {
+			scheme = "http"
+		}
+	}
+	if scheme != "http" && scheme != "https" {
+		return mcpRuntimeURLs{}, fmt.Errorf("invalid scheme")
+	}
+	parsed, err := url.Parse("//" + strings.TrimSpace(request.Host))
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Path != "" {
+		return mcpRuntimeURLs{}, fmt.Errorf("invalid host")
+	}
+	hostname := parsed.Hostname()
+	if net.ParseIP(hostname) == nil {
+		for _, label := range strings.Split(hostname, ".") {
+			if !mcpDNSLabelPattern.MatchString(label) {
+				return mcpRuntimeURLs{}, fmt.Errorf("invalid host")
+			}
+		}
+	}
+	if port := parsed.Port(); port != "" {
+		number, e := strconv.Atoi(port)
+		if e != nil || number < 1 || number > 65535 {
+			return mcpRuntimeURLs{}, fmt.Errorf("invalid port")
+		}
+	}
+	authority := parsed.Host
+	origin := scheme + "://" + authority
+	apiURL := func(api string) string {
+		if api == "" {
+			return ""
+		}
+		path, e := canonicalAPIEndpointPath(api)
+		if e != nil {
+			return ""
+		}
+		return origin + path
+	}
+	path, _ := canonicalAPIEndpointPath(name)
+	return mcpRuntimeURLs{Origin: origin, Resource: origin + path, Issuer: origin, AuthorizationServerMetadata: apiURL(mcp.OAuth.AuthorizationServerMetadata), ProtectedResourceMetadata: apiURL(mcp.OAuth.ProtectedResourceMetadataAPI), AuthorizationEndpoint: apiURL(mcp.OAuth.Authorize), TokenEndpoint: apiURL(mcp.OAuth.Token), RegistrationEndpoint: apiURL(mcp.OAuth.Register)}, nil
+}
+
+func dispatchMCPOrOAuth(c *gin.Context) bool {
+	snapshot := currentAPISnapshot()
+	if snapshot == nil {
+		return false
+	}
+	apiName := strings.Trim(strings.TrimSpace(c.Request.URL.Path), "/")
+	if c.Request.URL.Path == "/" {
+		apiName = strings.TrimSpace(c.Query("api"))
+	}
+	for name, mcp := range snapshot.Config {
+		if mcp.Type != apiTypeMCP || mcp.Transport != "streamable_http" {
+			continue
+		}
+		if apiName == name {
+			handleMCPHTTP(c, snapshot, name, mcp)
+			return true
+		}
+		if role, ok := mcpOAuthRoleForAPI(mcp, apiName); ok {
+			handleOAuthJavaScript(c, snapshot, name, mcp, role)
+			return true
+		}
+	}
+	return false
+}
+
+func mcpOAuthRoleForAPI(mcp EndpointConfig, apiName string) (string, bool) {
+	refs := []struct{ api, role string }{{mcp.OAuth.AuthorizationServerMetadata, "authorizationServerMetadata"}, {mcp.OAuth.ProtectedResourceMetadataAPI, "protectedResourceMetadata"}, {mcp.OAuth.Authorize, "oauthAuthorize"}, {mcp.OAuth.Token, "oauthToken"}, {mcp.OAuth.Register, "oauthRegister"}, {mcp.OAuth.VerifyAccess, "oauthValidateAccessToken"}}
+	for _, ref := range refs {
+		if ref.api != "" && ref.api == apiName {
+			return ref.role, true
+		}
+	}
+	return "", false
+}
+
+func handleMCPHTTP(c *gin.Context, snapshot *APIConfigSnapshot, endpointName string, mcp EndpointConfig) {
+	runtimeURLs, err := deriveMCPRuntimeURLs(c.Request, endpointName, mcp)
+	if err != nil {
+		c.JSON(http.StatusMisdirectedRequest, gin.H{"error": "invalid Host"})
+		return
+	}
+	if !mcpOriginAllowed(c.Request.Header.Get("Origin"), mcp, runtimeURLs.Origin) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "origin is not allowed"})
+		return
+	}
+	if origin := strings.TrimSpace(c.Request.Header.Get("Origin")); origin != "" {
+		c.Header("Access-Control-Allow-Origin", origin)
+		c.Header("Vary", "Origin")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, MCP-Protocol-Version, MCP-Session-Id, Last-Event-ID")
+		c.Header("Access-Control-Allow-Methods", "POST, OPTIONS")
+		c.Header("Access-Control-Expose-Headers", "WWW-Authenticate, MCP-Protocol-Version, Retry-After")
+	}
+	if c.Request.Method == http.MethodOptions {
+		c.Status(http.StatusNoContent)
+		return
+	}
+	if c.Request.Method != http.MethodPost {
+		c.Header("Allow", "POST, OPTIONS")
+		c.Status(http.StatusMethodNotAllowed)
+		return
+	}
+	if allowed, retryAfter := mcpRateLimitAllows(endpointName, mcp.RateLimit, c.Request.RemoteAddr, time.Now()); !allowed {
+		c.Header("Retry-After", strconv.Itoa(max(1, int(math.Ceil(retryAfter.Seconds())))))
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
+		return
+	}
+	release, acquired := acquireMCPExecutionSlot(endpointName, mcpMaxConcurrent(mcp))
+	if !acquired {
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP server is busy"})
+		return
+	}
+	defer release()
+	contentType, _, contentTypeErr := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if contentTypeErr != nil || contentType != "application/json" {
+		c.JSON(http.StatusUnsupportedMediaType, gin.H{"error": "Content-Type must be application/json"})
+		return
+	}
+	if !strings.Contains(c.GetHeader("Accept"), "application/json") || !strings.Contains(c.GetHeader("Accept"), "text/event-stream") {
+		c.JSON(http.StatusNotAcceptable, gin.H{"error": "Accept must include application/json and text/event-stream"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20+1))
+	if err != nil || len(body) > 1<<20 {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
+		return
+	}
+	if len(bytes.TrimSpace(body)) == 0 || bytes.HasPrefix(bytes.TrimSpace(body), []byte("[")) {
+		mcpWriteError(c, nil, -32600, "Invalid Request")
+		return
+	}
+	if err := validateNoDuplicateJSONKeys(body); err != nil {
+		mcpWriteError(c, nil, -32600, "Invalid Request")
+		return
+	}
+	var request mcpRPCRequest
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(&request); err != nil || decoder.Decode(&struct{}{}) != io.EOF || request.JSONRPC != "2.0" || request.Method == "" || !validMCPRequestID(request.ID) {
+		mcpWriteError(c, nil, -32700, "Parse error")
+		return
+	}
+	if request.Method == "initialize" {
+		var params map[string]interface{}
+		_ = json.Unmarshal(request.Params, &params)
+		version, _ := params["protocolVersion"].(string)
+		if version == "" {
+			mcpWriteError(c, request.ID, -32602, "protocolVersion is required")
+			return
+		}
+		if len(mcp.ProtocolVersions) > 0 {
+			supported := false
+			for _, candidate := range mcp.ProtocolVersions {
+				if candidate == version {
+					supported = true
+					break
+				}
+			}
+			if !supported {
+				mcpWriteError(c, request.ID, -32602, "unsupported protocolVersion")
+				return
+			}
+		}
+		c.Header("MCP-Protocol-Version", version)
+		mcpWriteResult(c, request.ID, mcpInitializeResult(mcp, version))
+		return
+	}
+	protocolVersion := c.GetHeader("MCP-Protocol-Version")
+	if !mcpProtocolVersionAllowed(protocolVersion, mcp.ProtocolVersions) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "MCP-Protocol-Version is missing or unsupported"})
+		return
+	}
+	if len(bytes.TrimSpace(request.ID)) == 0 {
+		c.Status(http.StatusAccepted)
+		return
+	}
+	switch request.Method {
+	case "ping":
+		mcpWriteResult(c, request.ID, map[string]interface{}{})
+	case "tools/list":
+		mcpWriteResult(c, request.ID, map[string]interface{}{"tools": mcpToolListForTransport(mcp, true)})
+	case "tools/call":
+		handleMCPToolCall(c, snapshot, endpointName, mcp, runtimeURLs, request)
+	default:
+		mcpWriteError(c, request.ID, -32601, "Method not found")
+	}
+}
+
+func mcpProtocolVersionAllowed(version string, allowed []string) bool {
+	if strings.TrimSpace(version) == "" {
+		return false
+	}
+	for _, candidate := range allowed {
+		if version == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func mcpRateLimitAllows(endpointName string, limit *MCPRateLimit, remoteAddress string, now time.Time) (bool, time.Duration) {
+	if limit == nil {
+		return true, 0
+	}
+	window, err := time.ParseDuration(limit.Window)
+	if err != nil || window <= 0 || limit.Requests <= 0 {
+		return false, time.Second
+	}
+	host := remoteAddress
+	if parsed, _, err := net.SplitHostPort(remoteAddress); err == nil {
+		host = parsed
+	}
+	key := endpointName + "\x00" + host + "\x00" + strconv.Itoa(limit.Requests) + "\x00" + window.String()
+	mcpRateBuckets.Lock()
+	defer mcpRateBuckets.Unlock()
+	if mcpRateBuckets.LastCleanup.IsZero() || now.Sub(mcpRateBuckets.LastCleanup) >= time.Minute {
+		for bucketKey, bucket := range mcpRateBuckets.Buckets {
+			if now.Sub(bucket.StartedAt) >= bucket.Window*2 {
+				delete(mcpRateBuckets.Buckets, bucketKey)
+			}
+		}
+		mcpRateBuckets.LastCleanup = now
+	}
+	bucket, exists := mcpRateBuckets.Buckets[key]
+	if !exists || now.Before(bucket.StartedAt) || now.Sub(bucket.StartedAt) >= window {
+		mcpRateBuckets.Buckets[key] = mcpRateBucket{StartedAt: now, Window: window, Count: 1}
+		return true, 0
+	}
+	if bucket.Count >= limit.Requests {
+		return false, window - now.Sub(bucket.StartedAt)
+	}
+	bucket.Count++
+	mcpRateBuckets.Buckets[key] = bucket
+	return true, 0
+}
+
+func mcpMaxConcurrent(endpoint EndpointConfig) int {
+	if endpoint.MaxConcurrent > 0 {
+		return endpoint.MaxConcurrent
+	}
+	return 16
+}
+
+func mcpConcurrencyKey(endpointName string, limit int) string {
+	return endpointName + "\x00" + strconv.Itoa(limit)
+}
+
+// Publication holds apiConfigMu before taking the limiter lock here.
+// Acquisition and release take only the limiter lock, never apiConfigMu.
+func reconcileMCPConcurrencyLimiters(config APIConfig) {
+	current := make(map[string]bool)
+	for name, endpoint := range config {
+		if endpoint.Type == apiTypeMCP && endpoint.Transport == "streamable_http" {
+			current[mcpConcurrencyKey(name, mcpMaxConcurrent(endpoint))] = true
+		}
+	}
+	mcpConcurrencyLimiters.Lock()
+	defer mcpConcurrencyLimiters.Unlock()
+	mcpConcurrencyLimiters.Current = current
+	for key, limiter := range mcpConcurrencyLimiters.Limiters {
+		if !current[key] && len(limiter) == 0 {
+			delete(mcpConcurrencyLimiters.Limiters, key)
+		}
+	}
+}
+
+func acquireMCPExecutionSlot(endpointName string, limit int) (func(), bool) {
+	key := mcpConcurrencyKey(endpointName, limit)
+	mcpConcurrencyLimiters.Lock()
+	defer mcpConcurrencyLimiters.Unlock()
+	limiter := mcpConcurrencyLimiters.Limiters[key]
+	if limiter == nil {
+		limiter = make(chan struct{}, limit)
+		mcpConcurrencyLimiters.Limiters[key] = limiter
+	}
+	// Keep lookup and acquisition atomic with removal of unused limiters.
+	select {
+	case limiter <- struct{}{}:
+		return func() {
+			mcpConcurrencyLimiters.Lock()
+			defer mcpConcurrencyLimiters.Unlock()
+			<-limiter
+			// This also reclaims entries acquired later by an old snapshot.
+			if !mcpConcurrencyLimiters.Current[key] && len(limiter) == 0 {
+				delete(mcpConcurrencyLimiters.Limiters, key)
+			}
+		}, true
+	default:
+		return func() {}, false
+	}
+}
+
+func handleMCPToolCall(c *gin.Context, snapshot *APIConfigSnapshot, endpointName string, mcp EndpointConfig, runtimeURLs mcpRuntimeURLs, request mcpRPCRequest) {
+	var params struct {
+		Name      string                 `json:"name"`
+		Arguments map[string]interface{} `json:"arguments"`
+	}
+	if err := json.Unmarshal(request.Params, &params); err != nil || params.Name == "" {
+		mcpWriteError(c, request.ID, -32602, "Invalid params")
+		return
+	}
+	var tool MCPToolConfig
+	for _, candidate := range mcp.Tools {
+		if candidate.Name == params.Name {
+			tool = candidate
+			break
+		}
+	}
+	if tool.Name == "" {
+		mcpWriteError(c, request.ID, -32602, "Unknown tool")
+		return
+	}
+	principal, authenticated := interface{}(map[string]interface{}{"anonymous": true, "transport": "streamable_http"}), true
+	if mcpOAuthConfigured(mcp.OAuth) {
+		principal, authenticated = invokeOAuthHook(c, snapshot, endpointName, mcp, runtimeURLs, "oauthValidateAccessToken", map[string]interface{}{"authorization": c.GetHeader("Authorization"), "tool": tool.Name, "required_scopes": mcpToolScopes(tool)})
+	}
+	if !authenticated {
+		challenge := fmt.Sprintf(`Bearer resource_metadata="%s", scope="%s"`, runtimeURLs.ProtectedResourceMetadata, strings.Join(mcpToolScopes(tool), " "))
+		c.Header("WWW-Authenticate", challenge)
+		mcpWriteHTTPResult(c, request.ID, http.StatusUnauthorized, map[string]interface{}{"content": []map[string]interface{}{{"type": "text", "text": "Authentication required."}}, "isError": true, "_meta": map[string]interface{}{"mcp/www_authenticate": []string{challenge}}})
+		return
+	}
+	if params.Arguments == nil {
+		params.Arguments = map[string]interface{}{}
+	}
+	for key := range params.Arguments {
+		if key == "api" || key == "mcp_principal" || key == "mcp_tool" || strings.HasPrefix(key, "_headers") || strings.HasPrefix(key, "_remote") {
+			mcpWriteError(c, request.ID, -32602, "Tool arguments contain a reserved parameter")
+			return
+		}
+	}
+	if err := validateMCPJSONSchemaValue(tool.InputSchema, params.Arguments); err != nil {
+		mcpWriteError(c, request.ID, -32602, "Tool arguments do not match inputSchema")
+		return
+	}
+	payload, toolError := executeMCPToolWithContext(snapshot, c, tool, params.Arguments, principal)
+	if toolError != "" {
+		mcpWriteHTTPResult(c, request.ID, http.StatusOK, map[string]interface{}{"content": []map[string]interface{}{{"type": "text", "text": toolError}}, "isError": true})
+		return
+	}
+	mcpWriteResult(c, request.ID, payload)
+}
+
+func mcpToolScopes(tool MCPToolConfig) []string {
+	result := []string{}
+	seen := map[string]bool{}
+	for _, scheme := range tool.SecuritySchemes {
+		raw, ok := scheme["scopes"].([]interface{})
+		if ok {
+			for _, item := range raw {
+				value, ok := item.(string)
+				if ok && !seen[value] {
+					seen[value] = true
+					result = append(result, value)
+				}
+			}
+		}
+		if typed, ok := scheme["scopes"].([]string); ok {
+			for _, value := range typed {
+				if !seen[value] {
+					seen[value] = true
+					result = append(result, value)
+				}
+			}
+		}
+	}
+	return result
+}
+
+func invokeOAuthHook(c *gin.Context, snapshot *APIConfigSnapshot, endpointName string, mcp EndpointConfig, runtimeURLs mcpRuntimeURLs, hookName string, extra map[string]interface{}) (interface{}, bool) {
+	apiName := map[string]string{"oauthRegister": mcp.OAuth.Register, "oauthAuthorize": mcp.OAuth.Authorize, "oauthToken": mcp.OAuth.Token, "oauthValidateAccessToken": mcp.OAuth.VerifyAccess}[hookName]
+	backing, exists := snapshot.Config[apiName]
+	hookPath := strings.TrimSpace(backing.Script)
+	if !exists || hookPath == "" {
+		return nil, false
+	}
+	apiPath, pathErr := canonicalAPIEndpointPath(apiName)
+	if pathErr != nil {
+		return nil, false
+	}
+	params := map[string]interface{}{"oauth_hook": hookName, "oauth_api": apiName, "method": c.Request.Method, "request_path": c.Request.URL.Path, "path": apiPath, "endpoint": endpointName, "mcp_api_name": endpointName, "issuer": runtimeURLs.Issuer, "resource": runtimeURLs.Resource, "authorization_server_metadata_url": runtimeURLs.AuthorizationServerMetadata, "protected_resource_metadata_url": runtimeURLs.ProtectedResourceMetadata, "authorization_endpoint": runtimeURLs.AuthorizationEndpoint, "token_endpoint": runtimeURLs.TokenEndpoint, "registration_endpoint": runtimeURLs.RegistrationEndpoint, "scopes": mcp.OAuth.Scopes, "redirect_uri_allowed_prefixes": mcp.RedirectURIAllowedPrefixes, "state_directory": mcpOAuthStateDirectory(snapshot, endpointName), "authorization": c.GetHeader("Authorization")}
+	for key, value := range extra {
+		params[key] = value
+	}
+	if c.Request.URL != nil {
+		params["query"] = c.Request.URL.Query()
+	}
+	params["headers"] = c.Request.Header
+	cookies := map[string]string{}
+	for _, cookie := range c.Request.Cookies() {
+		cookies[cookie.Name] = cookie.Value
+	}
+	params["cookies"] = cookies
+	if c.Request.Method == http.MethodPost {
+		contentType := c.GetHeader("Content-Type")
+		if strings.HasPrefix(contentType, "application/json") {
+			data, readErr := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20+1))
+			if readErr == nil && len(data) <= 1<<20 {
+				var body interface{}
+				if json.Unmarshal(data, &body) == nil {
+					params["body"] = body
+				}
+				c.Request.Body = io.NopCloser(bytes.NewReader(data))
+			}
+		} else {
+			_ = c.Request.ParseForm()
+			params["form"] = c.Request.PostForm
+		}
+	}
+	value, err := runJavaScriptValueWithContext(snapshot, c, hookPath, "", params)
+	if err != nil || value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
+		return nil, false
+	}
+	exported := value.Export()
+	if result, ok := exported.(map[string]interface{}); ok {
+		if allowed, exists := result["allowed"].(bool); exists {
+			return result["principal"], allowed
+		}
+		if authenticated, exists := result["authenticated"].(bool); exists {
+			return result["principal"], authenticated
+		}
+	}
+	if hookName == "oauthValidateAccessToken" {
+		return nil, false
+	}
+	return exported, true
+}
+
+func handleOAuthJavaScript(c *gin.Context, snapshot *APIConfigSnapshot, endpointName string, mcp EndpointConfig, role string) {
+	runtimeURLs, err := deriveMCPRuntimeURLs(c.Request, endpointName, mcp)
+	if err != nil {
+		c.JSON(http.StatusMisdirectedRequest, gin.H{"error": "invalid Host"})
+		return
+	}
+	if !mcpOriginAllowed(c.GetHeader("Origin"), mcp, runtimeURLs.Origin) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "origin is not allowed"})
+		return
+	}
+	if role == "authorizationServerMetadata" || role == "protectedResourceMetadata" {
+		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodOptions {
+			c.Header("Allow", "GET, OPTIONS")
+			c.Status(http.StatusMethodNotAllowed)
+			return
+		}
+		if c.Request.Method == http.MethodOptions {
+			c.Status(http.StatusNoContent)
+			return
+		}
+		if role == "authorizationServerMetadata" {
+			c.JSON(http.StatusOK, gin.H{"issuer": runtimeURLs.Issuer, "authorization_endpoint": runtimeURLs.AuthorizationEndpoint, "token_endpoint": runtimeURLs.TokenEndpoint, "registration_endpoint": runtimeURLs.RegistrationEndpoint, "response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"}, "token_endpoint_auth_methods_supported": []string{"none"}, "code_challenge_methods_supported": []string{"S256"}, "scopes_supported": mcp.OAuth.Scopes})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"resource": runtimeURLs.Resource, "authorization_servers": []string{runtimeURLs.Issuer}, "scopes_supported": mcp.OAuth.Scopes})
+		return
+	}
+	hookName := role
+	if hookName == "oauthValidateAccessToken" || hookName == "" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	value, ok := invokeOAuthHook(c, snapshot, endpointName, mcp, runtimeURLs, hookName, map[string]interface{}{})
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "OAuth hook denied the request"})
+		return
+	}
+	if response, isResponse := value.(map[string]interface{}); isResponse {
+		if rawStatus, exists := response["status"]; exists {
+			status, _ := parseStatusCode(rawStatus)
+			contentType, _ := response["contentType"].(string)
+			body, _ := jsBodyToBytes(response["body"])
+			if headers, ok := response["headers"].(map[string]interface{}); ok {
+				for key, value := range headers {
+					c.Header(key, fmt.Sprint(value))
+				}
+			}
+			if contentType == "" {
+				contentType = "application/json; charset=utf-8"
+			}
+			c.Data(status, contentType, body)
+			return
+		}
+	}
+	c.JSON(http.StatusOK, value)
+}
+
+func mcpOriginAllowed(origin string, mcp EndpointConfig, requestOrigin string) bool {
+	if origin == "" {
+		return true
+	}
+	for _, allowed := range mcp.AllowedOrigins {
+		if strings.TrimSuffix(origin, "/") == strings.TrimSuffix(allowed, "/") {
+			return true
+		}
+	}
+	return strings.EqualFold(strings.TrimSuffix(origin, "/"), strings.TrimSuffix(requestOrigin, "/"))
+}
+
+func mcpOAuthStateDirectory(snapshot *APIConfigSnapshot, name string) string {
+	root := strings.TrimSpace(globalConfig.OAuthStateRoot)
+	if root == "" && snapshot != nil {
+		source := snapshot.Sources[name]
+		if source == "" {
+			source = snapshot.RootPath
+		}
+		root = filepath.Join(filepath.Dir(source), "oauth-state")
+	}
+	return filepath.Join(root, filepath.FromSlash(name))
+}
+
+func mcpWriteResult(c *gin.Context, id json.RawMessage, result interface{}) {
+	mcpWriteHTTPResult(c, id, http.StatusOK, map[string]interface{}{"jsonrpc": "2.0", "id": rawMCPID(id), "result": result})
+}
+
+func mcpWriteError(c *gin.Context, id json.RawMessage, code int, message string) {
+	mcpWriteHTTPResult(c, id, http.StatusOK, map[string]interface{}{"jsonrpc": "2.0", "id": rawMCPID(id), "error": map[string]interface{}{"code": code, "message": message}})
+}
+
+func mcpWriteHTTPResult(c *gin.Context, id json.RawMessage, status int, payload interface{}) {
+	object, isObject := payload.(map[string]interface{})
+	if !isObject || object["jsonrpc"] == nil {
+		payload = map[string]interface{}{"jsonrpc": "2.0", "id": rawMCPID(id), "result": payload}
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		status = http.StatusInternalServerError
+		encoded = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"MCP response could not be serialized"}}`)
+	} else if len(encoded) > maxMCPResponseBytes {
+		status = http.StatusInternalServerError
+		encoded = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"MCP response is too large"}}`)
+	}
+	c.Data(status, "application/json; charset=utf-8", encoded)
+}
+
+func rawMCPID(id json.RawMessage) interface{} {
+	if len(id) == 0 {
+		return nil
+	}
+	return id
+}
+
+type mcpStdioLifecycle int
+
+const (
+	mcpStdioCreated mcpStdioLifecycle = iota
+	mcpStdioWaitingForInitialized
+	mcpStdioReady
+)
+
+type mcpStdioProtocolResponse struct {
+	Payload interface{}
+	Respond bool
+}
+
+func selectMCPStdioServer(snapshot *APIConfigSnapshot, name string) (EndpointConfig, error) {
+	if snapshot == nil {
+		return EndpointConfig{}, fmt.Errorf("API snapshot is unavailable")
+	}
+	mcp, ok := snapshot.Config[name]
+	if !ok || mcp.Type != apiTypeMCP {
+		return EndpointConfig{}, fmt.Errorf("MCP API %q was not found", name)
+	}
+	if mcp.Transport != "stdio" {
+		return EndpointConfig{}, fmt.Errorf("MCP API %q does not use stdio", name)
+	}
+	return mcp, nil
+}
+
+func serveMCPStdio(input io.Reader, output io.Writer, snapshot *APIConfigSnapshot, mcp EndpointConfig) error {
+	if input == nil || output == nil || snapshot == nil {
+		return fmt.Errorf("stdio MCP input, output, and snapshot are required")
+	}
+	if mcp.Transport != "stdio" {
+		return fmt.Errorf("selected MCP does not use stdio")
+	}
+	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 64<<10), (1<<20)+1)
+	state := mcpStdioCreated
+	for scanner.Scan() {
+		message := append([]byte(nil), scanner.Bytes()...)
+		if len(message) > 1<<20 {
+			return fmt.Errorf("stdio MCP message exceeds 1 MiB")
+		}
+		response := handleMCPStdioMessage(snapshot, mcp, &state, message)
+		if response.Respond {
+			if err := writeMCPStdioMessage(output, response.Payload); err != nil {
+				return err
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("stdio MCP input failed: %w", err)
+	}
+	return nil
+}
+
+func handleMCPStdioMessage(snapshot *APIConfigSnapshot, mcp EndpointConfig, state *mcpStdioLifecycle, message []byte) mcpStdioProtocolResponse {
+	request, code, msg := decodeMCPStdioRequest(message)
+	if code != 0 {
+		return mcpStdioError(nil, code, msg)
+	}
+	notification := len(request.ID) == 0
+	if request.Method == "notifications/initialized" {
+		if !notification {
+			return mcpStdioError(request.ID, -32600, "notifications/initialized must be a notification")
+		}
+		if *state == mcpStdioWaitingForInitialized && mcpParamsAreObjectOrEmpty(request.Params) {
+			*state = mcpStdioReady
+		}
+		return mcpStdioProtocolResponse{}
+	}
+	if notification {
+		return mcpStdioProtocolResponse{}
+	}
+	if request.Method == "initialize" {
+		if *state != mcpStdioCreated {
+			return mcpStdioError(request.ID, -32600, "MCP server is already initialized")
+		}
+		var params struct {
+			ProtocolVersion string                 `json:"protocolVersion"`
+			Capabilities    map[string]interface{} `json:"capabilities"`
+			ClientInfo      map[string]interface{} `json:"clientInfo"`
+			Meta            map[string]interface{} `json:"_meta"`
+		}
+		if !decodeMCPParams(request.Params, &params) || !mcpProtocolVersionAllowed(params.ProtocolVersion, mcp.ProtocolVersions) {
+			return mcpStdioError(request.ID, -32602, "unsupported or missing protocolVersion")
+		}
+		*state = mcpStdioWaitingForInitialized
+		return mcpStdioResult(request.ID, mcpInitializeResult(mcp, params.ProtocolVersion))
+	}
+	if *state != mcpStdioReady {
+		return mcpStdioError(request.ID, -32002, "MCP server is not initialized")
+	}
+	switch request.Method {
+	case "ping":
+		if !mcpParamsAreObjectOrEmpty(request.Params) {
+			return mcpStdioError(request.ID, -32602, "Invalid params")
+		}
+		return mcpStdioResult(request.ID, map[string]interface{}{})
+	case "tools/list":
+		if !mcpParamsAreObjectOrEmpty(request.Params) {
+			return mcpStdioError(request.ID, -32602, "Invalid params")
+		}
+		return mcpStdioResult(request.ID, map[string]interface{}{"tools": mcpToolListForTransport(mcp, false)})
+	case "tools/call":
+		return handleMCPStdioToolCall(snapshot, mcp, request)
+	default:
+		return mcpStdioError(request.ID, -32601, "Method not found")
+	}
+}
+
+func decodeMCPStdioRequest(message []byte) (mcpRPCRequest, int, string) {
+	trimmed := bytes.TrimSpace(message)
+	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		return mcpRPCRequest{}, -32700, "Parse error"
+	}
+	if trimmed[0] != '{' {
+		return mcpRPCRequest{}, -32600, "Invalid Request"
+	}
+	if validateNoDuplicateJSONKeys(trimmed) != nil {
+		return mcpRPCRequest{}, -32600, "Invalid Request"
+	}
+	var request mcpRPCRequest
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.UseNumber()
+	if decoder.Decode(&request) != nil || request.JSONRPC != "2.0" || strings.TrimSpace(request.Method) == "" || !validMCPRequestID(request.ID) {
+		return mcpRPCRequest{}, -32600, "Invalid Request"
+	}
+	return request, 0, ""
+}
+func validMCPRequestID(id json.RawMessage) bool {
+	if len(id) == 0 {
+		return true
+	}
+	var value interface{}
+	decoder := json.NewDecoder(bytes.NewReader(id))
+	decoder.UseNumber()
+	if decoder.Decode(&value) != nil {
+		return false
+	}
+	switch value.(type) {
+	case string, json.Number, nil:
+		return true
+	}
+	return false
+}
+func decodeMCPParams(raw json.RawMessage, target interface{}) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return true
+	}
+	if validateNoDuplicateJSONKeys(raw) != nil {
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(target) == nil
+}
+func mcpParamsAreObjectOrEmpty(raw json.RawMessage) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return true
+	}
+	var value map[string]interface{}
+	return json.Unmarshal(raw, &value) == nil
+}
+func mcpInitializeResult(mcp EndpointConfig, version string) map[string]interface{} {
+	return map[string]interface{}{"protocolVersion": version, "capabilities": map[string]interface{}{"tools": map[string]interface{}{"listChanged": false}}, "serverInfo": map[string]interface{}{"name": globalConfig.Name, "version": globalConfig.Version}, "instructions": mcp.Instructions}
+}
+func mcpToolListForTransport(mcp EndpointConfig, httpSecurity bool) []map[string]interface{} {
+	tools := make([]map[string]interface{}, 0, len(mcp.Tools))
+	for _, tool := range mcp.Tools {
+		entry := map[string]interface{}{"name": tool.Name, "title": tool.Title, "description": tool.Description, "inputSchema": tool.InputSchema}
+		if tool.OutputSchema != nil {
+			entry["outputSchema"] = tool.OutputSchema
+		}
+		if httpSecurity && len(tool.SecuritySchemes) != 0 {
+			entry["securitySchemes"] = tool.SecuritySchemes
+			entry["_meta"] = map[string]interface{}{"securitySchemes": tool.SecuritySchemes}
+		}
+		if tool.Annotations != nil {
+			entry["annotations"] = tool.Annotations
+		}
+		tools = append(tools, entry)
+	}
+	return tools
+}
+func handleMCPStdioToolCall(snapshot *APIConfigSnapshot, mcp EndpointConfig, request mcpRPCRequest) mcpStdioProtocolResponse {
+	var params struct {
+		Name      string                 `json:"name"`
+		Arguments map[string]interface{} `json:"arguments"`
+	}
+	if !decodeMCPParams(request.Params, &params) || params.Name == "" {
+		return mcpStdioError(request.ID, -32602, "Invalid params")
+	}
+	var tool *MCPToolConfig
+	for index := range mcp.Tools {
+		if mcp.Tools[index].Name == params.Name {
+			tool = &mcp.Tools[index]
+			break
+		}
+	}
+	if tool == nil {
+		return mcpStdioError(request.ID, -32602, "Unknown tool")
+	}
+	scopes := mcpToolScopes(*tool)
+	principal := map[string]interface{}{"user_id": "local-process", "username": "local-process", "client_id": "stdio", "transport": "stdio", "scope": strings.Join(scopes, " "), "scopes": scopes}
+	payload, toolError := executeMCPTool(snapshot, *tool, params.Arguments, principal)
+	if toolError != "" {
+		return mcpStdioResult(request.ID, map[string]interface{}{"content": []map[string]interface{}{{"type": "text", "text": toolError}}, "isError": true})
+	}
+	return mcpStdioResult(request.ID, payload)
+}
+func executeMCPTool(snapshot *APIConfigSnapshot, tool MCPToolConfig, arguments map[string]interface{}, principal interface{}) (map[string]interface{}, string) {
+	return executeMCPToolWithContext(snapshot, nil, tool, arguments, principal)
+}
+
+func executeMCPToolWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Context, tool MCPToolConfig, arguments map[string]interface{}, principal interface{}) (map[string]interface{}, string) {
+	if arguments == nil {
+		arguments = map[string]interface{}{}
+	}
+	if validateMCPJSONSchemaValue(tool.InputSchema, arguments) != nil {
+		return nil, "Tool arguments do not match inputSchema."
+	}
+	args := map[string]interface{}{}
+	for key, value := range arguments {
+		if key == "api" || key == "mcp_principal" || key == "mcp_tool" || strings.HasPrefix(key, "_headers") || strings.HasPrefix(key, "_remote") {
+			return nil, "Tool arguments contain a reserved parameter."
+		}
+		args[key] = value
+	}
+	args["api"], args["mcp_principal"], args["mcp_tool"] = tool.API, principal, tool.Name
+	backing, ok := snapshot.Config[tool.API]
+	if !ok {
+		return nil, "Tool backing API is unavailable."
+	}
+	value, err := runJavaScriptValueWithContext(snapshot, requestContext, backing.Script, backing.HTML, args)
+	if err != nil {
+		return nil, "Tool execution failed."
+	}
+	response, handled, err := responseFromJSValue(value)
+	if err != nil {
+		return nil, "Tool returned invalid JSON."
+	}
+	body := response.Body
+	if exported, ok := value.Export().(map[string]interface{}); ok {
+		_, hasBody := exported["body"]
+		_, hasStatus := exported["status"]
+		_, hasContentType := exported["contentType"]
+		_, hasHeaders := exported["headers"]
+		handled = hasBody || hasStatus || hasContentType || hasHeaders
+	}
+	if !handled {
+		body, _ = json.Marshal(value.Export())
+	}
+	if len(body) > maxMCPToolResultBytes {
+		return nil, "Tool result is too large."
+	}
+	var structured interface{}
+	if json.Unmarshal(body, &structured) != nil {
+		return nil, "Tool returned invalid JSON."
+	}
+	if response.Status < http.StatusBadRequest && tool.OutputSchema != nil && validateMCPJSONSchemaValue(tool.OutputSchema, structured) != nil {
+		return nil, "Tool result does not match outputSchema."
+	}
+	return map[string]interface{}{"content": []map[string]interface{}{{"type": "text", "text": string(body)}}, "structuredContent": structured, "isError": response.Status >= http.StatusBadRequest}, ""
+}
+func mcpStdioResult(id json.RawMessage, result interface{}) mcpStdioProtocolResponse {
+	return mcpStdioProtocolResponse{Respond: true, Payload: map[string]interface{}{"jsonrpc": "2.0", "id": rawMCPID(id), "result": result}}
+}
+func mcpStdioError(id json.RawMessage, code int, message string) mcpStdioProtocolResponse {
+	return mcpStdioProtocolResponse{Respond: true, Payload: map[string]interface{}{"jsonrpc": "2.0", "id": rawMCPID(id), "error": map[string]interface{}{"code": code, "message": message}}}
+}
+func writeMCPStdioMessage(output io.Writer, payload interface{}) error {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	if len(encoded) > maxMCPResponseBytes {
+		return fmt.Errorf("stdio MCP response exceeds 4 MiB")
+	}
+	encoded = append(encoded, '\n')
+	written, err := output.Write(encoded)
+	if err != nil {
+		return err
+	}
+	if written != len(encoded) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+const oauthStateTempPattern = ".nyanpui-oauth-*.tmp"
+
+var oauthStateMu sync.Mutex
+var oauthStateNamespacePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+var oauthArgon2Slots = make(chan struct{}, 2)
+
+type argon2idProfile struct {
+	memory      uint32
+	iterations  uint32
+	parallelism uint8
+	saltLength  uint32
+	keyLength   uint32
+}
+
+func (profile argon2idProfile) parameters() string {
+	return fmt.Sprintf("m=%d,t=%d,p=%d", profile.memory, profile.iterations, profile.parallelism)
+}
+
+// Keep existing profiles unchanged so stored hashes remain verifiable. To change
+// generation settings, append a profile and select its index below.
+var argon2idProfiles = [...]argon2idProfile{
+	{memory: 64 * 1024, iterations: 3, parallelism: 2, saltLength: 16, keyLength: 32},
+}
+
+const currentArgon2idProfile = 0
+
+func setupOAuthStateRuntime(vm *goja.Runtime, root string) {
+	vm.Set("nyanOAuthRead", func(key string) string {
+		value, err := oauthReadState(root, key)
+		if os.IsNotExist(err) {
+			return ""
+		}
+		if err != nil {
+			panic(vm.ToValue("OAuth state read failed"))
+		}
+		return value
+	})
+	vm.Set("nyanOAuthWrite", func(key, value string) bool {
+		if err := oauthWriteState(root, key, value); err != nil {
+			panic(vm.ToValue("OAuth state write failed"))
+		}
+		return true
+	})
+	vm.Set("nyanOAuthDelete", func(key string) bool {
+		err := oauthDeleteState(root, key)
+		if err != nil && !os.IsNotExist(err) {
+			panic(vm.ToValue("OAuth state delete failed"))
+		}
+		return true
+	})
+	vm.Set("nyanOAuthConsume", func(key string) string {
+		value, err := oauthConsumeState(root, key)
+		if os.IsNotExist(err) {
+			return ""
+		}
+		if err != nil {
+			panic(vm.ToValue("OAuth state consume failed"))
+		}
+		return value
+	})
+	vm.Set("nyanOAuthList", func(namespace string) []string {
+		values, err := oauthListState(root, namespace)
+		if err != nil {
+			panic(vm.ToValue("OAuth state list failed"))
+		}
+		return values
+	})
+	vm.Set("nyanArgon2idHash", func(password string) string {
+		value, err := argon2idHash(password)
+		if err != nil {
+			panic(vm.ToValue("password hashing failed"))
+		}
+		return value
+	})
+	vm.Set("nyanArgon2idVerify", argon2idVerify)
+}
+
+func argon2idHash(password string) (string, error) {
+	if len(password) < 1 || len(password) > 4096 {
+		return "", fmt.Errorf("invalid password")
+	}
+	profile := argon2idProfiles[currentArgon2idProfile]
+	salt := make([]byte, profile.saltLength)
+	if _, err := cryptorand.Read(salt); err != nil {
+		return "", err
+	}
+	oauthArgon2Slots <- struct{}{}
+	defer func() { <-oauthArgon2Slots }()
+	hash := argon2.IDKey([]byte(password), salt, profile.iterations, profile.memory, profile.parallelism, profile.keyLength)
+	return fmt.Sprintf("$argon2id$v=19$%s$%s$%s", profile.parameters(), base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(hash)), nil
+}
+func argon2idVerify(password, encoded string) bool {
+	parts := strings.Split(encoded, "$")
+	if len(parts) != 6 || parts[0] != "" || parts[1] != "argon2id" || parts[2] != "v=19" || len(password) > 4096 {
+		return false
+	}
+	var profile argon2idProfile
+	supported := false
+	for _, candidate := range argon2idProfiles {
+		if parts[3] == candidate.parameters() &&
+			len(parts[4]) == base64.RawStdEncoding.EncodedLen(int(candidate.saltLength)) &&
+			len(parts[5]) == base64.RawStdEncoding.EncodedLen(int(candidate.keyLength)) {
+			profile, supported = candidate, true
+			break
+		}
+	}
+	if !supported {
+		return false
+	}
+	salt, e1 := base64.RawStdEncoding.DecodeString(parts[4])
+	expected, e2 := base64.RawStdEncoding.DecodeString(parts[5])
+	if e1 != nil || e2 != nil || len(salt) != int(profile.saltLength) || len(expected) != int(profile.keyLength) {
+		return false
+	}
+	oauthArgon2Slots <- struct{}{}
+	defer func() { <-oauthArgon2Slots }()
+	actual := argon2.IDKey([]byte(password), salt, profile.iterations, profile.memory, profile.parallelism, profile.keyLength)
+	return subtle.ConstantTimeCompare(actual, expected) == 1
+}
+func resolveOAuthStatePath(root, key string, create bool) (string, error) {
+	root = filepath.Clean(strings.TrimSpace(root))
+	if root == "" || !filepath.IsAbs(root) {
+		return "", fmt.Errorf("OAuth state root must be absolute")
+	}
+	key = filepath.Clean(filepath.FromSlash(strings.TrimSpace(key)))
+	if !filepath.IsLocal(key) || filepath.Ext(key) != ".json" {
+		return "", fmt.Errorf("invalid OAuth state key")
+	}
+	if err := ensureOAuthStateDirectory(root, create); err != nil {
+		return "", err
+	}
+	path := filepath.Join(root, key)
+	relative, err := filepath.Rel(root, path)
+	if err != nil || !filepath.IsLocal(relative) {
+		return "", fmt.Errorf("OAuth state key escapes root")
+	}
+	parent := filepath.Dir(path)
+	if create {
+		if err := os.MkdirAll(parent, 0700); err != nil {
+			return "", err
+		}
+	}
+	for current := parent; current != filepath.Dir(root) && strings.HasPrefix(current, root); current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || oauthPermissionsTooBroad(info.Mode(), 0077) {
+			return "", fmt.Errorf("unsafe OAuth state directory")
+		}
+		if current == root {
+			break
+		}
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("OAuth state file is symlink")
+	}
+	return path, nil
+}
+func ensureOAuthStateDirectory(root string, create bool) error {
+	info, err := os.Lstat(root)
+	if os.IsNotExist(err) && create {
+		if err = os.MkdirAll(root, 0700); err != nil {
+			return err
+		}
+		info, err = os.Lstat(root)
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || oauthPermissionsTooBroad(info.Mode(), 0077) {
+		return fmt.Errorf("unsafe OAuth state root")
+	}
+	return nil
+}
+func oauthPermissionsTooBroad(mode os.FileMode, mask os.FileMode) bool {
+	return runtime.GOOS != "windows" && mode.Perm()&mask != 0
+}
+func oauthReadState(root, key string) (string, error) {
+	oauthStateMu.Lock()
+	defer oauthStateMu.Unlock()
+	return oauthReadStateLocked(root, key)
+}
+func oauthReadStateLocked(root, key string) (string, error) {
+	path, err := resolveOAuthStatePath(root, key, false)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || oauthPermissionsTooBroad(info.Mode(), 0077) {
+		return "", fmt.Errorf("unsafe OAuth state file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) > 1<<20 || !json.Valid(data) || validateNoDuplicateJSONKeys(data) != nil {
+		return "", fmt.Errorf("invalid OAuth state file")
+	}
+	return string(data), nil
+}
+func oauthWriteState(root, key, value string) error {
+	if len(value) > 1<<20 || !json.Valid([]byte(value)) || validateNoDuplicateJSONKeys([]byte(value)) != nil {
+		return fmt.Errorf("OAuth state must be valid JSON")
+	}
+	oauthStateMu.Lock()
+	defer oauthStateMu.Unlock()
+	path, err := resolveOAuthStatePath(root, key, true)
+	if err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), oauthStateTempPattern)
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err = temp.Chmod(0600); err == nil {
+		_, err = io.WriteString(temp, value)
+	}
+	if err == nil {
+		err = temp.Sync()
+	}
+	closeErr := temp.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tempPath, path)
+	}
+	return err
+}
+func oauthDeleteState(root, key string) error {
+	oauthStateMu.Lock()
+	defer oauthStateMu.Unlock()
+	path, err := resolveOAuthStatePath(root, key, false)
+	if err != nil {
+		return err
+	}
+	return os.Remove(path)
+}
+func oauthConsumeState(root, key string) (string, error) {
+	oauthStateMu.Lock()
+	defer oauthStateMu.Unlock()
+	value, err := oauthReadStateLocked(root, key)
+	if err != nil {
+		return "", err
+	}
+	path, err := resolveOAuthStatePath(root, key, false)
+	if err != nil {
+		return "", err
+	}
+	if err = os.Remove(path); err != nil {
+		return "", err
+	}
+	return value, nil
+}
+func oauthListState(root, namespace string) ([]string, error) {
+	oauthStateMu.Lock()
+	defer oauthStateMu.Unlock()
+	if !oauthStateNamespacePattern.MatchString(namespace) {
+		return nil, fmt.Errorf("invalid namespace")
+	}
+	directory := filepath.Join(root, namespace)
+	if _, err := resolveOAuthStatePath(root, namespace+"/placeholder.json", false); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	entries, err := os.ReadDir(directory)
+	if os.IsNotExist(err) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	keys := []string{}
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() || oauthPermissionsTooBroad(info.Mode(), 0077) {
+			return nil, fmt.Errorf("unsafe state entry")
+		}
+		// Ignore safe temporary files left behind by interrupted writes.
+		if temporary, _ := filepath.Match(oauthStateTempPattern, entry.Name()); temporary {
+			continue
+		}
+		if filepath.Ext(entry.Name()) != ".json" {
+			return nil, fmt.Errorf("unsafe state entry")
+		}
+		keys = append(keys, namespace+"/"+entry.Name())
+	}
+	sort.Strings(keys)
+	return keys, nil
 }
