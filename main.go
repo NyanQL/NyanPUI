@@ -2822,6 +2822,29 @@ func nyanReadFileB64(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 	}
 }
 
+// Only ordinary APIs are callable through the public JSON-RPC endpoint.
+// OAuth APIs must run through their dedicated handlers with server-owned context.
+func isJSONRPCCallableAPI(config APIConfig, name string) bool {
+	endpoint, exists := config[name]
+	if !exists {
+		return false
+	}
+	switch strings.TrimSpace(endpoint.Type) {
+	case "", "api":
+	default:
+		return false
+	}
+	for _, candidate := range config {
+		if strings.TrimSpace(candidate.Type) != apiTypeMCP {
+			continue
+		}
+		if _, isOAuthRole := mcpOAuthRoleForAPI(candidate, name); isOAuthRole {
+			return false
+		}
+	}
+	return true
+}
+
 func handleJSONRPC(c *gin.Context) {
 	serviceLog(slog.LevelDebug, "jsonrpc_request_received")
 
@@ -2856,15 +2879,11 @@ func handleJSONRPC(c *gin.Context) {
 		respondJSONRPCError(c, rpcReq.ID, -32603, "API configuration is not loaded", nil)
 		return
 	}
-	config, exists := snapshot.Config[rpcReq.Method]
-	if !exists {
-		respondJSONRPCError(c, rpcReq.ID, -32601, fmt.Sprintf("API not found: %s", rpcReq.Method), nil)
+	if !isJSONRPCCallableAPI(snapshot.Config, rpcReq.Method) {
+		respondJSONRPCError(c, rpcReq.ID, -32601, "Method not found", nil)
 		return
 	}
-	if strings.TrimSpace(config.Type) == apiTypeSchedule {
-		respondJSONRPCError(c, rpcReq.ID, -32601, fmt.Sprintf("API not found: %s", rpcReq.Method), nil)
-		return
-	}
+	config := snapshot.Config[rpcReq.Method]
 
 	// 4) JSON-RPC では HTML 出力は想定しないため、script が必須とする
 	if config.Script == "" {

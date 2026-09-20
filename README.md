@@ -864,7 +864,11 @@ JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
 }
 ```
 
-`method` には `api.json` の API 名を指定します。JSON-RPC では `script` が必須です。`type: "schedule"` は呼び出せません。成功時の `result` は JavaScript の戻り値を文字列化した値です。
+`method` には `api.json` の API 名を指定します。JSON-RPCから呼べるのは `type: "api"` またはtypeを省略した通常APIで、`script` が必須です。`ws_client`、`public`、`schedule`、`mcp` など、それ以外の種別は呼び出せません。
+
+また、いずれかのMCP定義の `oauth` から参照されるAPIは、通常APIとして定義されていてもJSON-RPCからは呼び出せません。対象は `authorizationServerMetadata`、`protectedResourceMetadata`、`authorize`、`token`、`register`、`adminUser`、`verifyAccess` の全役割です。対象外のAPIにはHTTP 200でJSON-RPCエラー `-32601`（`Method not found`）を返し、チェック・本体・Pushを実行しません。この制限はホットリロード後の定義にも適用されます。
+
+成功時の `result` は JavaScript の戻り値を文字列化した値です。
 
 JSON-RPCでも `paramCheck` と `outCheck` を実行します。チェックが `success: true` かつ `status: 200` を満たさなかった場合、HTTP 200で次のJSON-RPCエラーを返します。`id` はリクエストの値を保持し、`error.code` は `-32000`、`error.message` は `paramCheck rejected` または `outCheck rejected` です。元のチェック結果は `error.data` に保持します。
 

@@ -1701,6 +1701,113 @@ func TestWebSocketChecksAuthorization(t *testing.T) {
 	}
 }
 
+func TestJSONRPCRejectsNonPublicAPIs(t *testing.T) {
+	const target = "group/private"
+	cases := []struct {
+		name    string
+		apiType string
+		oauth   MCPOAuthHooks
+		missing bool
+	}{
+		{name: "ws_client", apiType: apiTypeWSClient},
+		{name: "public", apiType: apiTypePublic},
+		{name: "schedule", apiType: apiTypeSchedule},
+		{name: "mcp", apiType: apiTypeMCP},
+		{name: "include", apiType: "include"},
+		{name: "unknown_type", apiType: "unknown"},
+		{name: "missing", missing: true},
+		{name: "authorizationServerMetadata", oauth: MCPOAuthHooks{AuthorizationServerMetadata: target}},
+		{name: "protectedResourceMetadata", oauth: MCPOAuthHooks{ProtectedResourceMetadataAPI: target}},
+		{name: "authorize", oauth: MCPOAuthHooks{Authorize: target}},
+		{name: "token", oauth: MCPOAuthHooks{Token: target}},
+		{name: "register", oauth: MCPOAuthHooks{Register: target}},
+		{name: "adminUser", oauth: MCPOAuthHooks{AdminUser: target}},
+		{name: "verifyAccess", oauth: MCPOAuthHooks{VerifyAccess: target}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			marker := filepath.Join(dir, "script-ran")
+			check := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"check ran"); ({success:true,status:200,result:null});`, marker))
+			script := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"script ran"); "PRIVATE_RESULT";`, marker))
+			config := APIConfig{
+				target:    {Type: tc.apiType, Script: script, ParamCheck: check, OutCheck: check, Push: "updates"},
+				"updates": {Script: script},
+				// An unrelated MCP definition must not hide roles in another definition.
+				"mcp/first":  {Type: apiTypeMCP, Transport: "stdio"},
+				"mcp/second": {Type: apiTypeMCP, Transport: "streamable_http", OAuth: tc.oauth},
+			}
+			if tc.missing {
+				delete(config, target)
+			}
+			router := newRequestRegressionRouter(t, config)
+			for _, mode := range []string{"", "checkOnly"} {
+				body, err := json.Marshal(map[string]interface{}{
+					"jsonrpc": "2.0", "id": "private-request", "method": target,
+					"params": map[string]interface{}{
+						"nyan_mode": mode, "api": "updates", "state_directory": dir,
+						"oauth_hook": "caller-selected", "resource": "https://caller.example/mcp", "required_scopes": []string{},
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				req := httptest.NewRequest(http.MethodPost, "/nyan-rpc?api=updates", bytes.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				response := decodeJSONRPCCheckResponse(t, rec, `"private-request"`)
+				var rpcError JSONRPCError
+				if err := json.Unmarshal(response["error"], &rpcError); err != nil || rpcError.Code != -32601 || rpcError.Message != "Method not found" {
+					t.Fatalf("private API was not rejected: body=%s error=%v", rec.Body.String(), err)
+				}
+				if _, exists := response["result"]; exists {
+					t.Fatalf("private API returned a result: %s", rec.Body.String())
+				}
+				assertJSONRPCExecutionMarker(t, marker, false)
+			}
+		})
+	}
+}
+
+func TestJSONRPCExposureUsesCurrentSnapshot(t *testing.T) {
+	script := writeFixtureFile(t, `"ordinary API";`)
+	router := newRequestRegressionRouter(t, APIConfig{})
+	for _, tc := range []struct {
+		name    string
+		apiType string
+		oauth   MCPOAuthHooks
+		allowed bool
+	}{
+		{name: "implicit_api", allowed: true},
+		{name: "explicit_api", apiType: "api", allowed: true},
+		{name: "becomes_oauth_hook", apiType: "api", oauth: MCPOAuthHooks{VerifyAccess: "private"}},
+		{name: "oauth_role_removed", apiType: "api", allowed: true},
+		{name: "becomes_background_job", apiType: apiTypeWSClient},
+		{name: "ordinary_api_restored", allowed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Hot reload publishes a new snapshot; reuse the same HTTP router.
+			publishAPISnapshot(&APIConfigSnapshot{Config: APIConfig{
+				"private": {Type: tc.apiType, Script: script, SecuritySchemes: []map[string]interface{}{{"type": "oauth2", "scopes": []string{"read"}}}},
+				"mcp":     {Type: apiTypeMCP, OAuth: tc.oauth, Tools: []MCPToolConfig{{Name: "private", API: "private"}}},
+			}})
+			rec := serveJSONRPCCheckRequest(router, "42", `{}`)
+			response := decodeJSONRPCCheckResponse(t, rec, "42")
+			if tc.allowed {
+				if string(response["result"]) != `"ordinary API"` || response["error"] != nil {
+					t.Fatalf("ordinary API was blocked: %s", rec.Body.String())
+				}
+			} else {
+				var rpcError JSONRPCError
+				if err := json.Unmarshal(response["error"], &rpcError); err != nil || rpcError.Code != -32601 {
+					t.Fatalf("stale exposure allowed a private API: %s", rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
 func TestJSONRPCOutCheck(t *testing.T) {
 	script := writeFixtureFile(t, `"PRIVATE_RESULT";`)
 	deny := writeFixtureFile(t, `({success:false,status:403,result:"denied"});`)
