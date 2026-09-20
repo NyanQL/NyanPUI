@@ -2359,6 +2359,17 @@ func setupGojaRuntimeWithContext(snapshot *APIConfigSnapshot, requestContext *gi
 	vm.Set("nyanJsonAPI", jsonAPIFunc)
 	vm.Set("nyanCallAPI", jsonAPIFunc)
 
+	vm.Set("nyanGetRequestHeaders", func() map[string]string {
+		headers := make(map[string]string)
+		if requestContext == nil || requestContext.Request == nil {
+			return headers
+		}
+		for name, values := range requestContext.Request.Header {
+			headers[name] = strings.Join(values, ",")
+		}
+		return headers
+	})
+
 	// getCookie, setCookie, setItem, getItem も同様に登録する
 	vm.Set("nyanGetCookie", func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {

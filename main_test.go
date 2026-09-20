@@ -1896,6 +1896,65 @@ func completeTestOAuthConfiguration(t *testing.T, cfg APIConfig) {
 	}
 }
 
+func TestNyanGetRequestHeadersReturnsIndependentCopies(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name       string
+		context    bool
+		request    bool
+		withHeader bool
+	}{
+		{name: "without_context"},
+		{name: "without_request", context: true},
+		{name: "empty_headers", context: true, request: true},
+		{name: "multiple_header_values", context: true, request: true, withHeader: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var requestContext *gin.Context
+			if tc.context {
+				requestContext, _ = gin.CreateTestContext(httptest.NewRecorder())
+				if tc.request {
+					requestContext.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+					if tc.withHeader {
+						requestContext.Request.Header.Set("Origin", "https://allowed.example")
+						requestContext.Request.Header.Add("X-Values", "first")
+						requestContext.Request.Header.Add("X-Values", "second")
+					}
+				}
+			}
+			vm := setupGojaRuntimeWithContext(&APIConfigSnapshot{}, requestContext)
+			value, err := vm.RunString(`
+const first = nyanGetRequestHeaders();
+first.Origin = "mutated";
+delete first["X-Values"];
+first["X-Injected"] = "injected";
+JSON.stringify(nyanGetRequestHeaders());
+`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var headers map[string]string
+			if err := json.Unmarshal([]byte(value.String()), &headers); err != nil || headers == nil {
+				t.Fatalf("headers must be an object of strings: value=%s error=%v", value.String(), err)
+			}
+			if !tc.withHeader {
+				if len(headers) != 0 {
+					t.Fatalf("request without headers returned %v", headers)
+				}
+				return
+			}
+			if len(headers) != 2 || headers["Origin"] != "https://allowed.example" || headers["X-Values"] != "first,second" {
+				t.Fatalf("request header copy changed: %v", headers)
+			}
+			original := requestContext.Request.Header
+			values := original.Values("X-Values")
+			if len(original) != 2 || original.Get("Origin") != "https://allowed.example" || len(values) != 2 || values[0] != "first" || values[1] != "second" {
+				t.Fatalf("JavaScript mutated the original HTTP headers: %v", original)
+			}
+		})
+	}
+}
+
 func TestCookieRequestIsolation(t *testing.T) {
 	enteredA, enteredB := make(chan struct{}), make(chan struct{})
 	releaseA, releaseB := make(chan struct{}), make(chan struct{})
@@ -1909,11 +1968,12 @@ func TestCookieRequestIsolation(t *testing.T) {
 		}
 	}))
 	defer gate.Close()
-	script := writeFixtureFile(t, `nyanGetAPI(nyanAllParams.gate,"",""); nyanGetCookie("session");`)
+	script := writeFixtureFile(t, `nyanGetAPI(nyanAllParams.gate,"",""); nyanGetCookie("session") + ":" + nyanGetRequestHeaders()["X-Request-Owner"];`)
 	r := newRequestRegressionRouter(t, APIConfig{"who": {Script: script}})
 	run := func(id string, done chan<- string) {
 		req := httptest.NewRequest("POST", "/who", strings.NewReader(`{"gate":"`+gate.URL+`/`+id+`"}`))
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Request-Owner", id)
 		req.AddCookie(&http.Cookie{Name: "session", Value: id})
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
@@ -1928,8 +1988,73 @@ func TestCookieRequestIsolation(t *testing.T) {
 	resultA := <-doneA
 	close(releaseB)
 	resultB := <-doneB
-	if resultA != "a" || resultB != "b" {
+	if resultA != "a:a" || resultB != "b:b" {
 		t.Fatalf("request A got %q; request B got %q", resultA, resultB)
+	}
+}
+
+func TestWebSocketParamCheckUsesRequestOriginHeader(t *testing.T) {
+	check := writeFixtureFile(t, `
+const allowed = nyanGetRequestHeaders().Origin === "https://allowed.example";
+({success:allowed,status:allowed ? 200 : 403,result:allowed ? null : "origin denied"});
+`)
+	html := writeFixtureFile(t, "PRIVATE_HTML")
+	router := newRequestRegressionRouter(t, APIConfig{"private": {HTML: html, ParamCheck: check}})
+	server := httptest.NewServer(router)
+	defer server.Close()
+	forgedQuery := url.Values{
+		"Origin": {"https://allowed.example"}, "origin": {"https://allowed.example"},
+		"headers":  {`{"Origin":"https://allowed.example"}`},
+		"_headers": {`{"Origin":"https://allowed.example"}`}, "_headers_raw": {`{"Origin":["https://allowed.example"]}`},
+	}.Encode()
+	for _, tc := range []struct {
+		name   string
+		origin string
+		query  string
+		allow  bool
+	}{
+		{name: "allowed", origin: "https://allowed.example", allow: true},
+		{name: "denied", origin: "https://untrusted.example"},
+		{name: "missing"},
+		{name: "forged_query_with_denied_header", origin: "https://untrusted.example", query: forgedQuery},
+		{name: "forged_query_without_header", query: forgedQuery},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			headers := http.Header{}
+			if tc.origin != "" {
+				headers.Set("Origin", tc.origin)
+			}
+			target := "ws" + strings.TrimPrefix(server.URL, "http") + "/private"
+			if tc.query != "" {
+				target += "?" + tc.query
+			}
+			conn, response, err := websocket.DefaultDialer.Dial(target, headers)
+			if conn != nil {
+				defer conn.Close()
+			}
+			if !tc.allow {
+				if err == nil || conn != nil || response == nil || response.StatusCode != http.StatusForbidden {
+					t.Fatalf("Origin rejection must precede upgrade: error=%v response=%v", err, response)
+				}
+				defer response.Body.Close()
+				body, err := io.ReadAll(response.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertParamCheckResponse(t, body, false, http.StatusForbidden)
+				return
+			}
+			if err != nil || conn == nil {
+				t.Fatalf("allowed Origin did not upgrade: error=%v response=%v", err, response)
+			}
+			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"echo":"allowed"}`)); err != nil {
+				t.Fatal(err)
+			}
+			if _, body, err := conn.ReadMessage(); err != nil || string(body) != `{"echo":"allowed"}` {
+				t.Fatalf("allowed WebSocket did not echo: body=%s error=%v", body, err)
+			}
+		})
 	}
 }
 
@@ -2442,16 +2567,17 @@ func TestWebSocketConcurrentPushAndReplies(t *testing.T) {
 }
 
 func TestNestedJavaScriptPreservesRequestCookies(t *testing.T) {
-	target := writeFixtureFile(t, `nyanSetCookie("result",nyanGetCookie("session")); nyanGetCookie("session");`)
+	target := writeFixtureFile(t, `nyanSetCookie("result",nyanGetCookie("session")); nyanGetCookie("session") + ":" + nyanGetRequestHeaders()["X-Request-Owner"];`)
 	caller := writeFixtureFile(t, `nyanCallMe({api:"target"});`)
 	router := newRequestRegressionRouter(t, APIConfig{"caller": {Script: caller}, "target": {Script: target}})
 	req := httptest.NewRequest("GET", "https://example.test/caller", nil)
 	req.AddCookie(&http.Cookie{Name: "session", Value: "request-owner"})
+	req.Header.Set("X-Request-Owner", "header-owner")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	cookies := rec.Result().Cookies()
-	if rec.Body.String() != "request-owner" || len(cookies) != 1 || cookies[0].Value != "request-owner" || !cookies[0].Secure {
-		t.Fatalf("nested request lost its cookie context: body=%s cookies=%v", rec.Body.String(), cookies)
+	if rec.Body.String() != "request-owner:header-owner" || len(cookies) != 1 || cookies[0].Value != "request-owner" || !cookies[0].Secure {
+		t.Fatalf("nested request lost its cookie or header context: body=%s cookies=%v", rec.Body.String(), cookies)
 	}
 	value, err := setupGojaRuntime().RunString(`nyanGetCookie("session");`)
 	if err != nil || value.String() != "" {

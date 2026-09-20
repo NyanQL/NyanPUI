@@ -668,6 +668,7 @@ schedule の `script` では通常 API と同じ Goja 環境を使えます。�
 * リクエストパラメータ: `nyanAllParams`
 * テンプレート HTML: `nyanHtmlCode`
 * コンソール出力: `console.log()`
+* リクエストヘッダーの取得: `nyanGetRequestHeaders()`
 * Cookie 操作: `nyanGetCookie()` / `nyanSetCookie()`
 * localStorage 操作: `nyanGetItem()` / `nyanSetItem()`
 * 外部 APIの呼び出し : `nyanGetAPI()` / `nyanJsonAPI()` / `nyanCallAPI()`
@@ -826,6 +827,21 @@ console.log(result);
 テンプレート内に `data-nyan*` 属性を記述し、`nyanPlate(data, htmlCode)` で動的置換します。
 詳細については [nyanPlate.js](javascript%2Flib%2FnyanPlate.js) の文頭にコメントで記載していますので
 そちらを参照してください。
+
+### 14. **nyanGetRequestHeaders()**
+
+Nyan8と同じ形式で、現在のHTTPリクエストのヘッダーをオブジェクトとして取得します。通常API、JSON-RPC、`paramCheck` / `outCheck` など、HTTPリクエストに伴うJavaScriptから使用できます。`nyanCallMe()` の呼び出し先にも元のリクエスト情報を引き継ぎます。
+
+```javascript
+const headers = nyanGetRequestHeaders();
+const origin = headers["Origin"] || "";
+const userAgent = headers["User-Agent"] || "";
+```
+
+ヘッダー名は `Origin`、`User-Agent` などの表記に正規化されます。値は文字列で、同名ヘッダーの複数の値はカンマで連結します。取得するのは実際の受信ヘッダーで、クエリーやJSONのパラメーターからは補いません。返されたオブジェクトを書き換えても元のヘッダーは変わりません。`Host` は含みません。
+
+`schedule`、`ws_client`、MCPのstdioなど、HTTPリクエストを伴わない実行では空のオブジェクト `{}` を返します。WebSocket接続時と接続後のチェック処理では、接続時のHTTPリクエストヘッダーを取得します。
+
 ## WebSocket サンプル
 WebSocket による双方向通信とプッシュ通知のサンプルを同梱しています。
 * フロント: `http://localhost:8009/push/test`
@@ -834,6 +850,23 @@ WebSocket による双方向通信とプッシュ通知のサンプルを同梱�
 通常HTTPのAPIに `push` を設定すると、`paramCheck`・`outCheck` を通過し、HTTPステータスが200〜399の応答を返した後に、指定先の内容をWebSocket接続へ配信します。文字列・オブジェクト・空の応答・HTMLのみのAPIで共通です。応答の内容や形式は変わりません。
 
 HTTP 4xx・5xxの応答、チェック拒否、スクリプト例外、HTML読み込みや応答変換の失敗、`nyan_mode=checkOnly` の場合はPushを実行しません。本体スクリプトが明示的に `status: 500` などを返した場合も対象です。
+
+### JavaScriptによる接続前のOriginチェック
+
+WebSocketの接続先APIに `paramCheck` を設定すると、接続確立前にチェックを実行します。次のスクリプトでは、指定したOriginのみ許可し、Originがない場合も拒否します。許可する値と、Originがない場合の扱いはJavaScript側で決めてください。
+
+```javascript
+// api.jsonの接続先APIで、このファイルをparamCheckに指定します。
+const origin = nyanGetRequestHeaders()["Origin"] || "";
+const allowed = origin === "https://app.example.com";
+({
+  success: allowed,
+  status: allowed ? 200 : 403,
+  result: allowed ? null : { message: "Origin not allowed" }
+});
+```
+
+拒否するとHTTP 403を返し、WebSocket接続は確立しません。このチェックは同じAPIへの通常HTTPリクエストにも適用されます。チェックを設定しなければ、NyanPUIはWebSocket接続に対するOrigin制限を自動では行いません。
 
 ## JSON-RPC 対応
 JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
