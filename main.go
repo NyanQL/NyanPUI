@@ -972,6 +972,7 @@ func handleAPIRequestWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, c
 		return
 	}
 
+	var response APIResponse
 	// scriptが空の場合、HTMLファイルの内容をそのまま返す
 	if config.Script == "" {
 		htmlContent, err := os.ReadFile(htmlPath)
@@ -979,30 +980,25 @@ func handleAPIRequestWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, c
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load HTML file"})
 			return
 		}
-		response := APIResponse{
+		response = APIResponse{
 			Status:      http.StatusOK,
 			ContentType: "text/html; charset=utf-8",
 			Headers:     map[string]string{},
 			Body:        htmlContent,
 		}
-		if handled := runOutCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams, response); handled {
+	} else {
+		// JavaScriptを実行し、結果を取得
+		resultValue, err := runJavaScriptValueWithContext(snapshot, c, scriptPath, htmlPath, allParams)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		writeAPIResponse(c, response)
-		return
-	}
 
-	// JavaScriptを実行し、結果を取得
-	resultValue, err := runJavaScriptValueWithContext(snapshot, c, scriptPath, htmlPath, allParams)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	response, handledJSResponse, err := responseFromJSValue(resultValue)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		response, _, err = responseFromJSValue(resultValue)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	if handled := runOutCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams, response); handled {
@@ -1010,14 +1006,10 @@ func handleAPIRequestWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, c
 	}
 
 	writeAPIResponse(c, response)
-	if handledJSResponse {
-		return
+	// 応答形式によらず、エラーでない最終応答の場合だけPushを実行する。
+	if response.Status >= http.StatusOK && response.Status < http.StatusBadRequest {
+		performPushWithContext(snapshot, c, config, allParams)
 	}
-
-	// push 設定がある場合、対象のWebSocket接続に対してプッシュ
-	// API リクエスト完了後の push 処理
-	performPushWithContext(snapshot, c, config, allParams)
-
 }
 
 // handleWebSocket はWebSocketリクエストを処理します。

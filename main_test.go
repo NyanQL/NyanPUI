@@ -898,6 +898,134 @@ if (nyanAllParams.nyan_output_body === "main ok") {
 	}
 }
 
+func TestHandleAPIRequestPushConditions(t *testing.T) {
+	const allow = `({success:true,status:200,result:null});`
+	const deny = `({success:false,status:403,result:"denied"});`
+	const jsonResponse = `({status:200,contentType:"application/json",headers:{"X-Test":"ok"},body:{ok:true}});`
+	for _, tc := range []struct {
+		name        string
+		script      string
+		paramCheck  string
+		outCheck    string
+		query       string
+		htmlOnly    bool
+		missingHTML bool
+		noPush      bool
+		wantStatus  int
+		wantBody    string
+		wantPush    bool
+	}{
+		{name: "string", script: `"saved";`, wantStatus: 200, wantBody: "saved", wantPush: true},
+		{name: "json_object", script: jsonResponse, wantStatus: 200, wantBody: `{"ok":true}`, wantPush: true},
+		{name: "created", script: `({status:201,body:"created"});`, wantStatus: 201, wantBody: "created", wantPush: true},
+		{name: "no_content", script: `({status:204});`, wantStatus: 204, wantPush: true},
+		{name: "redirect", script: `({status:302,headers:{Location:"/done"}});`, wantStatus: 302, wantPush: true},
+		{name: "null", script: `null;`, wantStatus: 200, wantPush: true},
+		{name: "undefined", script: `undefined;`, wantStatus: 200, wantPush: true},
+		{name: "html_only", htmlOnly: true, wantStatus: 200, wantBody: "<p>saved</p>", wantPush: true},
+		{name: "bad_request", script: `({status:400,body:"failed"});`, wantStatus: 400},
+		{name: "server_error", script: `({status:500,body:"failed"});`, wantStatus: 500},
+		{name: "invalid_status", script: `({status:700,body:"failed"});`, wantStatus: 500},
+		{name: "param_rejected", script: jsonResponse, paramCheck: deny, wantStatus: 403},
+		{name: "out_rejected", script: jsonResponse, outCheck: deny, wantStatus: 403},
+		{name: "html_out_rejected", htmlOnly: true, outCheck: deny, wantStatus: 403},
+		{name: "param_non_200", script: jsonResponse, paramCheck: `({success:true,status:201,result:null});`, wantStatus: 201},
+		{name: "out_false_with_200", script: jsonResponse, outCheck: `({success:false,status:200,result:null});`, wantStatus: 200},
+		{name: "param_exception", script: jsonResponse, paramCheck: `throw new Error("failed");`, wantStatus: 500},
+		{name: "out_exception", script: jsonResponse, outCheck: `throw new Error("failed");`, wantStatus: 500},
+		{name: "check_only", script: jsonResponse, query: "&nyan_mode=checkOnly", wantStatus: 200},
+		{name: "script_exception", script: `throw new Error("failed");`, wantStatus: 500},
+		{name: "invalid_body", script: `({body:{encoding:"base64",data:"!"}});`, wantStatus: 500},
+		{name: "missing_html", htmlOnly: true, missingHTML: true, wantStatus: 500},
+		{name: "without_push", script: jsonResponse, noPush: true, wantStatus: 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := EndpointConfig{Push: "updates"}
+			if tc.htmlOnly {
+				config.HTML = writeFixtureFile(t, "<p>saved</p>")
+				if tc.missingHTML {
+					config.HTML += ".missing"
+				}
+			} else {
+				config.Script = writeFixtureFile(t, tc.script)
+			}
+			if !tc.missingHTML {
+				paramCheck, outCheck := allow, allow
+				if tc.paramCheck != "" {
+					paramCheck = tc.paramCheck
+				}
+				if tc.outCheck != "" {
+					outCheck = tc.outCheck
+				}
+				config.ParamCheck = writeFixtureFile(t, paramCheck)
+				config.OutCheck = writeFixtureFile(t, outCheck)
+			}
+			if tc.noPush {
+				config.Push = ""
+			}
+			marker := filepath.Join(t.TempDir(), "push-ran")
+			push := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q, (nyanGetFile(%q) || "") + nyanAllParams.id + ":" + nyanGetCookie("session")); "pushed";`, marker, marker))
+			router := newRequestRegressionRouter(t, APIConfig{"save": config, "updates": {Script: push}})
+			req := httptest.NewRequest(http.MethodGet, "/save?id=item"+tc.query, nil)
+			req.AddCookie(&http.Cookie{Name: "session", Value: "owner"})
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantPush && rec.Body.String() != tc.wantBody {
+				t.Fatalf("body = %q, want %q", rec.Body.String(), tc.wantBody)
+			}
+			if tc.name == "json_object" && (rec.Header().Get("Content-Type") != "application/json" || rec.Header().Get("X-Test") != "ok") {
+				t.Fatalf("response headers changed: %v", rec.Header())
+			}
+			if tc.name == "redirect" && rec.Header().Get("Location") != "/done" {
+				t.Fatalf("redirect location = %q, want /done", rec.Header().Get("Location"))
+			}
+			body, err := os.ReadFile(marker)
+			if tc.wantPush {
+				if err != nil || string(body) != "item:owner" {
+					t.Fatalf("Push must run once with request parameters and cookies: body=%q, error=%v", body, err)
+				}
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("Push must not run: body=%q, error=%v", body, err)
+			}
+		})
+	}
+}
+
+func TestHTTPStructuredResponseSendsWebSocketPush(t *testing.T) {
+	script := writeFixtureFile(t, `({status:200,contentType:"application/json",body:{ok:true}});`)
+	push := writeFixtureFile(t, `JSON.stringify({updated:nyanAllParams.id});`)
+	router := newRequestRegressionRouter(t, APIConfig{
+		"save": {Script: script, Push: "updates"}, "updates": {Script: push},
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/updates", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// An echo round trip ensures the subscriber is registered before the HTTP request.
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/save?id=item", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"ok":true}` {
+		t.Fatalf("unexpected HTTP response: status=%d, body=%s", rec.Code, rec.Body.String())
+	}
+	messageType, body, err := conn.ReadMessage()
+	if err != nil || messageType != websocket.TextMessage || string(body) != `{"updated":"item"}` {
+		t.Fatalf("unexpected Push: type=%d, body=%q, error=%v", messageType, body, err)
+	}
+}
+
 func TestHandleAPIRequestOutCheckSeesStructuredResponse(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

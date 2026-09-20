@@ -850,6 +850,10 @@ WebSocket による双方向通信とプッシュ通知のサンプルを同梱�
 * フロント: `http://localhost:8009/push/test`
 * プッシュ: `http://localhost:8009/push/request` → `ws://localhost:8009/push/receive`
 
+通常HTTPのAPIに `push` を設定すると、`paramCheck`・`outCheck` を通過し、HTTPステータスが200〜399の応答を返した後に、指定先の内容をWebSocket接続へ配信します。文字列・オブジェクト・空の応答・HTMLのみのAPIで共通です。応答の内容や形式は変わりません。
+
+HTTP 4xx・5xxの応答、チェック拒否、スクリプト例外、HTML読み込みや応答変換の失敗、`nyan_mode=checkOnly` の場合はPushを実行しません。本体スクリプトが明示的に `status: 500` などを返した場合も対象です。
+
 ## JSON-RPC 対応
 JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
 /nyan-rpc エンドポイントに POST リクエストを送ると、JSON-RPC 形式でレスポンスが返ります。
