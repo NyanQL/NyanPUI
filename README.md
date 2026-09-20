@@ -295,13 +295,19 @@ https://example.com/server_mcp_http
 | API名 | Toolの `name`。`title` 省略時のtitleにも使用 |
 | `title` | Toolの `title` |
 | `description` | Toolの `description` |
-| `paramCheck` | 入力JSON Schema。省略時は空のobject schema |
-| `outCheck` | 出力JSON Schema |
+| `paramCheck` | 実行前チェック。ファイル内の `nyanInputSchema` を入力JSON Schemaとして使用 |
+| `outCheck` | 出力前チェック。ファイル内の `nyanOutputSchema` を出力JSON Schemaとして使用 |
 | `securitySchemes` | OAuthなど、Toolが必要とするsecurity scheme |
 | `annotations` | `readOnlyHint`、`destructiveHint`、`idempotentHint`、`openWorldHint` などのTool annotation |
 | `script` | `tools/call` で実行するJavaScript |
 
 OAuthを有効にしたMCPで公開する各Toolは、`securitySchemes` の定義に1件以上の `scopes` が必要です。指定したscopeは、後述する `verifyAccess` APIの `scopes` に含まれている必要があります。
+
+`tools/call` は、入力JSON Schema検証 → `paramCheck` → 本体スクリプト → `outCheck` → 出力JSON Schema検証の順で処理します。出力JSON Schema検証は、スキーマがあり、応答の `status` が400未満の場合に行います。Streamable HTTPとstdioのどちらでも、指定したチェックスクリプトを実行します。チェックの成功条件は通常APIと同じ `success: true` かつ `status: 200` です。拒否・不正なチェック結果・例外はMCP Toolの `isError: true` 応答となり、`paramCheck` の拒否時は本体を実行せず、`outCheck` の拒否時は本体の結果を返しません。
+
+MCP用のチェックファイルにも、スキーマ宣言に加えて `{success, status, result}` のチェック結果が必要です。スキーマを宣言するだけではチェックに成功しません。
+
+チェックでは、本体と同じ `nyanAllParams` の引数、`mcp_principal`、`mcp_tool` を参照できます。`outCheck` の `nyan_output.body` にはToolの応答本文となるJSONが入ります。`nyan_mode: "checkOnly"` を引数に渡した場合は、入力JSON Schema検証後に `paramCheck` の結果だけを返し、本体・`outCheck`・出力JSON Schema検証を実行しません。入力JSON Schemaでプロパティを制限している場合は、`nyan_mode` も許可する必要があります。
 
 ### OAuth設定フィールド
 
@@ -327,6 +333,29 @@ stdioは次のように起動します。stdoutはJSON-RPC専用で、HTTP liste
 ### OAuthの責務と状態保存
 
 Goの `main.go` はMCP/OAuthのHTTP受付、request由来URL生成、JavaScript hook呼出し、hookの結果に基づく処理の許可・拒否と応答を担当します。安全な状態ファイル操作やパスワードハッシュなどの汎用ヘルパーも提供します。ユーザー認証、PKCE検証、認可コードの一回限り消費、access tokenの発行・検証は参照先APIのJavaScript側の責務です。JavaScriptファイル名は固定されません。
+
+`oauth` から参照する通常APIにも `paramCheck` と `outCheck` を指定できます。例えば、MCP定義で `"token": "oauth/token"` と指定した場合、参照先は次のように設定します。
+
+```json
+{
+  "oauth/token": {
+    "type": "api",
+    "script": "./runtime/oauth_policy.js",
+    "paramCheck": "./runtime/check_token_request.js",
+    "outCheck": "./runtime/check_token_response.js"
+  }
+}
+```
+
+`authorize`・`token`・`register` は `paramCheck` → 本体スクリプト → `outCheck` の順で実行します。チェックの成功条件は通常APIと同じ `success: true` かつ `status: 200` です。`paramCheck` が拒否すると本体を実行せず、`outCheck` が拒否すると本体の結果を返しません。OAuth用HTTP endpointでは通常HTTPと同じく、チェック結果の `{success, status, result}` をJSONで返し、HTTPステータスに `status` を使用します。
+
+Metadata用の2つのAPIも `paramCheck` → Goが生成するメタデータ → `outCheck` の順で処理します。Metadata endpointへの `OPTIONS` はチェックを実行しません。MCP内部から呼び出す `verifyAccess` も前後のチェックを実行し、拒否・不正なチェック結果・例外は認証失敗として扱います。この場合はMCPへのリクエストにHTTP 401で応答し、Toolを実行しません。
+
+`nyan_mode=checkOnly` は通常APIと同様に、`paramCheck` の結果だけを返し、本体・メタデータ生成・`outCheck` を実行しません。`paramCheck` がなければ `{success: true, status: 200, result: null}` を返します。MCP内部の `verifyAccess` では、チェックだけの成功を認証成功とは扱わず、HTTP 401でToolの実行を止めます。
+
+各チェックでは本体と同じOAuth用パラメータやリクエストヘッダーを参照できます。`outCheck` の `nyanAllParams.nyan_output` は通常APIと同じ形式で、実際に返すOAuth応答を検査できます。`verifyAccess` では、検証スクリプトが返した `authenticated` / `allowed` や `principal` を含む結果のJSON本文が対象です。
+
+OAuth用APIのチェックとMCP Toolのチェックは、それぞれの参照先APIの設定に従って実行します。OAuth用APIにチェックを指定しても `push` は実行せず、汎用JSON-RPCからの呼び出し制限も変わりません。
 
 状態保存rootは `config.json` の `oauth_state_directory` で指定します。実際の保存先はその下のMCP API名ごとに分離されます。未指定時はMCP定義元の `oauth-state/MCP API名` です。
 
@@ -385,7 +414,9 @@ include定義に指定できるフィールドは`type`と`path`だけです。�
 
 ### 実行前チェック（`paramCheck`）
 
-`paramCheck` を指定すると、通常 API の `script` 実行前、または `type: "public"` のファイル配信前に JavaScript を実行できます。
+`paramCheck` を指定すると、APIの本体実行前、または `type: "public"` のファイル配信前にJavaScriptを実行できます。通常HTTP・JSON-RPCに加え、MCP Tool、OAuth用API、`nyanCallMe()` の呼び出し先、Pushの配信先でも適用します。WebSocketでは接続前と、受信メッセージの `api` で指定されたAPIの処理前に適用します。
+
+`type: "schedule"` と `type: "ws_client"` 自身のバックグラウンド実行では、`paramCheck` と `outCheck` を実行しません。ただし、それらのスクリプトから `nyanCallMe()` で通常APIを呼び出した場合は、呼び出し先のチェックを実行します。
 
 ```json
 {
@@ -454,7 +485,9 @@ var path = nyanAllParams.nyan_public_path;         // 例: "docs/a.txt"
 
 ### 出力前チェック（`outCheck`）
 
-`outCheck` を指定すると、通常 API の本体実行後、または `type: "public"` のファイル送信前に JavaScript を実行できます。`outCheck` が成功した場合は本体の実行結果をそのまま出力し、失敗した場合は `outCheck` の結果を JSON として出力します。JSON-RPC呼び出し時は、後述のJSON-RPCエラー形式で返します。
+`outCheck` を指定すると、APIの本体実行後、または `type: "public"` のファイル送信前にJavaScriptを実行できます。MCP Tool、OAuth用API、`nyanCallMe()` の呼び出し先、Pushの配信先、WebSocket受信メッセージで指定されたAPIにも適用します。WebSocketの接続確立だけでは出力チェックは実行しません。
+
+`outCheck` が成功した場合は本体の実行結果をそのまま出力します。通常HTTPで失敗した場合は `outCheck` の結果をJSONとして出力し、JSON-RPCでは後述のJSON-RPCエラー形式で返します。MCP ToolではToolエラー、`nyanCallMe()` ではJavaScriptの例外となり、Pushでは配信を止めます。本体の実行自体が失敗して結果を取得できなかった場合は、`outCheck` を実行しません。
 
 ```json
 {
@@ -844,8 +877,12 @@ console.log(result);
 ```
 
 #### 挙動
+
 * `data.api` で呼び出し先 API 名を指定します。未指定時は現在処理中の API 名（HTTP エンドポイント実行時）を使用します。
 * 引数オブジェクトは呼び出し先 API の `nyanAllParams` に渡されます（`api` は呼び出し先名で上書き）。
+* 呼び出し先に設定した `paramCheck` → 本体スクリプト → `outCheck` の順で実行します。チェック拒否・不正なチェック結果・例外は、呼び出し元のJavaScriptで `try` / `catch` できる例外になります。実行前の拒否時は本体を実行せず、出力前の拒否時は本体の結果を返しません。
+* `outCheck` の `nyan_output` は、戻り値が `{status, headers, contentType, body}` 形式の場合は通常HTTPと同様に生成します。それ以外の戻り値は、文字列をそのまま、オブジェクト・配列・数値・真偽値・`null` をJSON本文として渡します。チェックに成功した場合の戻り値は変わりません。
+* `nyan_mode: "checkOnly"` を渡した場合は `paramCheck` の結果オブジェクトを返し、本体と `outCheck` を実行しません。`paramCheck` がなければ `{success: true, status: 200, result: null}` を返します。チェックが拒否された場合は例外になります。
 * 呼び出し先の戻り値が JSON 文字列の場合は自動でオブジェクト化されます。
 * `type: "ws_client"` のエンドポイントは `nyanCallMe` では呼び出せません。
 * `type: "schedule"` のエンドポイントは `nyanCallMe` では呼び出せません。
@@ -880,6 +917,10 @@ WebSocket による双方向通信とプッシュ通知のサンプルを同梱�
 通常HTTPのAPIに `push` を設定すると、`paramCheck`・`outCheck` を通過し、HTTPステータスが200〜399の応答を返した後に、指定先の内容をWebSocket接続へ配信します。文字列・オブジェクト・空の応答・HTMLのみのAPIで共通です。応答の内容や形式は変わりません。
 
 HTTP 4xx・5xxの応答、チェック拒否、スクリプト例外、HTML読み込みや応答変換の失敗、`nyan_mode=checkOnly` の場合はPushを実行しません。本体スクリプトが明示的に `status: 500` などを返した場合も対象です。
+
+Pushの配信先APIにもチェックを適用し、`paramCheck` → 配信内容の生成 → `outCheck` → WebSocket配信の順で処理します。配信先のチェック拒否・不正なチェック結果・例外、または `checkOnly` の場合は配信しません。配信先の拒否によって、配信元の成功応答を変更することはありません。
+
+配信先の本体とチェックには、配信元の `nyanAllParams` を引き継ぎます（`api` も配信元の値のままです）。`outCheck` の `nyan_output.body` は実際に配信する文字列で、`status` は200、`contentType` は `text/html; charset=utf-8` です。
 
 ### JavaScriptによる接続前のOriginチェック
 

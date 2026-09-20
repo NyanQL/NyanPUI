@@ -1180,15 +1180,45 @@ func callNyanAPIFromVMWithContext(snapshot *APIConfigSnapshot, requestContext *g
 	}
 	params["api"] = apiName
 
+	exePath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get executable path: %w", err)
+	}
+	exeDir := filepath.Dir(exePath)
+	if _, check := evaluateParamCheckWithSnapshot(requestContext, snapshot, apiCfg, exeDir, apiCfg.HTML, params); check != nil {
+		if !check.Success || check.Status != http.StatusOK {
+			return nil, internalAPICheckError(apiName, "paramCheck", *check)
+		}
+		return map[string]interface{}{"success": check.Success, "status": check.Status, "result": check.Result}, nil
+	}
+
 	resultValue, err := runJavaScriptValueWithContext(snapshot, requestContext, apiCfg.Script, apiCfg.HTML, params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to run API %s: %w", apiName, err)
 	}
-	if resultValue == nil || goja.IsUndefined(resultValue) || goja.IsNull(resultValue) {
-		return nil, nil
+	var exported interface{}
+	if resultValue != nil && !goja.IsUndefined(resultValue) && !goja.IsNull(resultValue) {
+		exported = resultValue.Export()
+	}
+	if strings.TrimSpace(apiCfg.OutCheck) != "" {
+		response, _, err := responseFromExportedJSValue(resultValue, exported)
+		if err != nil {
+			return nil, fmt.Errorf("invalid response from API %s: %w", apiName, err)
+		}
+		// Internal calls return values. Expose non-string values as JSON to the
+		// checker, while explicit HTTP responses retain their status/body fields.
+		if _, isString := exported.(string); !isString && !hasHTTPResponseFields(exported) {
+			response.Body, err = json.Marshal(exported)
+			if err != nil {
+				return nil, fmt.Errorf("invalid response from API %s: %w", apiName, err)
+			}
+			response.ContentType = "application/json; charset=utf-8"
+		}
+		if check := evaluateOutCheckWithSnapshot(requestContext, snapshot, apiCfg, exeDir, apiCfg.HTML, params, response); check != nil {
+			return nil, internalAPICheckError(apiName, "outCheck", *check)
+		}
 	}
 
-	exported := resultValue.Export()
 	if asText, ok := exported.(string); ok {
 		var parsed interface{}
 		if json.Unmarshal([]byte(asText), &parsed) == nil {
@@ -1196,6 +1226,14 @@ func callNyanAPIFromVMWithContext(snapshot *APIConfigSnapshot, requestContext *g
 		}
 	}
 	return exported, nil
+}
+
+func internalAPICheckError(apiName, stage string, check ParamCheckResponse) error {
+	encoded, err := json.Marshal(check)
+	if err != nil {
+		return fmt.Errorf("API %s %s rejected (status %d)", apiName, stage, check.Status)
+	}
+	return fmt.Errorf("API %s %s rejected: %s", apiName, stage, encoded)
 }
 
 func runJavaScriptValueWithSnapshot(snapshot *APIConfigSnapshot, scriptPath string, htmlPath string, allParams map[string]interface{}) (goja.Value, error) {
@@ -1346,8 +1384,10 @@ func evaluateParamCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot,
 		return true, nil
 	}
 
-	c.Writer.Header().Set("Cache-Control", "no-store")
-	c.Writer.Header().Set("Pragma", "no-cache")
+	if c != nil && c.Writer != nil && !c.Writer.Written() {
+		c.Writer.Header().Set("Cache-Control", "no-store")
+		c.Writer.Header().Set("Pragma", "no-cache")
+	}
 
 	resultValue, err := runJavaScriptValueWithContext(snapshot, c, resolvePath(exeDir, paramCheckPath), htmlPath, allParams)
 	if err != nil {
@@ -1501,6 +1541,19 @@ func responseFromJSValue(value goja.Value) (APIResponse, bool, error) {
 		exported = value.Export()
 	}
 	return responseFromExportedJSValue(value, exported)
+}
+
+func hasHTTPResponseFields(exported interface{}) bool {
+	object, ok := exported.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	for _, field := range []string{"status", "contentType", "headers", "body"} {
+		if _, exists := object[field]; exists {
+			return true
+		}
+	}
+	return false
 }
 
 func responseFromExportedJSValue(value goja.Value, exported interface{}) (APIResponse, bool, error) {
@@ -2885,6 +2938,13 @@ func performPushWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Con
 	exeDir := filepath.Dir(exePath)
 	scriptPath := resolvePath(exeDir, pushConfig.Script)
 	htmlPath := resolvePathFromBase(exeDir, pushConfig.HTML)
+	checkEnabled := strings.TrimSpace(pushConfig.Type) != apiTypeSchedule && strings.TrimSpace(pushConfig.Type) != apiTypeWSClient
+	if checkEnabled {
+		if _, check := evaluateParamCheckWithSnapshot(requestContext, snapshot, pushConfig, exeDir, htmlPath, allParams); check != nil {
+			serviceLog(slog.LevelDebug, "push_check_stopped", "channel", config.Push, "check", "paramCheck", "status", check.Status)
+			return
+		}
+	}
 	var pushResult string
 	if pushConfig.Script == "" {
 		content, err := os.ReadFile(htmlPath)
@@ -2900,6 +2960,13 @@ func performPushWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Con
 			return
 		}
 		pushResult = result.String()
+	}
+	if checkEnabled {
+		response := APIResponse{Status: http.StatusOK, ContentType: "text/html; charset=utf-8", Headers: map[string]string{}, Body: []byte(pushResult)}
+		if check := evaluateOutCheckWithSnapshot(requestContext, snapshot, pushConfig, exeDir, htmlPath, allParams, response); check != nil {
+			serviceLog(slog.LevelDebug, "push_check_stopped", "channel", config.Push, "check", "outCheck", "status", check.Status)
+			return
+		}
 	}
 	if pushResult != "" {
 		wsConnections.RLock()
@@ -4132,6 +4199,8 @@ func handleMCPHTTP(c *gin.Context, snapshot *APIConfigSnapshot, endpointName str
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
 		return
 	}
+	// OAuth checks and the verifier receive the same parsed request body.
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	if len(bytes.TrimSpace(body)) == 0 || bytes.HasPrefix(bytes.TrimSpace(body), []byte("[")) {
 		mcpWriteError(c, nil, -32600, "Invalid Request")
 		return
@@ -4318,7 +4387,8 @@ func handleMCPToolCall(c *gin.Context, snapshot *APIConfigSnapshot, endpointName
 	}
 	principal, authenticated := interface{}(map[string]interface{}{"anonymous": true, "transport": "streamable_http"}), true
 	if mcpOAuthConfigured(mcp.OAuth) {
-		principal, authenticated = invokeOAuthHook(c, snapshot, endpointName, mcp, runtimeURLs, "oauthValidateAccessToken", map[string]interface{}{"authorization": c.GetHeader("Authorization"), "tool": tool.Name, "required_scopes": mcpToolScopes(tool)})
+		result := invokeOAuthHook(c, snapshot, endpointName, mcp, runtimeURLs, "oauthValidateAccessToken", map[string]interface{}{"authorization": c.GetHeader("Authorization"), "tool": tool.Name, "required_scopes": mcpToolScopes(tool)})
+		principal, authenticated = result.Value, result.Allowed && result.CheckResponse == nil
 	}
 	if !authenticated {
 		challenge := fmt.Sprintf(`Bearer resource_metadata="%s", scope="%s"`, runtimeURLs.ProtectedResourceMetadata, strings.Join(mcpToolScopes(tool), " "))
@@ -4373,16 +4443,17 @@ func mcpToolScopes(tool MCPToolConfig) []string {
 	return result
 }
 
-func invokeOAuthHook(c *gin.Context, snapshot *APIConfigSnapshot, endpointName string, mcp EndpointConfig, runtimeURLs mcpRuntimeURLs, hookName string, extra map[string]interface{}) (interface{}, bool) {
-	apiName := map[string]string{"oauthRegister": mcp.OAuth.Register, "oauthAuthorize": mcp.OAuth.Authorize, "oauthToken": mcp.OAuth.Token, "oauthValidateAccessToken": mcp.OAuth.VerifyAccess}[hookName]
-	backing, exists := snapshot.Config[apiName]
-	hookPath := strings.TrimSpace(backing.Script)
-	if !exists || hookPath == "" {
-		return nil, false
-	}
+type oauthAPIResult struct {
+	Value         interface{}
+	Allowed       bool
+	Response      APIResponse
+	CheckResponse *ParamCheckResponse
+}
+
+func oauthHookParams(c *gin.Context, snapshot *APIConfigSnapshot, endpointName string, mcp EndpointConfig, runtimeURLs mcpRuntimeURLs, hookName, apiName string, extra map[string]interface{}) (map[string]interface{}, error) {
 	apiPath, pathErr := canonicalAPIEndpointPath(apiName)
 	if pathErr != nil {
-		return nil, false
+		return nil, pathErr
 	}
 	params := map[string]interface{}{"oauth_hook": hookName, "oauth_api": apiName, "method": c.Request.Method, "request_path": c.Request.URL.Path, "path": apiPath, "endpoint": endpointName, "mcp_api_name": endpointName, "issuer": runtimeURLs.Issuer, "resource": runtimeURLs.Resource, "authorization_server_metadata_url": runtimeURLs.AuthorizationServerMetadata, "protected_resource_metadata_url": runtimeURLs.ProtectedResourceMetadata, "authorization_endpoint": runtimeURLs.AuthorizationEndpoint, "token_endpoint": runtimeURLs.TokenEndpoint, "registration_endpoint": runtimeURLs.RegistrationEndpoint, "scopes": mcp.OAuth.Scopes, "redirect_uri_allowed_prefixes": mcp.RedirectURIAllowedPrefixes, "state_directory": mcpOAuthStateDirectory(snapshot, endpointName), "authorization": c.GetHeader("Authorization")}
 	for key, value := range extra {
@@ -4413,23 +4484,122 @@ func invokeOAuthHook(c *gin.Context, snapshot *APIConfigSnapshot, endpointName s
 			params["form"] = c.Request.PostForm
 		}
 	}
-	value, err := runJavaScriptValueWithContext(snapshot, c, hookPath, "", params)
-	if err != nil || value == nil || goja.IsUndefined(value) || goja.IsNull(value) {
-		return nil, false
-	}
-	exported := value.Export()
-	if result, ok := exported.(map[string]interface{}); ok {
-		if allowed, exists := result["allowed"].(bool); exists {
-			return result["principal"], allowed
+	// Preserve the normal API precedence for the checkOnly control parameter.
+	if body, ok := params["body"].(map[string]interface{}); ok {
+		if mode, exists := body["nyan_mode"]; exists {
+			params["nyan_mode"] = mode
 		}
-		if authenticated, exists := result["authenticated"].(bool); exists {
-			return result["principal"], authenticated
+	}
+	if values := c.Request.PostForm["nyan_mode"]; len(values) > 0 {
+		params["nyan_mode"] = values[0]
+	}
+	if values := c.Request.URL.Query()["nyan_mode"]; len(values) > 0 {
+		params["nyan_mode"] = values[0]
+	}
+	return params, nil
+}
+
+// OAuth responses default to JSON, while explicit HTTP response objects retain
+// their status, headers and body. Both outCheck and the writer use these bytes.
+func oauthHTTPResponse(value interface{}) (APIResponse, error) {
+	response := APIResponse{Status: http.StatusOK, ContentType: "application/json; charset=utf-8", Headers: map[string]string{}}
+	if fields, ok := value.(map[string]interface{}); ok {
+		if rawStatus, exists := fields["status"]; exists {
+			status, valid := parseStatusCode(rawStatus)
+			if !valid || status < 100 || status > 599 {
+				return response, fmt.Errorf("invalid OAuth response status")
+			}
+			response.Status = status
+			if contentType, ok := fields["contentType"].(string); ok && contentType != "" {
+				response.ContentType = contentType
+			}
+			if headers, ok := fields["headers"].(map[string]interface{}); ok {
+				for key, value := range headers {
+					response.Headers[key] = fmt.Sprint(value)
+				}
+			}
+			body, err := jsBodyToBytes(fields["body"])
+			response.Body = body
+			return response, err
+		}
+	}
+	body, err := json.Marshal(value)
+	response.Body = body
+	return response, err
+}
+
+func invokeOAuthHook(c *gin.Context, snapshot *APIConfigSnapshot, endpointName string, mcp EndpointConfig, runtimeURLs mcpRuntimeURLs, hookName string, extra map[string]interface{}) oauthAPIResult {
+	result := oauthAPIResult{Response: APIResponse{
+		Status: http.StatusUnauthorized, ContentType: "application/json; charset=utf-8",
+		Headers: map[string]string{}, Body: []byte(`{"error":"OAuth hook denied the request"}`),
+	}}
+	apiName := map[string]string{
+		"authorizationServerMetadata": mcp.OAuth.AuthorizationServerMetadata,
+		"protectedResourceMetadata":   mcp.OAuth.ProtectedResourceMetadataAPI,
+		"oauthRegister":               mcp.OAuth.Register, "oauthAuthorize": mcp.OAuth.Authorize,
+		"oauthToken": mcp.OAuth.Token, "oauthValidateAccessToken": mcp.OAuth.VerifyAccess,
+	}[hookName]
+	backing, exists := snapshot.Config[apiName]
+	metadata := hookName == "authorizationServerMetadata" || hookName == "protectedResourceMetadata"
+	if !exists || (!metadata && strings.TrimSpace(backing.Script) == "") {
+		return result
+	}
+	params, err := oauthHookParams(c, snapshot, endpointName, mcp, runtimeURLs, hookName, apiName, extra)
+	if err != nil {
+		return result
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		checkResponse := newParamCheckError(http.StatusInternalServerError, err.Error())
+		result.CheckResponse = &checkResponse
+		return result
+	}
+	exeDir := filepath.Dir(exePath)
+	if _, checkResponse := evaluateParamCheckWithSnapshot(c, snapshot, backing, exeDir, "", params); checkResponse != nil {
+		result.CheckResponse = checkResponse
+		return result
+	}
+
+	var exported interface{}
+	switch hookName {
+	case "authorizationServerMetadata":
+		exported = gin.H{"issuer": runtimeURLs.Issuer, "authorization_endpoint": runtimeURLs.AuthorizationEndpoint, "token_endpoint": runtimeURLs.TokenEndpoint, "registration_endpoint": runtimeURLs.RegistrationEndpoint, "response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"}, "token_endpoint_auth_methods_supported": []string{"none"}, "code_challenge_methods_supported": []string{"S256"}, "scopes_supported": mcp.OAuth.Scopes}
+	case "protectedResourceMetadata":
+		exported = gin.H{"resource": runtimeURLs.Resource, "authorization_servers": []string{runtimeURLs.Issuer}, "scopes_supported": mcp.OAuth.Scopes}
+	default:
+		value, runErr := runJavaScriptValueWithContext(snapshot, c, backing.Script, "", params)
+		if runErr != nil {
+			return result
+		}
+		if value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
+			exported = value.Export()
+		}
+	}
+	result.Value, result.Allowed = exported, exported != nil && hookName != "oauthValidateAccessToken"
+	if fields, ok := exported.(map[string]interface{}); ok {
+		if allowed, exists := fields["allowed"].(bool); exists {
+			result.Value, result.Allowed = fields["principal"], allowed
+		} else if authenticated, exists := fields["authenticated"].(bool); exists {
+			result.Value, result.Allowed = fields["principal"], authenticated
 		}
 	}
 	if hookName == "oauthValidateAccessToken" {
-		return nil, false
+		// The verifier's output is a decision object, not an HTTP response.
+		// Give outCheck the complete decision before it is used for authorization.
+		result.Response = APIResponse{Status: http.StatusOK, ContentType: "application/json; charset=utf-8", Headers: map[string]string{}}
+		result.Response.Body, err = json.Marshal(exported)
+	} else if result.Allowed {
+		result.Response, err = oauthHTTPResponse(result.Value)
 	}
-	return exported, true
+	if err != nil {
+		checkResponse := newParamCheckError(http.StatusInternalServerError, err.Error())
+		result.Allowed, result.CheckResponse = false, &checkResponse
+		return result
+	}
+	if checkResponse := evaluateOutCheckWithSnapshot(c, snapshot, backing, exeDir, "", params, result.Response); checkResponse != nil {
+		result.Allowed, result.CheckResponse = false, checkResponse
+	}
+	return result
 }
 
 func handleOAuthJavaScript(c *gin.Context, snapshot *APIConfigSnapshot, endpointName string, mcp EndpointConfig, role string) {
@@ -4452,41 +4622,18 @@ func handleOAuthJavaScript(c *gin.Context, snapshot *APIConfigSnapshot, endpoint
 			c.Status(http.StatusNoContent)
 			return
 		}
-		if role == "authorizationServerMetadata" {
-			c.JSON(http.StatusOK, gin.H{"issuer": runtimeURLs.Issuer, "authorization_endpoint": runtimeURLs.AuthorizationEndpoint, "token_endpoint": runtimeURLs.TokenEndpoint, "registration_endpoint": runtimeURLs.RegistrationEndpoint, "response_types_supported": []string{"code"}, "grant_types_supported": []string{"authorization_code", "refresh_token"}, "token_endpoint_auth_methods_supported": []string{"none"}, "code_challenge_methods_supported": []string{"S256"}, "scopes_supported": mcp.OAuth.Scopes})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"resource": runtimeURLs.Resource, "authorization_servers": []string{runtimeURLs.Issuer}, "scopes_supported": mcp.OAuth.Scopes})
-		return
 	}
 	hookName := role
 	if hookName == "oauthValidateAccessToken" || hookName == "" {
 		c.Status(http.StatusNotFound)
 		return
 	}
-	value, ok := invokeOAuthHook(c, snapshot, endpointName, mcp, runtimeURLs, hookName, map[string]interface{}{})
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "OAuth hook denied the request"})
+	result := invokeOAuthHook(c, snapshot, endpointName, mcp, runtimeURLs, hookName, map[string]interface{}{})
+	if result.CheckResponse != nil {
+		writeParamCheckResponse(c, *result.CheckResponse)
 		return
 	}
-	if response, isResponse := value.(map[string]interface{}); isResponse {
-		if rawStatus, exists := response["status"]; exists {
-			status, _ := parseStatusCode(rawStatus)
-			contentType, _ := response["contentType"].(string)
-			body, _ := jsBodyToBytes(response["body"])
-			if headers, ok := response["headers"].(map[string]interface{}); ok {
-				for key, value := range headers {
-					c.Header(key, fmt.Sprint(value))
-				}
-			}
-			if contentType == "" {
-				contentType = "application/json; charset=utf-8"
-			}
-			c.Data(status, contentType, body)
-			return
-		}
-	}
-	c.JSON(http.StatusOK, value)
+	writeAPIResponse(c, result.Response)
 }
 
 func mcpOriginAllowed(origin string, mcp EndpointConfig, requestOrigin string) bool {
@@ -4777,27 +4924,39 @@ func executeMCPToolWithContext(snapshot *APIConfigSnapshot, requestContext *gin.
 	if !ok {
 		return nil, "Tool backing API is unavailable."
 	}
+	exePath, err := os.Executable()
+	if err != nil {
+		return nil, "Tool execution failed."
+	}
+	exeDir := filepath.Dir(exePath)
+	if _, check := evaluateParamCheckWithSnapshot(requestContext, snapshot, backing, exeDir, backing.HTML, args); check != nil {
+		return mcpCheckResult(*check), ""
+	}
 	value, err := runJavaScriptValueWithContext(snapshot, requestContext, backing.Script, backing.HTML, args)
 	if err != nil {
 		return nil, "Tool execution failed."
 	}
-	response, handled, err := responseFromJSValue(value)
+	var exported interface{}
+	if value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
+		exported = value.Export()
+	}
+	response, _, err := responseFromExportedJSValue(value, exported)
 	if err != nil {
 		return nil, "Tool returned invalid JSON."
 	}
+	if !hasHTTPResponseFields(exported) {
+		response.Body, err = json.Marshal(exported)
+		if err != nil {
+			return nil, "Tool returned invalid JSON."
+		}
+		response.ContentType = "application/json; charset=utf-8"
+	}
 	body := response.Body
-	if exported, ok := value.Export().(map[string]interface{}); ok {
-		_, hasBody := exported["body"]
-		_, hasStatus := exported["status"]
-		_, hasContentType := exported["contentType"]
-		_, hasHeaders := exported["headers"]
-		handled = hasBody || hasStatus || hasContentType || hasHeaders
-	}
-	if !handled {
-		body, _ = json.Marshal(value.Export())
-	}
 	if len(body) > maxMCPToolResultBytes {
 		return nil, "Tool result is too large."
+	}
+	if check := evaluateOutCheckWithSnapshot(requestContext, snapshot, backing, exeDir, backing.HTML, args, response); check != nil {
+		return mcpCheckResult(*check), ""
 	}
 	var structured interface{}
 	if json.Unmarshal(body, &structured) != nil {
@@ -4808,6 +4967,19 @@ func executeMCPToolWithContext(snapshot *APIConfigSnapshot, requestContext *gin.
 	}
 	return map[string]interface{}{"content": []map[string]interface{}{{"type": "text", "text": string(body)}}, "structuredContent": structured, "isError": response.Status >= http.StatusBadRequest}, ""
 }
+
+func mcpCheckResult(check ParamCheckResponse) map[string]interface{} {
+	encoded, err := json.Marshal(check)
+	if err != nil || len(encoded) > maxMCPToolResultBytes {
+		return map[string]interface{}{"content": []map[string]interface{}{{"type": "text", "text": "Tool check result is invalid or too large."}}, "isError": true}
+	}
+	return map[string]interface{}{
+		"content":           []map[string]interface{}{{"type": "text", "text": string(encoded)}},
+		"structuredContent": map[string]interface{}{"success": check.Success, "status": check.Status, "result": check.Result},
+		"isError":           !check.Success || check.Status != http.StatusOK,
+	}
+}
+
 func mcpStdioResult(id json.RawMessage, result interface{}) mcpStdioProtocolResponse {
 	return mcpStdioProtocolResponse{Respond: true, Payload: map[string]interface{}{"jsonrpc": "2.0", "id": rawMCPID(id), "result": result}}
 }
