@@ -3,9 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -258,6 +256,8 @@ func TestEndpointConfigAcceptsLowercaseOutcheck(t *testing.T) {
 }
 
 func TestResolveServiceFilePathsDefaultsToExecDir(t *testing.T) {
+	t.Setenv("NYAN_API_PATH", "")
+	t.Setenv("NYAN_CONFIG_PATH", "")
 	execDir := t.TempDir()
 	writeTestFile(t, filepath.Join(execDir, "api.json"), "{}")
 	writeTestFile(t, filepath.Join(execDir, "config.json"), "{}")
@@ -417,8 +417,9 @@ func TestLoadAPIConfigResolvesEndpointPathsFromAPIFileDirectory(t *testing.T) {
 			"path": "./public"
 		}
 	}`)
+	previous := currentAPISnapshot()
 	setAPIConfig(nil)
-	t.Cleanup(func() { setAPIConfig(nil) })
+	t.Cleanup(func() { publishAPISnapshot(previous) })
 
 	if err := loadAPIConfig(apiPath, apiBaseDir); err != nil {
 		t.Fatalf("loadAPIConfig() error = %v", err)
@@ -582,8 +583,9 @@ func TestDynamicDispatcherReflectsAddDeleteAndSlashName(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "hot.js")
 	writeTestFile(t, script, `"hot";`)
+	previous := currentAPISnapshot()
 	setAPIConfig(APIConfig{"nested/hot": {Script: script}})
-	t.Cleanup(func() { setAPIConfig(nil) })
+	t.Cleanup(func() { publishAPISnapshot(previous) })
 	router := gin.New()
 	router.NoRoute(func(c *gin.Context) {
 		if !dispatchDynamicEndpoint(c) {
@@ -614,8 +616,9 @@ func TestDynamicDispatcherUsesLongestPublicPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeTestFile(t, filepath.Join(longDir, "file.txt"), "long")
+	previous := currentAPISnapshot()
 	setAPIConfig(APIConfig{"assets": {Type: apiTypePublic, Path: shortDir}, "assets/deep": {Type: apiTypePublic, Path: longDir}})
-	t.Cleanup(func() { setAPIConfig(nil) })
+	t.Cleanup(func() { publishAPISnapshot(previous) })
 	router := gin.New()
 	router.NoRoute(func(c *gin.Context) {
 		if !dispatchDynamicEndpoint(c) {
@@ -630,8 +633,9 @@ func TestDynamicDispatcherUsesLongestPublicPrefix(t *testing.T) {
 }
 
 func TestAPIConfigConcurrentReadAndReplace(t *testing.T) {
+	previous := currentAPISnapshot()
 	setAPIConfig(APIConfig{"api": {Description: "initial"}})
-	t.Cleanup(func() { setAPIConfig(nil) })
+	t.Cleanup(func() { publishAPISnapshot(previous) })
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
@@ -648,15 +652,53 @@ func TestAPIConfigConcurrentReadAndReplace(t *testing.T) {
 	wg.Wait()
 }
 
+func TestCronScheduleNext(t *testing.T) {
+	for _, tc := range []struct{ name, expression, after, want string }{
+		{"minute_boundary", "* * * * *", "2026-09-20T10:07:30Z", "2026-09-20T10:08:00Z"},
+		{"range_and_step", "*/15 9-10 * * 1-5", "2026-09-18T10:59:00Z", "2026-09-21T09:00:00Z"},
+		{"sunday_alias", "0 0 * * 7", "2026-09-19T23:59:00Z", "2026-09-20T00:00:00Z"},
+		{"day_or_weekday_uses_weekday", "0 9 1 * 1", "2026-09-01T09:00:00Z", "2026-09-07T09:00:00Z"},
+		{"day_or_weekday_uses_day", "0 9 1 * 1", "2026-08-31T09:00:00Z", "2026-09-01T09:00:00Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			schedule, err := parseCronSchedule(tc.expression)
+			if err != nil {
+				t.Fatal(err)
+			}
+			after, err := time.Parse(time.RFC3339, tc.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := schedule.next(after).Format(time.RFC3339); got != tc.want {
+				t.Fatalf("next occurrence of %q after %s = %s, want %s", tc.expression, tc.after, got, tc.want)
+			}
+		})
+	}
+	for _, invalid := range []string{"* * * *", "60 * * * *", "*/0 * * * *", "0 9 * * 5-1"} {
+		t.Run("invalid_"+invalid, func(t *testing.T) {
+			if _, err := parseCronSchedule(invalid); err == nil {
+				t.Fatalf("invalid cron expression accepted: %q", invalid)
+			}
+		})
+	}
+}
+
 func TestBackgroundRuntimeManagerUpdatesAndStopsSchedule(t *testing.T) {
 	manager := newBackgroundRuntimeManager()
-	firstSchedule, _ := parseCronSchedule("0 0 1 1 *")
+	cleanupBackgroundRuntimeManager(t, manager)
+	firstSchedule, err := parseCronSchedule("0 0 1 1 *")
+	if err != nil {
+		t.Fatal(err)
+	}
 	first := scheduleJobConfig{name: "job", scriptPath: "/tmp/job-v1.js", trigger: TriggerConfig{Type: "cron", Value: "0 0 1 1 *"}, schedule: firstSchedule}
 	manager.reconcile(map[string]scheduleJobConfig{"job": first}, nil)
 	manager.mu.Lock()
 	runtime := manager.schedules["job"]
 	manager.mu.Unlock()
-	secondSchedule, _ := parseCronSchedule("0 0 2 1 *")
+	secondSchedule, err := parseCronSchedule("0 0 2 1 *")
+	if err != nil {
+		t.Fatal(err)
+	}
 	second := scheduleJobConfig{name: "job", scriptPath: "/tmp/job-v2.js", trigger: TriggerConfig{Type: "cron", Value: "0 0 2 1 *"}, schedule: secondSchedule}
 	manager.reconcile(map[string]scheduleJobConfig{"job": second}, nil)
 	manager.mu.Lock()
@@ -676,6 +718,7 @@ func TestBackgroundRuntimeManagerReconnectsOnlyForURLChange(t *testing.T) {
 	firstURL, firstConnected, firstDisconnected := newHotReloadWebSocketServer(t)
 	secondURL, secondConnected, secondDisconnected := newHotReloadWebSocketServer(t)
 	manager := newBackgroundRuntimeManager()
+	cleanupBackgroundRuntimeManager(t, manager)
 	first := wsClientConfig{name: "client", scriptPath: "/tmp/v1.js", connectURL: firstURL}
 	manager.reconcile(nil, map[string]wsClientConfig{"client": first})
 	waitForRuntimeSignal(t, firstConnected, "first connect")
@@ -711,7 +754,7 @@ func TestWSClientBackoffResetsAfterSuccessfulConnection(t *testing.T) {
 	requestCount := 0
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
-		t.Skipf("local listener unavailable: %v", err)
+		t.Fatalf("local listener unavailable: %v", err)
 	}
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
@@ -782,20 +825,52 @@ func TestWSClientBackoffResetsAfterSuccessfulConnection(t *testing.T) {
 	}
 }
 
+func cleanupBackgroundRuntimeManager(t *testing.T, manager *backgroundRuntimeManager) {
+	t.Helper()
+	t.Cleanup(func() {
+		manager.mu.Lock()
+		done := make([]<-chan struct{}, 0, len(manager.schedules)+len(manager.wsClients))
+		for _, job := range manager.schedules {
+			done = append(done, job.done)
+		}
+		for _, client := range manager.wsClients {
+			done = append(done, client.done)
+		}
+		manager.mu.Unlock()
+		manager.reconcile(nil, nil)
+		for _, stopped := range done {
+			select {
+			case <-stopped:
+			case <-time.After(3 * time.Second):
+				t.Error("background runtime did not stop during cleanup")
+			}
+		}
+	})
+}
+
 func newHotReloadWebSocketServer(t *testing.T) (string, <-chan struct{}, <-chan struct{}) {
 	t.Helper()
 	connected, disconnected := make(chan struct{}, 1), make(chan struct{}, 1)
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
-		t.Skipf("local listener unavailable: %v", err)
+		t.Fatalf("local listener unavailable: %v", err)
 	}
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
-		connected <- struct{}{}
-		defer func() { disconnected <- struct{}{}; _ = conn.Close() }()
+		select {
+		case connected <- struct{}{}:
+		default:
+		}
+		defer func() {
+			_ = conn.Close()
+			select {
+			case disconnected <- struct{}{}:
+			default:
+			}
+		}()
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				return
@@ -883,14 +958,11 @@ if (nyanAllParams.deny === "1") {
 		t.Fatal(err)
 	}
 
-	router := gin.New()
 	config := EndpointConfig{
 		Script:     mainScript,
 		ParamCheck: checkScript,
 	}
-	router.Any("/secure", func(c *gin.Context) {
-		handleAPIRequest(c, config)
-	})
+	router := newRequestRegressionRouter(t, APIConfig{"secure": config})
 
 	req := httptest.NewRequest(http.MethodGet, "/secure?deny=1", nil)
 	rec := httptest.NewRecorder()
@@ -941,13 +1013,10 @@ if (nyanAllParams.nyan_output.body === "main ok") {
 		t.Fatal(err)
 	}
 
-	router := gin.New()
-	router.Any("/checked", func(c *gin.Context) {
-		handleAPIRequest(c, EndpointConfig{
-			Script:   mainScript,
-			OutCheck: outCheckScript,
-		})
-	})
+	router := newRequestRegressionRouter(t, APIConfig{"checked": {
+		Script:   mainScript,
+		OutCheck: outCheckScript,
+	}})
 
 	req := httptest.NewRequest(http.MethodGet, "/checked", nil)
 	rec := httptest.NewRecorder()
@@ -979,13 +1048,10 @@ if (nyanAllParams.nyan_output_body === "main ok") {
 		t.Fatal(err)
 	}
 
-	router := gin.New()
-	router.Any("/checked", func(c *gin.Context) {
-		handleAPIRequest(c, EndpointConfig{
-			Script:   mainScript,
-			OutCheck: outCheckScript,
-		})
-	})
+	router := newRequestRegressionRouter(t, APIConfig{"checked": {
+		Script:   mainScript,
+		OutCheck: outCheckScript,
+	}})
 
 	req := httptest.NewRequest(http.MethodGet, "/checked", nil)
 	rec := httptest.NewRecorder()
@@ -1151,13 +1217,10 @@ if (nyanAllParams.nyan_output.status === 201 && nyanAllParams.nyan_output.body.i
 		t.Fatal(err)
 	}
 
-	router := gin.New()
-	router.Any("/checked", func(c *gin.Context) {
-		handleAPIRequest(c, EndpointConfig{
-			Script:   mainScript,
-			OutCheck: outCheckScript,
-		})
-	})
+	router := newRequestRegressionRouter(t, APIConfig{"checked": {
+		Script:   mainScript,
+		OutCheck: outCheckScript,
+	}})
 
 	req := httptest.NewRequest(http.MethodGet, "/checked", nil)
 	rec := httptest.NewRecorder()
@@ -1412,28 +1475,15 @@ func TestMCPRateAndConcurrencyLimits(t *testing.T) {
 	}
 }
 
-func TestProductionMCPConfiguration(t *testing.T) {
-	path, err := filepath.Abs("api.vps.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Skip("local production API configuration is not present")
-	} else if err != nil {
-		t.Fatal(err)
-	}
-	loaded, err := readAPIConfigGraph(path, filepath.Dir(path))
-	if err != nil {
-		t.Fatal(err)
-	}
-	mcp := loaded.Snapshot.Config["server_mcp_http"]
-	if mcp.Transport != "streamable_http" || len(mcp.Tools) != 1 || mcp.Tools[0].Name != "sample/json" {
-		t.Fatalf("production MCP=%#v", mcp)
-	}
-	if _, exists := loaded.Snapshot.Config["oauth/admin/users"]; exists {
-		t.Fatal("sample configuration still exposes the removed user management API")
-	}
-	router := newRequestRegressionRouter(t, loaded.Snapshot.Config)
+func TestMCPDoesNotRegisterUserManagement(t *testing.T) {
+	hook := writeFixtureFile(t, `({authenticated:false});`)
+	tool := writeFixtureFile(t, `({ok:true});`)
+	config := APIConfig{"tool": {Script: tool}, "verify": {Script: hook}, "mcp": {
+		Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocol20251125},
+		Tools: []MCPToolConfig{{Name: "tool", API: "tool"}},
+	}}
+	completeTestOAuthConfiguration(t, config)
+	router := newRequestRegressionRouter(t, config)
 	for _, method := range []string{http.MethodGet, http.MethodPost} {
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, httptest.NewRequest(method, "/oauth/admin/users", nil))
@@ -1447,8 +1497,196 @@ func TestProductionMCPConfiguration(t *testing.T) {
 	router.ServeHTTP(rec, req)
 	response := decodeJSONRPCCheckResponse(t, rec, "1")
 	var rpcError JSONRPCError
-	if err := json.Unmarshal(response["error"], &rpcError); err != nil || rpcError.Code != -32601 {
+	if err := json.Unmarshal(response["error"], &rpcError); err != nil || rpcError.Code != -32601 || response["result"] != nil {
 		t.Fatalf("removed management API JSON-RPC response=%s error=%v", rec.Body.String(), err)
+	}
+}
+
+func TestOAuthHooksReceiveHTTPContextAndControlResponse(t *testing.T) {
+	hook := writeFixtureFile(t, `({
+  status:201, headers:{"X-OAuth-Hook":nyanAllParams.oauth_hook},
+  body:{hook:nyanAllParams.oauth_hook, method:nyanAllParams.method,
+    issuer:nyanAllParams.issuer, resource:nyanAllParams.resource,
+    authorize:nyanAllParams.authorization_endpoint,
+    authorization:nyanAllParams.authorization, cookie:nyanAllParams.cookies.session,
+    query:nyanAllParams.query, body:nyanAllParams.body, form:nyanAllParams.form}
+});`)
+	config := APIConfig{"tool": {Script: hook}, "verify": {Script: hook}, "mcp": {
+		Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocol20251125},
+		Tools: []MCPToolConfig{{Name: "tool", API: "tool"}},
+	}}
+	completeTestOAuthConfiguration(t, config)
+	router := newRequestRegressionRouter(t, config)
+	globalConfig.OAuthStateRoot = filepath.Join(t.TempDir(), "state")
+	for _, tc := range []struct {
+		name, method, target, contentType, body, hook, payloadField, payload string
+	}{
+		{name: "authorize_query", method: http.MethodGet, target: "/authorize?state=from-query", hook: "oauthAuthorize", payloadField: "query", payload: `{"state":["from-query"]}`},
+		{name: "register_json", method: http.MethodPost, target: "/register", contentType: "application/json; charset=utf-8", body: `{"client_name":"fixture"}`, hook: "oauthRegister", payloadField: "body", payload: `{"client_name":"fixture"}`},
+		{name: "token_form", method: http.MethodPost, target: "/token", contentType: "application/x-www-form-urlencoded", body: "grant_type=fixture", hook: "oauthToken", payloadField: "form", payload: `{"grant_type":["fixture"]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, "https://example.test:8443"+tc.target, strings.NewReader(tc.body))
+			if tc.contentType != "" {
+				req.Header.Set("Content-Type", tc.contentType)
+			}
+			req.Header.Set("Authorization", "Bearer fixture")
+			req.AddCookie(&http.Cookie{Name: "session", Value: "fixture-cookie"})
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusCreated || rec.Header().Get("X-OAuth-Hook") != tc.hook {
+				t.Fatalf("hook response status=%d headers=%v body=%s", rec.Code, rec.Header(), rec.Body.String())
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			for key, want := range map[string]string{
+				"hook": tc.hook, "method": tc.method, "issuer": "https://example.test:8443",
+				"resource": "https://example.test:8443/mcp", "authorize": "https://example.test:8443/authorize",
+				"authorization": "Bearer fixture", "cookie": "fixture-cookie",
+			} {
+				var got string
+				if err := json.Unmarshal(body[key], &got); err != nil || got != want {
+					t.Fatalf("hook input %s=%s, want %q; error=%v", key, body[key], want, err)
+				}
+			}
+			if string(body[tc.payloadField]) != tc.payload {
+				t.Fatalf("hook %s=%s, want %s", tc.payloadField, body[tc.payloadField], tc.payload)
+			}
+		})
+	}
+}
+
+func TestArgon2idHashAndVerify(t *testing.T) {
+	const password = "fixture-password"
+	encoded, err := argon2idHash(password)
+	if err != nil || !argon2idVerify(password, encoded) {
+		t.Fatalf("hash round trip failed: %v", err)
+	}
+	parts := strings.Split(encoded, "$")
+	changed := func(index int, value string) string {
+		copyOfParts := append([]string(nil), parts...)
+		copyOfParts[index] = value
+		return strings.Join(copyOfParts, "$")
+	}
+	for _, tc := range []struct{ name, password, encoded string }{
+		{"wrong_password", "wrong-password", encoded},
+		{"empty_hash", password, ""},
+		{"wrong_algorithm", password, changed(1, "argon2i")},
+		{"wrong_version", password, changed(2, "v=16")},
+		{"excessive_work", password, changed(3, "m=4294967295,t=4294967295,p=255")},
+		{"invalid_salt", password, changed(4, "!")},
+		{"short_digest", password, changed(5, "AA")},
+		{"oversize_password", strings.Repeat("x", 4097), encoded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if argon2idVerify(tc.password, tc.encoded) {
+				t.Fatal("invalid password or hash was accepted")
+			}
+		})
+	}
+	for _, invalid := range []string{"", strings.Repeat("x", 4097)} {
+		if _, err := argon2idHash(invalid); err == nil {
+			t.Fatal("invalid password was hashed")
+		}
+	}
+}
+
+func TestJavaScriptOAuthStateLifecycle(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	script := writeFixtureFile(t, `
+nyanOAuthWrite("tokens/one.json", '{"value":"one"}');
+const read = nyanOAuthRead("tokens/one.json");
+const consumed = nyanOAuthConsume("tokens/one.json");
+const missing = nyanOAuthRead("tokens/one.json");
+const replay = nyanOAuthConsume("tokens/one.json");
+nyanOAuthWrite("tokens/remove.json", '{"value":"remove"}');
+const deleted = nyanOAuthDelete("tokens/remove.json");
+const deletedAgain = nyanOAuthDelete("tokens/remove.json");
+JSON.stringify({read:read,consumed:consumed,missing:missing,replay:replay,deleted:deleted,deletedAgain:deletedAgain});
+`)
+	value, err := runJavaScriptValueWithSnapshot(&APIConfigSnapshot{}, script, "", map[string]interface{}{"state_directory": root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Read, Consumed, Missing, Replay string
+		Deleted, DeletedAgain           bool
+	}
+	if err := json.Unmarshal([]byte(value.String()), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Read != `{"value":"one"}` || result.Consumed != result.Read || result.Missing != "" || result.Replay != "" || !result.Deleted || !result.DeletedAgain {
+		t.Fatalf("unexpected state lifecycle: %+v", result)
+	}
+	if keys, err := oauthListState(root, "tokens"); err != nil || len(keys) != 0 {
+		t.Fatalf("consumed/deleted state remains: keys=%v error=%v", keys, err)
+	}
+}
+
+func TestMCPHTTPRejectsInvalidRequestsBeforeToolExecution(t *testing.T) {
+	const call = `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"tool","arguments":{}}}`
+	for _, tc := range []struct {
+		name, method, contentType, accept, version, body string
+		status                                           int
+		rpcError, runsTool                               bool
+	}{
+		{name: "valid_charset", contentType: "application/json; charset=utf-8", accept: "application/json, text/event-stream", version: mcpProtocol20251125, body: call, status: 200, runsTool: true},
+		{name: "wrong_method", method: http.MethodGet, status: 405},
+		{name: "wrong_content_type", contentType: "text/plain", accept: "application/json, text/event-stream", body: call, status: 415},
+		{name: "missing_event_stream_accept", contentType: "application/json", accept: "application/json", body: call, status: 406},
+		{name: "malformed_json", contentType: "application/json", accept: "application/json, text/event-stream", body: "{", status: 200, rpcError: true},
+		{name: "batch", contentType: "application/json", accept: "application/json, text/event-stream", body: "[" + call + "]", status: 200, rpcError: true},
+		{name: "duplicate_id", contentType: "application/json", accept: "application/json, text/event-stream", body: `{"jsonrpc":"2.0","id":1,"id":2,"method":"ping"}`, status: 200, rpcError: true},
+		{name: "missing_protocol", contentType: "application/json", accept: "application/json, text/event-stream", body: call, status: 400},
+		{name: "oversized_body", contentType: "application/json", accept: "application/json, text/event-stream", body: strings.Repeat(" ", (1<<20)+1), status: 413},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "tool-ran")
+			script := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({status:200,body:{ok:true}});`, marker))
+			config := APIConfig{"tool": {Script: script}, "mcp": {
+				Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocol20251125},
+				AllowedOrigins: []string{"https://client.example"}, Tools: []MCPToolConfig{{Name: "tool", API: "tool"}},
+			}}
+			if err := validateMCPConfiguration(config); err != nil {
+				t.Fatal(err)
+			}
+			router := newRequestRegressionRouter(t, config)
+			method := tc.method
+			if method == "" {
+				method = http.MethodPost
+			}
+			req := httptest.NewRequest(method, "https://example.test/mcp", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", tc.contentType)
+			req.Header.Set("Accept", tc.accept)
+			req.Header.Set("MCP-Protocol-Version", tc.version)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status=%d, want %d; body=%s", rec.Code, tc.status, rec.Body.String())
+			}
+			if tc.rpcError {
+				response := decodeJSONRPCCheckResponse(t, rec, "null")
+				var rpcError JSONRPCError
+				if err := json.Unmarshal(response["error"], &rpcError); err != nil || rpcError.Code == 0 || response["result"] != nil {
+					t.Fatalf("invalid request did not return a JSON-RPC error: body=%s error=%v", rec.Body.String(), err)
+				}
+			}
+			if tc.runsTool {
+				response := decodeJSONRPCCheckResponse(t, rec, "7")
+				var result struct {
+					IsError           bool `json:"isError"`
+					StructuredContent struct {
+						OK bool `json:"ok"`
+					} `json:"structuredContent"`
+				}
+				if err := json.Unmarshal(response["result"], &result); err != nil || result.IsError || !result.StructuredContent.OK || response["error"] != nil {
+					t.Fatalf("valid request did not return tool output: body=%s error=%v", rec.Body.String(), err)
+				}
+			}
+			assertJSONRPCExecutionMarker(t, marker, tc.runsTool)
+		})
 	}
 }
 
@@ -1620,188 +1858,6 @@ func TestOAuthListStateRejectsUnsafeEntries(t *testing.T) {
 	}
 }
 
-func TestOAuthHookJavaScriptLoadsWithoutGoState(t *testing.T) {
-	path, err := filepath.Abs("javascript/oauth_hooks.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Skip("local OAuth hook JavaScript is not present")
-	} else if err != nil {
-		t.Fatal(err)
-	}
-	oldSnapshot := currentAPISnapshot()
-	oldConfig := globalConfig
-	publishAPISnapshot(&APIConfigSnapshot{Config: APIConfig{}})
-	globalConfig = Config{}
-	t.Cleanup(func() { publishAPISnapshot(oldSnapshot); globalConfig = oldConfig })
-	value, err := runJavaScriptValueWithSnapshot(currentAPISnapshot(), path, "", map[string]interface{}{"oauth_hook": "oauthValidateAccessToken", "headers": map[string]interface{}{}, "resource": "https://example.test/mcp"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, ok := value.Export().(map[string]interface{})
-	if !ok || result["authenticated"] != false {
-		t.Fatalf("hook result=%#v", value.Export())
-	}
-}
-
-func TestJavaScriptOAuthAuthorizationCodePKCEFlow(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	hook, err := filepath.Abs("javascript/oauth_hooks.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(hook); os.IsNotExist(err) {
-		t.Skip("local OAuth hook JavaScript is not present")
-	} else if err != nil {
-		t.Fatal(err)
-	}
-	toolScript := filepath.Join(t.TempDir(), "tool.js")
-	writeTestFile(t, toolScript, `({status:200,contentType:"application/json",body:{ok:true,user:nyanAllParams.mcp_principal.user_id}});`)
-	stateDirectory := t.TempDir()
-	resource := "https://example.test:8443/server_mcp"
-	snapshot := &APIConfigSnapshot{Config: APIConfig{
-		"server_mcp":                             {Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{"2025-11-25"}, AllowedOrigins: []string{"https://chatgpt.com"}, RedirectURIAllowedPrefixes: []string{"https://chatgpt.com/connector/oauth/"}, OAuth: MCPOAuthHooks{AuthorizationServerMetadata: ".well-known/oauth-authorization-server", ProtectedResourceMetadataAPI: ".well-known/oauth-protected-resource/server_mcp", Authorize: "oauth/authorize", Token: "oauth/token", Register: "oauth/register", VerifyAccess: "oauth/verify_access"}, Tools: []MCPToolConfig{{Name: "sample", API: "sample"}}},
-		"sample":                                 {Type: "api", Script: toolScript, SecuritySchemes: []map[string]interface{}{{"type": "oauth2", "scopes": []string{"nyanpui:read"}}}},
-		".well-known/oauth-authorization-server": {Type: "api"}, ".well-known/oauth-protected-resource/server_mcp": {Type: "api"},
-		"oauth/authorize": {Type: "api", Script: hook}, "oauth/token": {Type: "api", Script: hook}, "oauth/register": {Type: "api", Script: hook}, "oauth/verify_access": {Type: "api", Script: hook, Scopes: []string{"nyanpui:read"}},
-	}}
-	if err := validateMCPConfiguration(snapshot.Config); err != nil {
-		t.Fatal(err)
-	}
-	oldSnapshot := currentAPISnapshot()
-	oldConfig := globalConfig
-	publishAPISnapshot(snapshot)
-	globalConfig = Config{Name: "NyanPUI", Version: "test", OAuthStateRoot: stateDirectory}
-	t.Cleanup(func() { publishAPISnapshot(oldSnapshot); globalConfig = oldConfig })
-	// Provision this fixture directly; the server has no user management API.
-	passwordHash, err := argon2idHash("oauth-password")
-	if err != nil {
-		t.Fatal(err)
-	}
-	usernameDigest := sha256.Sum256([]byte("neko"))
-	usernameHash := base64.RawURLEncoding.EncodeToString(usernameDigest[:])
-	userRecord, err := json.Marshal(map[string]interface{}{
-		"version": 1, "kind": "user", "username": "neko", "usernameHash": usernameHash,
-		"passwordHash": passwordHash, "disabled": false,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := oauthWriteState(mcpOAuthStateDirectory(snapshot, "server_mcp"), "users/"+usernameHash+".json", string(userRecord)); err != nil {
-		t.Fatal(err)
-	}
-	router := gin.New()
-	router.NoRoute(func(c *gin.Context) {
-		c.Request.Host = "example.test:8443"
-		c.Request.URL.Scheme = "https"
-		if !dispatchMCPOrOAuth(c) {
-			c.Status(http.StatusNotFound)
-		}
-	})
-
-	badRegisterRequest := httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(`{"redirect_uris":["https://attacker.test/callback"],"scope":"nyanpui:read"}`))
-	badRegisterRequest.Header.Set("Content-Type", "application/json")
-	badRegistration := httptest.NewRecorder()
-	router.ServeHTTP(badRegistration, badRegisterRequest)
-	if badRegistration.Code != http.StatusBadRequest || !strings.Contains(badRegistration.Body.String(), "invalid_redirect_uri") {
-		t.Fatalf("bad registration status=%d body=%s", badRegistration.Code, badRegistration.Body.String())
-	}
-
-	registerRequest := httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(`{"client_name":"test","redirect_uris":["https://chatgpt.com/connector/oauth/test-client"],"scope":"nyanpui:read","grant_types":["authorization_code","refresh_token"],"response_types":["code"],"token_endpoint_auth_method":"none"}`))
-	registerRequest.Header.Set("Content-Type", "application/json; charset=utf-8")
-	registration := httptest.NewRecorder()
-	router.ServeHTTP(registration, registerRequest)
-	if registration.Code != http.StatusCreated {
-		t.Fatalf("register status=%d body=%s", registration.Code, registration.Body.String())
-	}
-	var client map[string]interface{}
-	if err := json.Unmarshal(registration.Body.Bytes(), &client); err != nil {
-		t.Fatal(err)
-	}
-	clientID, _ := client["client_id"].(string)
-	if clientID == "" {
-		t.Fatalf("registration=%#v", client)
-	}
-
-	verifier := strings.Repeat("v", 48)
-	digest := sha256.Sum256([]byte(verifier))
-	challenge := base64.RawURLEncoding.EncodeToString(digest[:])
-	authorizeQuery := url.Values{"response_type": {"code"}, "client_id": {clientID}, "redirect_uri": {"https://chatgpt.com/connector/oauth/test-client"}, "scope": {"nyanpui:read"}, "state": {"test-state"}, "resource": {resource}, "code_challenge": {challenge}, "code_challenge_method": {"S256"}}
-	authorizeRequest := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+authorizeQuery.Encode(), nil)
-	authorize := httptest.NewRecorder()
-	router.ServeHTTP(authorize, authorizeRequest)
-	if authorize.Code != http.StatusOK || len(authorize.Result().Cookies()) != 1 {
-		t.Fatalf("authorize status=%d body=%s cookies=%v", authorize.Code, authorize.Body.String(), authorize.Result().Cookies())
-	}
-	body := authorize.Body.String()
-	if !strings.Contains(body, `action="https://example.test:8443/oauth/authorize"`) {
-		t.Fatalf("authorize form action is not absolute: %s", body)
-	}
-	if csp := authorize.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self' https://chatgpt.com") {
-		t.Fatalf("authorize CSP does not allow form submission from a sandboxed OAuth modal: %q", csp)
-	}
-	requestID := htmlInputValue(body, "request_id")
-	csrf := htmlInputValue(body, "csrf")
-	if requestID == "" || csrf == "" {
-		t.Fatalf("authorize form is incomplete: %s", body)
-	}
-	consentForm := url.Values{"request_id": {requestID}, "csrf": {csrf}, "username": {"neko"}, "password": {"oauth-password"}, "decision": {"allow"}}
-	consentRequest := httptest.NewRequest(http.MethodPost, "/oauth/authorize", strings.NewReader(consentForm.Encode()))
-	consentRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	consentRequest.AddCookie(authorize.Result().Cookies()[0])
-	consent := httptest.NewRecorder()
-	router.ServeHTTP(consent, consentRequest)
-	if consent.Code != http.StatusSeeOther {
-		t.Fatalf("consent status=%d body=%s", consent.Code, consent.Body.String())
-	}
-	redirect, err := url.Parse(consent.Header().Get("Location"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	code := redirect.Query().Get("code")
-	if code == "" || redirect.Query().Get("state") != "test-state" {
-		t.Fatalf("redirect=%s", redirect.String())
-	}
-
-	tokenForm := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "client_id": {clientID}, "redirect_uri": {"https://chatgpt.com/connector/oauth/test-client"}, "resource": {resource}, "code_verifier": {verifier}}
-	tokenRequest := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(tokenForm.Encode()))
-	tokenRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	tokenResponse := httptest.NewRecorder()
-	router.ServeHTTP(tokenResponse, tokenRequest)
-	if tokenResponse.Code != http.StatusOK {
-		t.Fatalf("token status=%d body=%s", tokenResponse.Code, tokenResponse.Body.String())
-	}
-	var token map[string]interface{}
-	if err := json.Unmarshal(tokenResponse.Body.Bytes(), &token); err != nil {
-		t.Fatal(err)
-	}
-	accessToken, _ := token["access_token"].(string)
-	if accessToken == "" {
-		t.Fatalf("token=%#v", token)
-	}
-
-	callBody := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sample","arguments":{}}}`
-	callRequest := httptest.NewRequest(http.MethodPost, "/server_mcp", strings.NewReader(callBody))
-	callRequest.Header.Set("Content-Type", "application/json")
-	callRequest.Header.Set("Accept", "application/json, text/event-stream")
-	callRequest.Header.Set("Authorization", "Bearer "+accessToken)
-	callRequest.Header.Set("MCP-Protocol-Version", "2025-11-25")
-	callResponse := httptest.NewRecorder()
-	router.ServeHTTP(callResponse, callRequest)
-	if callResponse.Code != http.StatusOK || !strings.Contains(callResponse.Body.String(), `"user":"neko"`) {
-		t.Fatalf("tool status=%d body=%s", callResponse.Code, callResponse.Body.String())
-	}
-
-	reuseRequest := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(tokenForm.Encode()))
-	reuseRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	reuseResponse := httptest.NewRecorder()
-	router.ServeHTTP(reuseResponse, reuseRequest)
-	if reuseResponse.Code != http.StatusBadRequest || !strings.Contains(reuseResponse.Body.String(), "invalid_grant") {
-		t.Fatalf("reused code status=%d body=%s", reuseResponse.Code, reuseResponse.Body.String())
-	}
-}
-
 func TestCurrentMCPConfigSupportsMultipleTransportsAndSharedTool(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "tool.js")
@@ -1901,20 +1957,6 @@ func TestMCPHTTPCanonicalAndQueryEndpoints(t *testing.T) {
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("stdio HTTP status=%d", response.Code)
 	}
-}
-
-func htmlInputValue(body, name string) string {
-	marker := `name="` + name + `" value="`
-	start := strings.Index(body, marker)
-	if start < 0 {
-		return ""
-	}
-	start += len(marker)
-	end := strings.Index(body[start:], `"`)
-	if end < 0 {
-		return ""
-	}
-	return body[start : start+end]
 }
 
 func writeTestFile(t *testing.T, path string, content string) {
@@ -2058,38 +2100,72 @@ JSON.stringify(nyanGetRequestHeaders());
 func TestCookieRequestIsolation(t *testing.T) {
 	enteredA, enteredB := make(chan struct{}), make(chan struct{})
 	releaseA, releaseB := make(chan struct{}), make(chan struct{})
+	abort := make(chan struct{})
 	gate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/a" {
-			close(enteredA)
-			<-releaseA
-		} else {
-			close(enteredB)
-			<-releaseB
+		entered, release := enteredA, releaseA
+		if r.URL.Path == "/b" {
+			entered, release = enteredB, releaseB
+		}
+		close(entered)
+		select {
+		case <-release:
+		case <-abort:
+		case <-r.Context().Done():
 		}
 	}))
-	defer gate.Close()
+	t.Cleanup(gate.Close)
 	script := writeFixtureFile(t, `nyanGetAPI(nyanAllParams.gate,"",""); nyanGetCookie("session") + ":" + nyanGetRequestHeaders()["X-Request-Owner"];`)
 	r := newRequestRegressionRouter(t, APIConfig{"who": {Script: script}})
-	run := func(id string, done chan<- string) {
+	type result struct {
+		status int
+		body   string
+	}
+	var requests sync.WaitGroup
+	// Registered after the router cleanup, so outstanding requests finish before
+	// its snapshot and global configuration are restored, including on Fatal.
+	t.Cleanup(func() {
+		close(abort)
+		done := make(chan struct{})
+		go func() { requests.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Error("cookie isolation requests did not stop during cleanup")
+		}
+	})
+	run := func(id string, done chan<- result) {
+		defer requests.Done()
 		req := httptest.NewRequest("POST", "/who", strings.NewReader(`{"gate":"`+gate.URL+`/`+id+`"}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Request-Owner", id)
 		req.AddCookie(&http.Cookie{Name: "session", Value: id})
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
-		done <- rec.Body.String()
+		done <- result{status: rec.Code, body: rec.Body.String()}
 	}
-	doneA, doneB := make(chan string, 1), make(chan string, 1)
+	waitResult := func(done <-chan result, label string) result {
+		t.Helper()
+		select {
+		case got := <-done:
+			return got
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for cookie request %s", label)
+			return result{}
+		}
+	}
+	doneA, doneB := make(chan result, 1), make(chan result, 1)
+	requests.Add(1)
 	go run("a", doneA)
-	<-enteredA
+	waitForRuntimeSignal(t, enteredA, "cookie request A entered gate")
+	requests.Add(1)
 	go run("b", doneB)
-	<-enteredB
+	waitForRuntimeSignal(t, enteredB, "cookie request B entered gate")
 	close(releaseA)
-	resultA := <-doneA
+	resultA := waitResult(doneA, "A")
 	close(releaseB)
-	resultB := <-doneB
-	if resultA != "a:a" || resultB != "b:b" {
-		t.Fatalf("request A got %q; request B got %q", resultA, resultB)
+	resultB := waitResult(doneB, "B")
+	if resultA.status != http.StatusOK || resultA.body != "a:a" || resultB.status != http.StatusOK || resultB.body != "b:b" {
+		t.Fatalf("request A got %+v; request B got %+v", resultA, resultB)
 	}
 }
 
@@ -2164,30 +2240,26 @@ func TestWebSocketChecksAuthorization(t *testing.T) {
 	r := newRequestRegressionRouter(t, APIConfig{"private": {HTML: secret, ParamCheck: deny}})
 	normal := httptest.NewRecorder()
 	r.ServeHTTP(normal, httptest.NewRequest("GET", "/private", nil))
-	if normal.Code != 401 {
+	if normal.Code != http.StatusUnauthorized {
 		t.Fatalf("HTTP baseline=%d", normal.Code)
 	}
 	server := httptest.NewServer(r)
 	defer server.Close()
 	conn, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/private", http.Header{"Origin": []string{"https://untrusted.example"}})
-	if err != nil {
-		if response == nil || response.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("unexpected upgrade failure: %v, response=%v", err, response)
-		}
-		return
+	if conn != nil {
+		defer conn.Close()
 	}
-	defer conn.Close()
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if err := conn.WriteJSON(map[string]string{"api": "private"}); err != nil {
-		t.Fatal(err)
+	if response != nil {
+		defer response.Body.Close()
 	}
-	_, body, err := conn.ReadMessage()
+	if err == nil || conn != nil || response == nil || response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("authorization must reject the upgrade: error=%v response=%v", err, response)
+	}
+	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) == "PRIVATE_HTML" {
-		t.Fatal("HTTP denied with 401, but unauthenticated WebSocket returned PRIVATE_HTML")
-	}
+	assertParamCheckResponse(t, body, false, http.StatusUnauthorized)
 }
 
 func TestJSONRPCRejectsNonPublicAPIs(t *testing.T) {
@@ -2292,6 +2364,77 @@ func TestJSONRPCExposureUsesCurrentSnapshot(t *testing.T) {
 					t.Fatalf("stale exposure allowed a private API: %s", rec.Body.String())
 				}
 			}
+		})
+	}
+}
+
+func TestJSONRPCRequestAndScriptErrors(t *testing.T) {
+	const request = `{"jsonrpc":"2.0","id":"request-42","method":"private","params":{}}`
+	for _, tc := range []struct {
+		name          string
+		body          string
+		query         string
+		script        string
+		withoutScript bool
+		wantID        string
+		wantCode      int
+		wantMessage   string
+		wantDetail    string
+		wantMain      bool
+	}{
+		{name: "invalid_json", body: `{"jsonrpc":`, wantID: "null", wantCode: -32700, wantMessage: "Parse error"},
+		{name: "invalid_version", body: `{"jsonrpc":"1.0","id":"request-42","method":"private","params":{}}`, wantCode: -32600, wantMessage: "Invalid Request: 'jsonrpc' must be '2.0'"},
+		{name: "missing_script", withoutScript: true, wantCode: -32603, wantMessage: "No script defined for JSON-RPC API"},
+		{name: "reserved_principal", body: `{"jsonrpc":"2.0","id":"request-42","method":"private","params":{"mcp_principal":null}}`, wantCode: -32602, wantMessage: "Invalid params", wantDetail: "reserved parameter mcp_principal"},
+		{name: "reserved_tool_query", query: "?mcp_tool=forged", wantCode: -32602, wantMessage: "Invalid params", wantDetail: "reserved parameter mcp_tool"},
+		{name: "script_exception", script: `throw new Error("main failed");`, wantCode: -32603, wantMessage: "Script execution error", wantDetail: "main failed", wantMain: true},
+		{name: "invalid_base64", script: `({body:{encoding:"base64",data:"!"}});`, wantCode: -32603, wantMessage: "Invalid script response", wantDetail: "invalid base64 body", wantMain: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mainMarker, outMarker, pushMarker := filepath.Join(dir, "main-ran"), filepath.Join(dir, "out-ran"), filepath.Join(dir, "push-ran")
+			script := tc.script
+			if script == "" {
+				script = `"PRIVATE_RESULT";`
+			}
+			config := EndpointConfig{
+				OutCheck: writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({success:true,status:200,result:null});`, outMarker)),
+				Push:     "updates",
+			}
+			if !tc.withoutScript {
+				config.Script = writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); `, mainMarker)+script)
+			}
+			push := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); "pushed";`, pushMarker))
+			router := newRequestRegressionRouter(t, APIConfig{"private": config, "updates": {Script: push}})
+			body := tc.body
+			if body == "" {
+				body = request
+			}
+			req := httptest.NewRequest(http.MethodPost, "/nyan-rpc"+tc.query, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			wantID := tc.wantID
+			if wantID == "" {
+				wantID = `"request-42"`
+			}
+			response := decodeJSONRPCCheckResponse(t, rec, wantID)
+			if _, exists := response["result"]; exists {
+				t.Fatalf("failed request returned result: %s", rec.Body.String())
+			}
+			var rpcError JSONRPCError
+			if err := json.Unmarshal(response["error"], &rpcError); err != nil {
+				t.Fatalf("invalid error response: %s; error=%v", rec.Body.String(), err)
+			}
+			if rpcError.Code != tc.wantCode || rpcError.Message != tc.wantMessage {
+				t.Fatalf("error = %#v, want code=%d message=%q", rpcError, tc.wantCode, tc.wantMessage)
+			}
+			if tc.wantDetail != "" && !strings.Contains(fmt.Sprint(rpcError.Data), tc.wantDetail) {
+				t.Fatalf("error.data = %#v, want %q", rpcError.Data, tc.wantDetail)
+			}
+			assertJSONRPCExecutionMarker(t, mainMarker, tc.wantMain)
+			assertJSONRPCExecutionMarker(t, outMarker, false)
+			assertJSONRPCExecutionMarker(t, pushMarker, false)
 		})
 	}
 }
@@ -2530,7 +2673,8 @@ func TestOAuthVerifierFailsClosed(t *testing.T) {
 
 func TestRawAPICannotForgeMCPPrincipal(t *testing.T) {
 	hook := writeFixtureFile(t, `({authenticated:false});`)
-	tool := writeFixtureFile(t, `({status:200,contentType:"application/json",body:{user:nyanAllParams.mcp_principal.user_id}});`)
+	marker := filepath.Join(t.TempDir(), "tool-ran")
+	tool := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q, "ran"); ({status:200,contentType:"application/json",body:{user:nyanAllParams.mcp_principal.user_id}});`, marker))
 	cfg := APIConfig{"tool": {Script: tool}, "verify": {Script: hook}, "mcp": {Type: "mcp", Transport: "streamable_http", ProtocolVersions: []string{mcpProtocol20251125}, OAuth: MCPOAuthHooks{VerifyAccess: "verify"}, Tools: []MCPToolConfig{{Name: "tool", API: "tool", InputSchema: map[string]interface{}{"type": "object"}}}}}
 	completeTestOAuthConfiguration(t, cfg)
 	r := newRequestRegressionRouter(t, cfg)
@@ -2542,33 +2686,45 @@ func TestRawAPICannotForgeMCPPrincipal(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
-	if strings.Contains(rec.Body.String(), "forged-admin") {
+	if rec.Code != http.StatusBadRequest || strings.Contains(rec.Body.String(), "forged-admin") {
 		t.Fatalf("raw API accepted client-supplied principal: %d %s", rec.Code, rec.Body.String())
 	}
-}
-
-func TestMCPToolErrorStatus(t *testing.T) {
-	tool := writeFixtureFile(t, `({status:403,contentType:"application/json",body:{error:"forbidden"}});`)
-	cfg := APIConfig{"tool": {Script: tool}, "mcp": {Type: "mcp", Transport: "streamable_http", ProtocolVersions: []string{mcpProtocol20251125}, Tools: []MCPToolConfig{{Name: "tool", API: "tool", InputSchema: map[string]interface{}{"type": "object"}}}}}
-	r := newRequestRegressionRouter(t, cfg)
-	rec := serveMCPRegressionRequest(r, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{}}}`)
-	if strings.Contains(rec.Body.String(), `"isError":false`) {
-		t.Fatalf("tool 403 reported as success: %s", rec.Body.String())
-	}
+	assertJSONRPCExecutionMarker(t, marker, false)
 }
 
 func TestStorageConcurrency(t *testing.T) {
+	storageMu.Lock()
 	oldStorage := storage
 	storage = make(map[string]string)
-	t.Cleanup(func() { storage = oldStorage })
+	storageMu.Unlock()
+	t.Cleanup(func() {
+		storageMu.Lock()
+		storage = oldStorage
+		storageMu.Unlock()
+	})
 	vmA, vmB := setupGojaRuntime(), setupGojaRuntime()
 	start := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); <-start; vmA.RunString(`nyanSetItem("key","a");`) }()
-	go func() { defer wg.Done(); <-start; vmB.RunString(`nyanGetItem("key");`) }()
+	results := make(chan error, 2)
+	go func() {
+		<-start
+		_, err := vmA.RunString(`for (let i = 0; i < 100; i++) nyanSetItem("key", "value-" + i);`)
+		results <- err
+	}()
+	go func() {
+		<-start
+		_, err := vmB.RunString(`for (let i = 0; i < 100; i++) nyanGetItem("key");`)
+		results <- err
+	}()
 	close(start)
-	wg.Wait()
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+	value, err := vmB.RunString(`nyanGetItem("key");`)
+	if err != nil || value.String() != "value-99" {
+		t.Fatalf("stored value = %v, error = %v", value, err)
+	}
 }
 
 func TestWebSocketChecksTargetAndPreservesPublicMessages(t *testing.T) {
@@ -2619,6 +2775,7 @@ func TestWebSocketConcurrentPushAndReplies(t *testing.T) {
 	}
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	// An echo round trip ensures the connection is registered before pushing.
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{}`)); err != nil {
 		t.Fatal(err)
@@ -2649,6 +2806,18 @@ func TestWebSocketConcurrentPushAndReplies(t *testing.T) {
 		}
 		writeErrors <- nil
 	}()
+	writersDone := make(chan struct{})
+	go func() { writers.Wait(); close(writersDone) }()
+	t.Cleanup(func() {
+		// A read/assertion failure must not leave push workers using the global
+		// snapshot after the router cleanup restores it.
+		_ = conn.Close()
+		select {
+		case <-writersDone:
+		case <-time.After(3 * time.Second):
+			t.Error("WebSocket writers did not stop during cleanup")
+		}
+	})
 	received := map[string]int{}
 	for i := 0; i < count*3; i++ {
 		_, body, err := conn.ReadMessage()
@@ -2657,7 +2826,7 @@ func TestWebSocketConcurrentPushAndReplies(t *testing.T) {
 		}
 		received[string(body)]++
 	}
-	writers.Wait()
+	waitForRuntimeSignal(t, writersDone, "WebSocket writers")
 	if err := <-writeErrors; err != nil {
 		t.Fatal(err)
 	}
@@ -2693,11 +2862,20 @@ func TestMCPStdioToolReportsErrorsAndHTTPIncludesAPIName(t *testing.T) {
 	}
 	router := newRequestRegressionRouter(t, config)
 	rec := serveMCPRegressionRequest(router, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{}}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("MCP HTTP status = %d; body=%s", rec.Code, rec.Body.String())
+	}
 	var httpResult struct {
-		Result map[string]interface{} `json:"result"`
+		JSONRPC string                 `json:"jsonrpc"`
+		ID      int                    `json:"id"`
+		Error   json.RawMessage        `json:"error"`
+		Result  map[string]interface{} `json:"result"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &httpResult); err != nil {
 		t.Fatal(err)
+	}
+	if httpResult.JSONRPC != "2.0" || httpResult.ID != 1 || len(httpResult.Error) != 0 {
+		t.Fatalf("unexpected MCP envelope: %s", rec.Body.String())
 	}
 	payload, errText := executeMCPTool(currentAPISnapshot(), config["mcp"].Tools[0], nil, map[string]interface{}{"transport": "stdio"})
 	if errText != "" || payload["isError"] != true || httpResult.Result["isError"] != true {
@@ -3200,27 +3378,38 @@ func TestHTTPProcessLogging(t *testing.T) {
 }
 
 func TestStartupLoggingFailuresStayOffStdout(t *testing.T) {
-	for _, invalidLevel := range []bool{false, true} {
-		dir := t.TempDir()
-		path := filepath.Join(dir, "config.json")
-		if invalidLevel {
-			writeLoggingFile(t, path, `{"log":{"Level":"verbose"}}`)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMCPStdioLoggingHelper$", "--", "--config", path)
-		cmd.Env = append(os.Environ(), "NYANPUI_TEST_STDIO_LOGGING_CHILD=1")
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout, cmd.Stderr = &stdout, &stderr
-		if err := cmd.Run(); err == nil {
-			t.Fatal("invalid startup succeeded")
-		}
-		if stdout.Len() != 0 {
-			t.Fatalf("startup failure polluted stdout: %s", stdout.String())
-		}
-		record := decodeLogObject(t, bytes.TrimSpace(stderr.Bytes()))
-		if record["level"] != "ERROR" {
-			t.Fatalf("missing startup error: %#v", record)
-		}
+	for _, tc := range []struct {
+		name, config, event string
+	}{
+		{"missing_config", "", "startup_options_failed"},
+		{"invalid_json", `{"log":`, "config_load_failed"},
+		{"invalid_level", `{"log":{"Level":"verbose"}}`, "Invalid log.Level: expected debug, info, warn, or error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath, apiPath := filepath.Join(dir, "config.json"), filepath.Join(dir, "api.json")
+			writeLoggingFile(t, apiPath, `{}`)
+			if tc.config != "" {
+				writeLoggingFile(t, configPath, tc.config)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMCPStdioLoggingHelper$", "--", "--config", configPath, "--api", apiPath)
+			cmd.Env = append(os.Environ(), "NYANPUI_TEST_STDIO_LOGGING_CHILD=1")
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			err := cmd.Run()
+			var exitError *exec.ExitError
+			if !errors.As(err, &exitError) || exitError.ExitCode() != 1 {
+				t.Fatalf("startup exit = %v, want exit code 1; stderr=%s", err, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("startup failure polluted stdout: %s", stdout.String())
+			}
+			record := decodeLogObject(t, bytes.TrimSpace(stderr.Bytes()))
+			if record["level"] != "ERROR" || record["msg"] != tc.event {
+				t.Fatalf("unexpected startup error: %#v; want event %q", record, tc.event)
+			}
+		})
 	}
 }
