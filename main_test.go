@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -32,7 +33,7 @@ import (
 	"github.com/natefinch/lumberjack"
 )
 
-func TestRegisterPublicEndpointServesFiles(t *testing.T) {
+func TestPublicEndpointServesFiles(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	tempDir := t.TempDir()
@@ -47,11 +48,12 @@ func TestRegisterPublicEndpointServesFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	router := gin.New()
-	registerPublicEndpoint(router, "assets", EndpointConfig{
+	config := APIConfig{"assets": {
 		Type: apiTypePublic,
 		Path: "./public",
-	}, tempDir)
+	}}
+	adjustAPIConfigPaths(config, tempDir)
+	router := newRequestRegressionRouter(t, config)
 
 	req := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
 	rec := httptest.NewRecorder()
@@ -82,11 +84,12 @@ func TestRegisterPublicEndpointServesFiles(t *testing.T) {
 	assertParamCheckResponse(t, rec.Body.Bytes(), true, http.StatusOK)
 }
 
-func TestRegisterPublicEndpointRequiresPath(t *testing.T) {
+func TestPublicEndpointRequiresPath(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	router := gin.New()
-	registerPublicEndpoint(router, "assets", EndpointConfig{Type: apiTypePublic}, t.TempDir())
+	config := APIConfig{"assets": {Type: apiTypePublic}}
+	adjustAPIConfigPaths(config, t.TempDir())
+	router := newRequestRegressionRouter(t, config)
 
 	req := httptest.NewRequest(http.MethodGet, "/assets/file.txt", nil)
 	rec := httptest.NewRecorder()
@@ -97,7 +100,7 @@ func TestRegisterPublicEndpointRequiresPath(t *testing.T) {
 	}
 }
 
-func TestRegisterPublicEndpointRunsParamCheck(t *testing.T) {
+func TestPublicEndpointRunsParamCheck(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	tempDir := t.TempDir()
@@ -119,12 +122,13 @@ if (nyanAllParams.deny === "1") {
 		t.Fatal(err)
 	}
 
-	router := gin.New()
-	registerPublicEndpoint(router, "assets", EndpointConfig{
+	config := APIConfig{"assets": {
 		Type:       apiTypePublic,
 		Path:       "./public",
 		ParamCheck: "./check.js",
-	}, tempDir)
+	}}
+	adjustAPIConfigPaths(config, tempDir)
+	router := newRequestRegressionRouter(t, config)
 
 	req := httptest.NewRequest(http.MethodGet, "/assets/app.js?deny=1", nil)
 	rec := httptest.NewRecorder()
@@ -146,7 +150,7 @@ if (nyanAllParams.deny === "1") {
 	}
 }
 
-func TestRegisterPublicEndpointBlocksJSONStringParamCheck(t *testing.T) {
+func TestPublicEndpointBlocksJSONStringParamCheck(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	tempDir := t.TempDir()
@@ -168,12 +172,13 @@ JSON.stringify({
 		t.Fatal(err)
 	}
 
-	router := gin.New()
-	registerPublicEndpoint(router, "public", EndpointConfig{
+	config := APIConfig{"public": {
 		Type:       apiTypePublic,
 		Path:       "./public",
 		ParamCheck: "./check.js",
-	}, tempDir)
+	}}
+	adjustAPIConfigPaths(config, tempDir)
+	router := newRequestRegressionRouter(t, config)
 
 	for _, target := range []string{"/public/test.txt", "/public/test.txt?nyan_mode=checkOnly"} {
 		req := httptest.NewRequest(http.MethodGet, target, nil)
@@ -192,7 +197,7 @@ JSON.stringify({
 	}
 }
 
-func TestRegisterPublicEndpointRunsOutCheck(t *testing.T) {
+func TestPublicEndpointRunsOutCheck(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	tempDir := t.TempDir()
@@ -214,12 +219,13 @@ if (nyanAllParams.nyan_output_body === "test") {
 		t.Fatal(err)
 	}
 
-	router := gin.New()
-	registerPublicEndpoint(router, "public", EndpointConfig{
+	config := APIConfig{"public": {
 		Type:     apiTypePublic,
 		Path:     "./public",
 		OutCheck: "./out_check.js",
-	}, tempDir)
+	}}
+	adjustAPIConfigPaths(config, tempDir)
+	router := newRequestRegressionRouter(t, config)
 
 	req := httptest.NewRequest(http.MethodGet, "/public/test.txt", nil)
 	rec := httptest.NewRecorder()
@@ -497,65 +503,77 @@ func TestDecodeAPIConfigResolvesAllRelativePaths(t *testing.T) {
 	}
 }
 
-func TestReloadAPIConfigKeepsLastGoodDefinition(t *testing.T) {
+func TestReloadAPIConfigGraphKeepsLastGoodDefinition(t *testing.T) {
 	apiDir := t.TempDir()
 	apiPath := filepath.Join(apiDir, "api.json")
 	writeTestFile(t, apiPath, `{"old":{"description":"active"}}`)
-	initial, initialHash, err := readAPIConfigFile(apiPath, apiDir)
+	initial, err := readAPIConfigGraph(apiPath, apiDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setAPIConfig(initial)
-	oldManager := backgroundRuntimes
+	oldSnapshot, oldManager := currentAPISnapshot(), backgroundRuntimes
+	publishAPISnapshot(initial.Snapshot)
 	backgroundRuntimes = nil
-	t.Cleanup(func() { setAPIConfig(nil); backgroundRuntimes = oldManager })
+	t.Cleanup(func() { publishAPISnapshot(oldSnapshot); backgroundRuntimes = oldManager })
 
 	writeTestFile(t, apiPath, `{"new":{"description":"updated"}}`)
-	hash, reloaded, err := reloadAPIConfigIfChanged(apiPath, apiDir, initialHash)
+	states, reloaded, err := reloadAPIConfigGraphIfChanged(apiPath, apiDir, initial.Snapshot.FileStates)
 	if err != nil || !reloaded {
 		t.Fatalf("reload=%t err=%v", reloaded, err)
 	}
 	if _, ok := currentAPIConfig()["old"]; ok {
 		t.Fatal("old API remains")
 	}
+	lastGood := currentAPISnapshot()
 
 	writeTestFile(t, apiPath, `{"broken":`)
-	invalidHash, reloaded, err := reloadAPIConfigIfChanged(apiPath, apiDir, hash)
+	invalidStates, reloaded, err := reloadAPIConfigGraphIfChanged(apiPath, apiDir, states)
 	if err == nil || reloaded {
 		t.Fatalf("invalid reload=%t err=%v", reloaded, err)
 	}
 	if _, ok := currentAPIConfig()["new"]; !ok {
 		t.Fatal("last-known-good config was lost")
 	}
-	secondHash, reloaded, err := reloadAPIConfigIfChanged(apiPath, apiDir, invalidHash)
-	if err != nil || reloaded || secondHash != invalidHash {
+	if currentAPISnapshot() != lastGood {
+		t.Fatal("invalid configuration replaced the last-known-good snapshot")
+	}
+	secondStates, reloaded, err := reloadAPIConfigGraphIfChanged(apiPath, apiDir, invalidStates)
+	if err != nil || reloaded || !maps.Equal(secondStates, invalidStates) {
 		t.Fatalf("unchanged invalid content reprocessed: reload=%t err=%v", reloaded, err)
 	}
 
 	writeTestFile(t, apiPath, `{"fixed":{"description":"ok"}}`)
-	_, reloaded, err = reloadAPIConfigIfChanged(apiPath, apiDir, invalidHash)
+	_, reloaded, err = reloadAPIConfigGraphIfChanged(apiPath, apiDir, invalidStates)
 	if err != nil || !reloaded {
 		t.Fatalf("fixed reload=%t err=%v", reloaded, err)
 	}
+	if _, ok := currentAPIConfig()["fixed"]; !ok {
+		t.Fatal("fixed definition was not published")
+	}
 }
 
-func TestReloadAPIConfigRejectsInvalidBackgroundCandidate(t *testing.T) {
+func TestReloadAPIConfigGraphRejectsInvalidBackgroundCandidate(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "api.json")
 	writeTestFile(t, path, `{"current":{}}`)
-	initial, hash, err := readAPIConfigFile(path, dir)
+	initial, err := readAPIConfigGraph(path, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setAPIConfig(initial)
-	t.Cleanup(func() { setAPIConfig(nil) })
+	oldSnapshot, oldManager := currentAPISnapshot(), backgroundRuntimes
+	publishAPISnapshot(initial.Snapshot)
+	backgroundRuntimes = nil
+	t.Cleanup(func() { publishAPISnapshot(oldSnapshot); backgroundRuntimes = oldManager })
 	writeTestFile(t, path, `{"job":{"type":"schedule","trigger":{"type":"cron","value":"* * * * *"}}}`)
-	_, reloaded, err := reloadAPIConfigIfChanged(path, dir, hash)
+	_, reloaded, err := reloadAPIConfigGraphIfChanged(path, dir, initial.Snapshot.FileStates)
 	if err == nil || reloaded {
 		t.Fatalf("reload=%t err=%v", reloaded, err)
 	}
 	if _, ok := currentAPIConfig()["current"]; !ok {
 		t.Fatal("current config changed")
+	}
+	if currentAPISnapshot() != initial.Snapshot {
+		t.Fatal("invalid background configuration replaced the active snapshot")
 	}
 }
 
@@ -799,7 +817,7 @@ func waitForRuntimeSignal(t *testing.T, signal <-chan struct{}, label string) {
 	}
 }
 
-func TestRegisterPublicEndpointBlocksLowercaseOutcheck(t *testing.T) {
+func TestPublicEndpointBlocksLowercaseOutcheck(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	tempDir := t.TempDir()
@@ -830,8 +848,9 @@ JSON.stringify({
 		t.Fatal(err)
 	}
 
-	router := gin.New()
-	registerPublicEndpoint(router, "public", config, tempDir)
+	apiConfig := APIConfig{"public": config}
+	adjustAPIConfigPaths(apiConfig, tempDir)
+	router := newRequestRegressionRouter(t, apiConfig)
 
 	req := httptest.NewRequest(http.MethodGet, "/public/test.txt", nil)
 	rec := httptest.NewRecorder()

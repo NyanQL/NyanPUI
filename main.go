@@ -248,7 +248,6 @@ type APIFileState struct {
 
 type apiConfigLoadResult struct {
 	Snapshot *APIConfigSnapshot
-	Hash     [sha256.Size]byte
 }
 
 const (
@@ -1001,11 +1000,6 @@ func handleAPIRequestWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, c
 	}
 }
 
-// handleWebSocket はWebSocketリクエストを処理します。
-func handleWebSocket(c *gin.Context, endpoint string, config EndpointConfig) {
-	handleWebSocketWithSnapshot(c, currentAPISnapshot(), endpoint, config)
-}
-
 func handleWebSocketWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, endpoint string, config EndpointConfig) {
 	allParams, err := collectRequestParams(c, endpoint)
 	if err != nil {
@@ -1123,22 +1117,6 @@ func checkWebSocketScript(conn *serverWebSocket, snapshot *APIConfigSnapshot, re
 	return false
 }
 
-// sendWebSocketHTMLError はWebSocket接続にHTML形式のエラーメッセージを送信します。
-func sendWebSocketHTMLError(conn *serverWebSocket, messageType int, errorMessage string) {
-	errorHTML := fmt.Sprintf("<html><body><h1>Error</h1><p>%s</p></body></html>", errorMessage)
-	if err := conn.WriteMessage(messageType, []byte(errorHTML)); err != nil {
-		logServiceError(slog.LevelWarn, "websocket_error_send_failed", err)
-	}
-}
-
-// sendHTMLErrorResponse はWebSocketアップグレードの際に発生したエラーをHTMLでクライアントに送信します。
-func sendHTMLErrorResponse(w http.ResponseWriter, errorMessage string) {
-	w.Header().Set("Content-Type", "text/html")
-	w.WriteHeader(http.StatusInternalServerError)
-	errorHTML := fmt.Sprintf("<html><body><h1>Error</h1><p>%s</p></body></html>", errorMessage)
-	w.Write([]byte(errorHTML))
-}
-
 // runJavaScript はJavaScriptを実行します。
 func runJavaScript(scriptPath string, htmlPath string, allParams map[string]interface{}) (string, error) {
 	return runJavaScriptWithSnapshot(currentAPISnapshot(), scriptPath, htmlPath, allParams)
@@ -1167,11 +1145,6 @@ func resolveCurrentAPINameFromContext(c *gin.Context) string {
 		return "html"
 	}
 	return strings.TrimPrefix(path, "/")
-}
-
-// callNyanAPIFromVM は、JavaScript(VM) から api.json 定義の API を内部実行します。
-func callNyanAPIFromVM(apiName string, allParams map[string]interface{}) (interface{}, error) {
-	return callNyanAPIFromVMWithSnapshot(currentAPISnapshot(), apiName, allParams)
 }
 
 func callNyanAPIFromVMWithSnapshot(snapshot *APIConfigSnapshot, apiName string, allParams map[string]interface{}) (interface{}, error) {
@@ -1222,10 +1195,6 @@ func callNyanAPIFromVMWithContext(snapshot *APIConfigSnapshot, requestContext *g
 		}
 	}
 	return exported, nil
-}
-
-func runJavaScriptValue(scriptPath string, htmlPath string, allParams map[string]interface{}) (goja.Value, error) {
-	return runJavaScriptValueWithSnapshot(currentAPISnapshot(), scriptPath, htmlPath, allParams)
 }
 
 func runJavaScriptValueWithSnapshot(snapshot *APIConfigSnapshot, scriptPath string, htmlPath string, allParams map[string]interface{}) (goja.Value, error) {
@@ -1352,10 +1321,6 @@ func validateExternalRequestParams(params map[string]interface{}) error {
 	return nil
 }
 
-func runParamCheck(c *gin.Context, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}) (bool, bool) {
-	return runParamCheckWithSnapshot(c, currentAPISnapshot(), config, exeDir, htmlPath, allParams)
-}
-
 func runParamCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}) (bool, bool) {
 	allowed, response := evaluateParamCheckWithSnapshot(c, snapshot, config, exeDir, htmlPath, allParams)
 	if response != nil {
@@ -1408,10 +1373,6 @@ func isCheckOnlyMode(allParams map[string]interface{}) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(fmt.Sprint(allParams["nyan_mode"])), "checkOnly")
-}
-
-func runOutCheck(c *gin.Context, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}, response APIResponse) bool {
-	return runOutCheckWithSnapshot(c, currentAPISnapshot(), config, exeDir, htmlPath, allParams, response)
 }
 
 func runOutCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, config EndpointConfig, exeDir string, htmlPath string, allParams map[string]interface{}, response APIResponse) bool {
@@ -1704,10 +1665,6 @@ func dispatchDynamicEndpoint(c *gin.Context) bool {
 	return true
 }
 
-func servePublicEndpoint(c *gin.Context, endpoint string, config EndpointConfig) {
-	servePublicEndpointWithSnapshot(c, currentAPISnapshot(), endpoint, config)
-}
-
 func servePublicEndpointWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, endpoint string, config EndpointConfig) {
 	publicPath := strings.TrimSpace(config.Path)
 	if publicPath == "" {
@@ -1752,86 +1709,6 @@ func servePublicEndpointWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot
 		}
 	}
 	c.File(filePath)
-}
-
-func registerPublicEndpoint(r *gin.Engine, endpoint string, config EndpointConfig, exeDir string) {
-	routePath := "/" + strings.Trim(strings.TrimSpace(endpoint), "/")
-	if routePath == "/" {
-		serviceLog(slog.LevelError, "public_endpoint_name_invalid")
-		return
-	}
-
-	publicPath := strings.TrimSpace(config.Path)
-	if publicPath == "" {
-		serviceLog(slog.LevelError, "public_endpoint_path_missing", "endpoint", endpoint)
-	}
-
-	basePath := resolvePath(exeDir, publicPath)
-	handler := func(c *gin.Context) {
-		if publicPath == "" {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "public path is missing"})
-			return
-		}
-
-		requestedPath := strings.TrimPrefix(c.Param("filepath"), "/")
-		allParams, err := collectRequestParams(c, endpoint)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON data"})
-			return
-		}
-		allParams["nyan_public_endpoint"] = endpoint
-		allParams["nyan_public_path"] = requestedPath
-
-		if allowed, handled := runParamCheck(c, config, exeDir, "", allParams); handled {
-			return
-		} else if !allowed {
-			return
-		}
-
-		if requestedPath == "" || !filepath.IsLocal(requestedPath) {
-			c.Status(http.StatusNotFound)
-			return
-		}
-
-		filePath := filepath.Join(basePath, requestedPath)
-		fileInfo, err := os.Stat(filePath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				c.Status(http.StatusNotFound)
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read public file"})
-			return
-		}
-		if fileInfo.IsDir() {
-			c.Status(http.StatusNotFound)
-			return
-		}
-
-		if strings.TrimSpace(config.OutCheck) != "" {
-			fileContent, err := os.ReadFile(filePath)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read public file"})
-				return
-			}
-			response := APIResponse{
-				Status:      http.StatusOK,
-				ContentType: http.DetectContentType(fileContent),
-				Headers:     map[string]string{},
-				Body:        fileContent,
-			}
-			if handled := runOutCheck(c, config, exeDir, "", allParams, response); handled {
-				return
-			}
-		}
-
-		c.File(filePath)
-	}
-
-	r.GET(routePath, handler)
-	r.HEAD(routePath, handler)
-	r.GET(routePath+"/*filepath", handler)
-	r.HEAD(routePath+"/*filepath", handler)
 }
 
 type wsClientConfig struct {
@@ -2082,15 +1959,6 @@ func isMCPOrOAuthHTTPRequest(request *http.Request) bool {
 		}
 	}
 	return false
-}
-
-// loadHTMLFile は指定されたHTMLファイルを読み込み、その内容を文字列として返します。
-func loadHTMLFile(filePath string) (string, error) {
-	htmlBytes, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", err
-	}
-	return string(htmlBytes), nil
 }
 
 func getAPI(url, username, password string) (string, error) {
@@ -2967,11 +2835,6 @@ func respondJSONRPCError(c *gin.Context, id interface{}, code int, message strin
 	})
 }
 
-// performPush は指定された config に対して push 処理を行います。
-func performPush(config EndpointConfig, allParams map[string]interface{}) {
-	performPushWithSnapshot(currentAPISnapshot(), config, allParams)
-}
-
 func performPushWithSnapshot(snapshot *APIConfigSnapshot, config EndpointConfig, allParams map[string]interface{}) {
 	performPushWithContext(snapshot, nil, config, allParams)
 }
@@ -3324,16 +3187,6 @@ func decodeAPIConfig(data []byte, apiBaseDir string) (APIConfig, error) {
 	return config, nil
 }
 
-// readAPIConfigFile remains as the single-file compatibility entry point used
-// by existing callers and tests. Production loading uses readAPIConfigGraph.
-func readAPIConfigFile(path, apiBaseDir string) (APIConfig, [sha256.Size]byte, error) {
-	loaded, err := readAPIConfigGraph(path, apiBaseDir)
-	if err != nil {
-		return nil, [sha256.Size]byte{}, fmt.Errorf("read api file: %w", err)
-	}
-	return loaded.Snapshot.Config, loaded.Hash, nil
-}
-
 func currentAPISnapshot() *APIConfigSnapshot {
 	apiConfigMu.RLock()
 	snapshot := apiSnapshot
@@ -3369,59 +3222,6 @@ func publishAPISnapshot(snapshot *APIConfigSnapshot) {
 	apiConfigMu.Unlock()
 }
 
-func reloadAPIConfigIfChanged(path, apiBaseDir string, lastHash [sha256.Size]byte) ([sha256.Size]byte, bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return lastHash, false, fmt.Errorf("read api file: %w", err)
-	}
-	hash := sha256.Sum256(data)
-	if hash == lastHash {
-		return lastHash, false, nil
-	}
-	candidate, err := decodeAPIConfig(data, apiBaseDir)
-	if err != nil {
-		return hash, false, err
-	}
-	if reflect.DeepEqual(currentAPIConfig(), candidate) {
-		return hash, false, nil
-	}
-	schedules, err := buildScheduleJobConfigs(candidate)
-	if err != nil {
-		return hash, false, err
-	}
-	wsClients, err := buildWSClientConfigs(candidate)
-	if err != nil {
-		return hash, false, err
-	}
-	setAPIConfig(candidate)
-	if backgroundRuntimes != nil {
-		backgroundRuntimes.reconcile(schedules, wsClients)
-	}
-	return hash, true, nil
-}
-
-func watchAPIConfig(path, apiBaseDir string, interval time.Duration, initialHash [sha256.Size]byte) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	lastHash := initialHash
-	lastError := ""
-	for range ticker.C {
-		hash, reloaded, err := reloadAPIConfigIfChanged(path, apiBaseDir, lastHash)
-		lastHash = hash
-		if err != nil {
-			if err.Error() != lastError {
-				logServiceError(slog.LevelError, "api_hot_reload_failed", err, "file", path, "active_config_retained", true)
-			}
-			lastError = err.Error()
-			continue
-		}
-		lastError = ""
-		if reloaded {
-			serviceLog(slog.LevelInfo, "api_hot_reload_succeeded", "api_count", len(currentAPIConfig()))
-		}
-	}
-}
-
 type apiIncludeDefinition struct {
 	Type string `json:"type"`
 	Path string `json:"path"`
@@ -3445,7 +3245,6 @@ func readAPIConfigGraph(rootPath, apiBaseDir string) (*apiConfigLoadResult, erro
 	if err != nil {
 		return result, err
 	}
-	result.Hash = sha256.Sum256(rootData)
 	if err := loader.loadFile(rootPath, rootIdentity, rootData, "", nil); err != nil {
 		return result, err
 	}
