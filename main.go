@@ -608,6 +608,7 @@ var mcpRateBuckets = struct {
 var mcpConcurrencyLimiters = struct {
 	sync.Mutex
 	Limiters map[string]chan struct{}
+	Current  map[string]bool
 }{Limiters: make(map[string]chan struct{})}
 
 // ストレージ
@@ -3212,6 +3213,7 @@ func publishAPISnapshot(snapshot *APIConfigSnapshot) {
 	} else {
 		apiConfig = snapshot.Config
 	}
+	reconcileMCPConcurrencyLimiters(apiConfig)
 	apiConfigMu.Unlock()
 }
 
@@ -4213,18 +4215,50 @@ func mcpMaxConcurrent(endpoint EndpointConfig) int {
 	return 16
 }
 
-func acquireMCPExecutionSlot(endpointName string, limit int) (func(), bool) {
-	key := endpointName + "\x00" + strconv.Itoa(limit)
+func mcpConcurrencyKey(endpointName string, limit int) string {
+	return endpointName + "\x00" + strconv.Itoa(limit)
+}
+
+// Publication holds apiConfigMu before taking the limiter lock here.
+// Acquisition and release take only the limiter lock, never apiConfigMu.
+func reconcileMCPConcurrencyLimiters(config APIConfig) {
+	current := make(map[string]bool)
+	for name, endpoint := range config {
+		if endpoint.Type == apiTypeMCP && endpoint.Transport == "streamable_http" {
+			current[mcpConcurrencyKey(name, mcpMaxConcurrent(endpoint))] = true
+		}
+	}
 	mcpConcurrencyLimiters.Lock()
+	defer mcpConcurrencyLimiters.Unlock()
+	mcpConcurrencyLimiters.Current = current
+	for key, limiter := range mcpConcurrencyLimiters.Limiters {
+		if !current[key] && len(limiter) == 0 {
+			delete(mcpConcurrencyLimiters.Limiters, key)
+		}
+	}
+}
+
+func acquireMCPExecutionSlot(endpointName string, limit int) (func(), bool) {
+	key := mcpConcurrencyKey(endpointName, limit)
+	mcpConcurrencyLimiters.Lock()
+	defer mcpConcurrencyLimiters.Unlock()
 	limiter := mcpConcurrencyLimiters.Limiters[key]
 	if limiter == nil {
 		limiter = make(chan struct{}, limit)
 		mcpConcurrencyLimiters.Limiters[key] = limiter
 	}
-	mcpConcurrencyLimiters.Unlock()
+	// Keep lookup and acquisition atomic with removal of unused limiters.
 	select {
 	case limiter <- struct{}{}:
-		return func() { <-limiter }, true
+		return func() {
+			mcpConcurrencyLimiters.Lock()
+			defer mcpConcurrencyLimiters.Unlock()
+			<-limiter
+			// This also reclaims entries acquired later by an old snapshot.
+			if !mcpConcurrencyLimiters.Current[key] && len(limiter) == 0 {
+				delete(mcpConcurrencyLimiters.Limiters, key)
+			}
+		}, true
 	default:
 		return func() {}, false
 	}

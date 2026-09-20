@@ -1681,6 +1681,210 @@ func TestMCPRateAndConcurrencyLimits(t *testing.T) {
 	}
 }
 
+func isolateMCPConcurrencyLimiters(t *testing.T) {
+	t.Helper()
+	previousSnapshot := currentAPISnapshot()
+	mcpConcurrencyLimiters.Lock()
+	previousLimiters, previousCurrent := mcpConcurrencyLimiters.Limiters, mcpConcurrencyLimiters.Current
+	mcpConcurrencyLimiters.Limiters = make(map[string]chan struct{})
+	mcpConcurrencyLimiters.Current = make(map[string]bool)
+	mcpConcurrencyLimiters.Unlock()
+	publishAPISnapshot(nil)
+	t.Cleanup(func() {
+		publishAPISnapshot(previousSnapshot)
+		mcpConcurrencyLimiters.Lock()
+		mcpConcurrencyLimiters.Limiters, mcpConcurrencyLimiters.Current = previousLimiters, previousCurrent
+		mcpConcurrencyLimiters.Unlock()
+	})
+}
+
+func acquireTestMCPExecutionSlot(t *testing.T, name string, limit int) func() {
+	t.Helper()
+	release, acquired := acquireMCPExecutionSlot(name, limit)
+	if !acquired {
+		t.Fatalf("could not acquire slot for %s with limit %d", name, limit)
+	}
+	var once sync.Once
+	releaseOnce := func() { once.Do(release) }
+	t.Cleanup(releaseOnce)
+	return releaseOnce
+}
+
+func TestMCPConcurrencyLimitersFollowConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		initialLimit int
+		next         APIConfig
+		retained     bool
+	}{
+		{"unchanged", 1, APIConfig{"mcp": {Type: apiTypeMCP, Transport: "streamable_http", MaxConcurrent: 1}}, true},
+		{"default matches explicit", 0, APIConfig{"mcp": {Type: apiTypeMCP, Transport: "streamable_http", MaxConcurrent: 16}}, true},
+		{"limit changed", 1, APIConfig{"mcp": {Type: apiTypeMCP, Transport: "streamable_http", MaxConcurrent: 2}}, false},
+		{"endpoint removed", 1, APIConfig{}, false},
+		{"stdio", 1, APIConfig{"mcp": {Type: apiTypeMCP, Transport: "stdio", MaxConcurrent: 1}}, false},
+		{"ordinary API", 1, APIConfig{"mcp": {Type: "api"}}, false},
+		{"snapshot cleared", 1, nil, false},
+	} {
+		for _, busy := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/busy=%t", tc.name, busy), func(t *testing.T) {
+				isolateMCPConcurrencyLimiters(t)
+				endpoint := EndpointConfig{Type: apiTypeMCP, Transport: "streamable_http", MaxConcurrent: tc.initialLimit}
+				publishAPISnapshot(&APIConfigSnapshot{Config: APIConfig{"mcp": endpoint}})
+				limit := mcpMaxConcurrent(endpoint)
+				var releases []func()
+				for i := 0; i < limit; i++ {
+					releases = append(releases, acquireTestMCPExecutionSlot(t, "mcp", limit))
+				}
+				key := mcpConcurrencyKey("mcp", limit)
+				mcpConcurrencyLimiters.Lock()
+				original := mcpConcurrencyLimiters.Limiters[key]
+				mcpConcurrencyLimiters.Unlock()
+				if !busy {
+					for _, release := range releases {
+						release()
+					}
+				}
+				var next *APIConfigSnapshot
+				if tc.next != nil {
+					next = &APIConfigSnapshot{Config: tc.next}
+				}
+				publishAPISnapshot(next)
+				mcpConcurrencyLimiters.Lock()
+				actual := mcpConcurrencyLimiters.Limiters[key]
+				mcpConcurrencyLimiters.Unlock()
+				if tc.retained || busy {
+					if actual != original {
+						t.Fatal("reload discarded the current or still-busy limiter")
+					}
+				} else if actual != nil {
+					t.Fatal("reload retained an idle obsolete limiter")
+				}
+				if tc.retained && busy {
+					if release, acquired := acquireMCPExecutionSlot("mcp", limit); acquired {
+						release()
+						t.Fatal("reload reset the in-flight request count")
+					}
+				}
+				for _, release := range releases {
+					release()
+				}
+				mcpConcurrencyLimiters.Lock()
+				actual = mcpConcurrencyLimiters.Limiters[key]
+				mcpConcurrencyLimiters.Unlock()
+				if tc.retained && actual != original {
+					t.Fatal("current limiter was removed after its requests finished")
+				}
+				if !tc.retained && actual != nil {
+					t.Fatal("obsolete limiter remained after its last request finished")
+				}
+			})
+		}
+	}
+}
+
+func TestMCPConcurrencyLimiterReusesBusyPreviousLimit(t *testing.T) {
+	isolateMCPConcurrencyLimiters(t)
+	config := func(limit int) *APIConfigSnapshot {
+		return &APIConfigSnapshot{Config: APIConfig{"mcp": {Type: apiTypeMCP, Transport: "streamable_http", MaxConcurrent: limit}}}
+	}
+	publishAPISnapshot(config(8))
+	releaseOriginal := acquireTestMCPExecutionSlot(t, "mcp", 8)
+	publishAPISnapshot(config(16))
+	releaseNew := acquireTestMCPExecutionSlot(t, "mcp", 16)
+	releaseNew()
+	publishAPISnapshot(config(8))
+	for i := 0; i < 7; i++ {
+		acquireTestMCPExecutionSlot(t, "mcp", 8)
+	}
+	if release, acquired := acquireMCPExecutionSlot("mcp", 8); acquired {
+		release()
+		t.Fatal("returning to limit 8 lost the original in-flight request")
+	}
+	mcpConcurrencyLimiters.Lock()
+	count := len(mcpConcurrencyLimiters.Limiters)
+	mcpConcurrencyLimiters.Unlock()
+	if count != 1 {
+		t.Fatalf("retained %d limiters after returning to limit 8, want 1", count)
+	}
+	releaseOriginal()
+	acquireTestMCPExecutionSlot(t, "mcp", 8)
+}
+
+func TestMCPConcurrencyLimiterCleansDelayedOldSnapshotRequest(t *testing.T) {
+	isolateMCPConcurrencyLimiters(t)
+	captured := &APIConfigSnapshot{Config: APIConfig{"mcp": {Type: apiTypeMCP, Transport: "streamable_http", MaxConcurrent: 1}}}
+	publishAPISnapshot(captured)
+	publishAPISnapshot(nil)
+	// A request can capture the old snapshot before reload and reach acquisition later.
+	release := acquireTestMCPExecutionSlot(t, "mcp", mcpMaxConcurrent(captured.Config["mcp"]))
+	release()
+	mcpConcurrencyLimiters.Lock()
+	count := len(mcpConcurrencyLimiters.Limiters)
+	mcpConcurrencyLimiters.Unlock()
+	if count != 0 {
+		t.Fatalf("delayed request left %d obsolete limiters behind", count)
+	}
+}
+
+func TestMCPConcurrencyLimiterConcurrentReloadAndRequests(t *testing.T) {
+	isolateMCPConcurrencyLimiters(t)
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		workers.Add(1)
+		go func(worker int) {
+			defer workers.Done()
+			<-start
+			for i := 0; i < 200; i++ {
+				if release, acquired := acquireMCPExecutionSlot("mcp", 1+(worker+i)%4); acquired {
+					runtime.Gosched()
+					release()
+				}
+			}
+		}(worker)
+	}
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		<-start
+		for i := 0; i < 200; i++ {
+			publishAPISnapshot(&APIConfigSnapshot{Config: APIConfig{"mcp": {Type: apiTypeMCP, Transport: "streamable_http", MaxConcurrent: 1 + i%4}}})
+			runtime.Gosched()
+		}
+	}()
+	close(start)
+	workers.Wait()
+	publishAPISnapshot(nil)
+	mcpConcurrencyLimiters.Lock()
+	count := len(mcpConcurrencyLimiters.Limiters)
+	mcpConcurrencyLimiters.Unlock()
+	if count != 0 {
+		t.Fatalf("concurrent reloads and completed requests left %d obsolete limiters", count)
+	}
+}
+
+func TestMCPHTTPConcurrencyLimitSurvivesReload(t *testing.T) {
+	isolateMCPConcurrencyLimiters(t)
+	config := APIConfig{"mcp": {Type: apiTypeMCP, Transport: "streamable_http", MaxConcurrent: 1}}
+	router := newRequestRegressionRouter(t, config)
+	release := acquireTestMCPExecutionSlot(t, "mcp", 1)
+	publishAPISnapshot(&APIConfigSnapshot{Config: config})
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`
+	response := serveMCPRegressionRequest(router, body)
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != "1" {
+		t.Fatalf("busy request status=%d retry=%q body=%s", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+	}
+	release()
+	response = serveMCPRegressionRequest(router, body)
+	envelope := decodeJSONRPCCheckResponse(t, response, "1")
+	var result struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if err := json.Unmarshal(envelope["result"], &result); err != nil || result.ProtocolVersion != mcpProtocol20251125 || envelope["error"] != nil {
+		t.Fatalf("unexpected initialization after release: body=%s error=%v", response.Body.String(), err)
+	}
+}
+
 func TestMCPDoesNotRegisterUserManagement(t *testing.T) {
 	hook := writeFixtureFile(t, `({authenticated:false});`)
 	tool := writeFixtureFile(t, `({ok:true});`)
