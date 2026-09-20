@@ -54,16 +54,10 @@ type Config struct {
 	Port              int                `json:"port"`
 	CertFile          string             `json:"certPath"`
 	KeyFile           string             `json:"keyPath"`
-	BasicAuth         BasicAuthConfig    `json:"BasicAuth"`
 	JavaScriptInclude []string           `json:"javascript_include"`
 	Log               LogConfig          `json:"log"`
 	APIHotReload      APIHotReloadConfig `json:"APIHotReload"`
 	OAuthStateRoot    string             `json:"oauth_state_directory"`
-}
-
-type BasicAuthConfig struct {
-	Username string `json:"Username"`
-	Password string `json:"Password"`
 }
 
 // LogConfig はログ設定を表します。
@@ -132,7 +126,6 @@ type MCPOAuthHooks struct {
 	Authorize                    string   `json:"authorize,omitempty"`
 	Token                        string   `json:"token,omitempty"`
 	Register                     string   `json:"register,omitempty"`
-	AdminUser                    string   `json:"adminUser,omitempty"`
 	VerifyAccess                 string   `json:"verifyAccess,omitempty"`
 	Scopes                       []string `json:"scopes,omitempty"`
 	RedirectURIAllowedPrefixes   []string `json:"redirectURIAllowedPrefixes,omitempty"`
@@ -148,7 +141,7 @@ func (oauth *MCPOAuthHooks) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &object); err != nil {
 		return err
 	}
-	allowed := map[string]bool{"authorizationServerMetadata": true, "protectedResourceMetadata": true, "authorize": true, "token": true, "register": true, "adminUser": true, "verifyAccess": true}
+	allowed := map[string]bool{"authorizationServerMetadata": true, "protectedResourceMetadata": true, "authorize": true, "token": true, "register": true, "verifyAccess": true}
 	for key := range object {
 		if !allowed[key] {
 			return fmt.Errorf("unknown OAuth field %s", key)
@@ -393,13 +386,9 @@ func validateMCPConfiguration(config APIConfig) error {
 			}
 			refs := []struct {
 				role, api string
-				optional  bool
-			}{{"authorizationServerMetadata", endpoint.OAuth.AuthorizationServerMetadata, false}, {"protectedResourceMetadata", endpoint.OAuth.ProtectedResourceMetadataAPI, false}, {"authorize", endpoint.OAuth.Authorize, false}, {"token", endpoint.OAuth.Token, false}, {"register", endpoint.OAuth.Register, false}, {"verifyAccess", endpoint.OAuth.VerifyAccess, false}, {"adminUser", endpoint.OAuth.AdminUser, true}}
+			}{{"authorizationServerMetadata", endpoint.OAuth.AuthorizationServerMetadata}, {"protectedResourceMetadata", endpoint.OAuth.ProtectedResourceMetadataAPI}, {"authorize", endpoint.OAuth.Authorize}, {"token", endpoint.OAuth.Token}, {"register", endpoint.OAuth.Register}, {"verifyAccess", endpoint.OAuth.VerifyAccess}}
 			seen := map[string]bool{}
 			for _, ref := range refs {
-				if ref.api == "" && ref.optional {
-					continue
-				}
 				if ref.api == "" {
 					return fmt.Errorf("MCP endpoint %s OAuth requires %s", name, ref.role)
 				}
@@ -468,7 +457,7 @@ func validateUniqueNonemptyStrings(values []string) error {
 }
 
 func mcpOAuthConfigured(oauth MCPOAuthHooks) bool {
-	return oauth.AuthorizationServerMetadata != "" || oauth.ProtectedResourceMetadataAPI != "" || oauth.Authorize != "" || oauth.Token != "" || oauth.Register != "" || oauth.AdminUser != "" || oauth.VerifyAccess != ""
+	return oauth.AuthorizationServerMetadata != "" || oauth.ProtectedResourceMetadataAPI != "" || oauth.Authorize != "" || oauth.Token != "" || oauth.Register != "" || oauth.VerifyAccess != ""
 }
 
 func canonicalAPIEndpointPath(name string) (string, error) {
@@ -4162,7 +4151,7 @@ type mcpRPCRequest struct {
 	Params  json.RawMessage `json:"params"`
 }
 
-type mcpRuntimeURLs struct{ Origin, Resource, Issuer, AuthorizationServerMetadata, ProtectedResourceMetadata, AuthorizationEndpoint, TokenEndpoint, RegistrationEndpoint, AdminUserEndpoint string }
+type mcpRuntimeURLs struct{ Origin, Resource, Issuer, AuthorizationServerMetadata, ProtectedResourceMetadata, AuthorizationEndpoint, TokenEndpoint, RegistrationEndpoint string }
 
 var mcpDNSLabelPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 
@@ -4212,7 +4201,7 @@ func deriveMCPRuntimeURLs(request *http.Request, name string, mcp EndpointConfig
 		return origin + path
 	}
 	path, _ := canonicalAPIEndpointPath(name)
-	return mcpRuntimeURLs{Origin: origin, Resource: origin + path, Issuer: origin, AuthorizationServerMetadata: apiURL(mcp.OAuth.AuthorizationServerMetadata), ProtectedResourceMetadata: apiURL(mcp.OAuth.ProtectedResourceMetadataAPI), AuthorizationEndpoint: apiURL(mcp.OAuth.Authorize), TokenEndpoint: apiURL(mcp.OAuth.Token), RegistrationEndpoint: apiURL(mcp.OAuth.Register), AdminUserEndpoint: apiURL(mcp.OAuth.AdminUser)}, nil
+	return mcpRuntimeURLs{Origin: origin, Resource: origin + path, Issuer: origin, AuthorizationServerMetadata: apiURL(mcp.OAuth.AuthorizationServerMetadata), ProtectedResourceMetadata: apiURL(mcp.OAuth.ProtectedResourceMetadataAPI), AuthorizationEndpoint: apiURL(mcp.OAuth.Authorize), TokenEndpoint: apiURL(mcp.OAuth.Token), RegistrationEndpoint: apiURL(mcp.OAuth.Register)}, nil
 }
 
 func dispatchMCPOrOAuth(c *gin.Context) bool {
@@ -4253,7 +4242,7 @@ func sortedMCPNames(config APIConfig) []string {
 }
 
 func mcpOAuthRoleForAPI(mcp EndpointConfig, apiName string) (string, bool) {
-	refs := []struct{ api, role string }{{mcp.OAuth.AuthorizationServerMetadata, "authorizationServerMetadata"}, {mcp.OAuth.ProtectedResourceMetadataAPI, "protectedResourceMetadata"}, {mcp.OAuth.Authorize, "oauthAuthorize"}, {mcp.OAuth.Token, "oauthToken"}, {mcp.OAuth.Register, "oauthRegister"}, {mcp.OAuth.AdminUser, "oauthAdminUser"}, {mcp.OAuth.VerifyAccess, "oauthValidateAccessToken"}}
+	refs := []struct{ api, role string }{{mcp.OAuth.AuthorizationServerMetadata, "authorizationServerMetadata"}, {mcp.OAuth.ProtectedResourceMetadataAPI, "protectedResourceMetadata"}, {mcp.OAuth.Authorize, "oauthAuthorize"}, {mcp.OAuth.Token, "oauthToken"}, {mcp.OAuth.Register, "oauthRegister"}, {mcp.OAuth.VerifyAccess, "oauthValidateAccessToken"}}
 	for _, ref := range refs {
 		if ref.api != "" && ref.api == apiName {
 			return ref.role, true
@@ -4524,7 +4513,7 @@ func mcpToolScopes(tool MCPToolConfig) []string {
 }
 
 func invokeOAuthHook(c *gin.Context, snapshot *APIConfigSnapshot, endpointName string, mcp EndpointConfig, runtimeURLs mcpRuntimeURLs, hookName string, extra map[string]interface{}) (interface{}, bool) {
-	apiName := map[string]string{"oauthRegister": mcp.OAuth.Register, "oauthAuthorize": mcp.OAuth.Authorize, "oauthToken": mcp.OAuth.Token, "oauthAdminUser": mcp.OAuth.AdminUser, "oauthValidateAccessToken": mcp.OAuth.VerifyAccess}[hookName]
+	apiName := map[string]string{"oauthRegister": mcp.OAuth.Register, "oauthAuthorize": mcp.OAuth.Authorize, "oauthToken": mcp.OAuth.Token, "oauthValidateAccessToken": mcp.OAuth.VerifyAccess}[hookName]
 	backing, exists := snapshot.Config[apiName]
 	hookPath := strings.TrimSpace(backing.Script)
 	if !exists || hookPath == "" {
@@ -4534,7 +4523,7 @@ func invokeOAuthHook(c *gin.Context, snapshot *APIConfigSnapshot, endpointName s
 	if pathErr != nil {
 		return nil, false
 	}
-	params := map[string]interface{}{"oauth_hook": hookName, "oauth_api": apiName, "method": c.Request.Method, "request_path": c.Request.URL.Path, "path": apiPath, "endpoint": endpointName, "mcp_api_name": endpointName, "issuer": runtimeURLs.Issuer, "resource": runtimeURLs.Resource, "authorization_server_metadata_url": runtimeURLs.AuthorizationServerMetadata, "protected_resource_metadata_url": runtimeURLs.ProtectedResourceMetadata, "authorization_endpoint": runtimeURLs.AuthorizationEndpoint, "token_endpoint": runtimeURLs.TokenEndpoint, "registration_endpoint": runtimeURLs.RegistrationEndpoint, "admin_user_endpoint": runtimeURLs.AdminUserEndpoint, "scopes": mcp.OAuth.Scopes, "redirect_uri_allowed_prefixes": mcp.RedirectURIAllowedPrefixes, "state_directory": mcpOAuthStateDirectory(snapshot, endpointName), "operator_username": globalConfig.BasicAuth.Username, "operator_password": globalConfig.BasicAuth.Password, "authorization": c.GetHeader("Authorization")}
+	params := map[string]interface{}{"oauth_hook": hookName, "oauth_api": apiName, "method": c.Request.Method, "request_path": c.Request.URL.Path, "path": apiPath, "endpoint": endpointName, "mcp_api_name": endpointName, "issuer": runtimeURLs.Issuer, "resource": runtimeURLs.Resource, "authorization_server_metadata_url": runtimeURLs.AuthorizationServerMetadata, "protected_resource_metadata_url": runtimeURLs.ProtectedResourceMetadata, "authorization_endpoint": runtimeURLs.AuthorizationEndpoint, "token_endpoint": runtimeURLs.TokenEndpoint, "registration_endpoint": runtimeURLs.RegistrationEndpoint, "scopes": mcp.OAuth.Scopes, "redirect_uri_allowed_prefixes": mcp.RedirectURIAllowedPrefixes, "state_directory": mcpOAuthStateDirectory(snapshot, endpointName), "authorization": c.GetHeader("Authorization")}
 	for key, value := range extra {
 		params[key] = value
 	}
@@ -5044,27 +5033,8 @@ func setupOAuthStateRuntime(vm *goja.Runtime, root string) {
 		return value
 	})
 	vm.Set("nyanArgon2idVerify", argon2idVerify)
-	vm.Set("nyanOAuthAdminAuthorized", oauthAdminAuthorized)
 }
 
-func oauthAdminAuthorized(authorization string) bool {
-	if !strings.HasPrefix(authorization, "Basic ") {
-		return false
-	}
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(strings.TrimPrefix(authorization, "Basic ")))
-	if err != nil {
-		return false
-	}
-	username, password, found := strings.Cut(string(decoded), ":")
-	if !found || globalConfig.BasicAuth.Username == "" || globalConfig.BasicAuth.Password == "" {
-		return false
-	}
-	left := sha256.Sum256([]byte(username))
-	right := sha256.Sum256([]byte(globalConfig.BasicAuth.Username))
-	leftPassword := sha256.Sum256([]byte(password))
-	rightPassword := sha256.Sum256([]byte(globalConfig.BasicAuth.Password))
-	return subtle.ConstantTimeCompare(left[:], right[:]) == 1 && subtle.ConstantTimeCompare(leftPassword[:], rightPassword[:]) == 1
-}
 func argon2idHash(password string) (string, error) {
 	if len(password) < 1 || len(password) > 4096 {
 		return "", fmt.Errorf("invalid password")

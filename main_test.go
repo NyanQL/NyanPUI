@@ -1329,6 +1329,26 @@ func TestProductionMCPConfiguration(t *testing.T) {
 	if mcp.Transport != "streamable_http" || len(mcp.Tools) != 1 || mcp.Tools[0].Name != "sample/json" {
 		t.Fatalf("production MCP=%#v", mcp)
 	}
+	if _, exists := loaded.Snapshot.Config["oauth/admin/users"]; exists {
+		t.Fatal("sample configuration still exposes the removed user management API")
+	}
+	router := newRequestRegressionRouter(t, loaded.Snapshot.Config)
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(method, "/oauth/admin/users", nil))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("removed management API HTTP %s status=%d body=%s", method, rec.Code, rec.Body.String())
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/nyan-rpc", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"oauth/admin/users","params":{"oauth_hook":"oauthAdminUser"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	response := decodeJSONRPCCheckResponse(t, rec, "1")
+	var rpcError JSONRPCError
+	if err := json.Unmarshal(response["error"], &rpcError); err != nil || rpcError.Code != -32601 {
+		t.Fatalf("removed management API JSON-RPC response=%s error=%v", rec.Body.String(), err)
+	}
 }
 
 func TestMCPAndOAuthDelegateDecisionsToJavaScriptHooks(t *testing.T) {
@@ -1336,13 +1356,23 @@ func TestMCPAndOAuthDelegateDecisionsToJavaScriptHooks(t *testing.T) {
 	dir := t.TempDir()
 	hook := filepath.Join(dir, "oauth_validate.js")
 	toolScript := filepath.Join(dir, "tool.js")
-	writeTestFile(t, hook, `({authenticated: nyanAllParams.authorization === "Bearer test-token", principal:{id:"user-1"}});`)
+	writeTestFile(t, hook, `
+for (const key of ["operator_username", "operator_password", "admin_user_endpoint"]) {
+  if (Object.prototype.hasOwnProperty.call(nyanAllParams, key)) {
+    throw new Error("removed operator parameter: " + key);
+  }
+}
+if (typeof nyanOAuthAdminAuthorized !== "undefined") {
+  throw new Error("removed operator authentication helper is still available");
+}
+({authenticated: nyanAllParams.authorization === "Bearer test-token", principal:{id:"user-1"}});
+`)
 	writeTestFile(t, toolScript, `({status:200,contentType:"application/json",body:{ok:true,items:[1,2,3]}});`)
 	snapshot := &APIConfigSnapshot{Config: APIConfig{
-		"server_mcp":                             {Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{"2025-11-25"}, AllowedOrigins: []string{"https://chatgpt.com"}, RedirectURIAllowedPrefixes: []string{"https://chatgpt.com/connector/oauth/"}, OAuth: MCPOAuthHooks{AuthorizationServerMetadata: ".well-known/oauth-authorization-server", ProtectedResourceMetadataAPI: ".well-known/oauth-protected-resource/server_mcp", Authorize: "oauth/authorize", Token: "oauth/token", Register: "oauth/register", AdminUser: "oauth/admin/users", VerifyAccess: "oauth/verify_access"}, Tools: []MCPToolConfig{{Name: "sample", API: "sample"}}, Instructions: "test"},
+		"server_mcp":                             {Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{"2025-11-25"}, AllowedOrigins: []string{"https://chatgpt.com"}, RedirectURIAllowedPrefixes: []string{"https://chatgpt.com/connector/oauth/"}, OAuth: MCPOAuthHooks{AuthorizationServerMetadata: ".well-known/oauth-authorization-server", ProtectedResourceMetadataAPI: ".well-known/oauth-protected-resource/server_mcp", Authorize: "oauth/authorize", Token: "oauth/token", Register: "oauth/register", VerifyAccess: "oauth/verify_access"}, Tools: []MCPToolConfig{{Name: "sample", API: "sample"}}, Instructions: "test"},
 		"sample":                                 {Type: "api", Script: toolScript, SecuritySchemes: []map[string]interface{}{{"type": "oauth2", "scopes": []string{"nyanpui:read"}}}},
 		".well-known/oauth-authorization-server": {Type: "api"}, ".well-known/oauth-protected-resource/server_mcp": {Type: "api"},
-		"oauth/authorize": {Type: "api", Script: hook}, "oauth/token": {Type: "api", Script: hook}, "oauth/register": {Type: "api", Script: hook}, "oauth/admin/users": {Type: "api", Script: hook}, "oauth/verify_access": {Type: "api", Script: hook, Scopes: []string{"nyanpui:read"}},
+		"oauth/authorize": {Type: "api", Script: hook}, "oauth/token": {Type: "api", Script: hook}, "oauth/register": {Type: "api", Script: hook}, "oauth/verify_access": {Type: "api", Script: hook, Scopes: []string{"nyanpui:read"}},
 	}}
 	if err := validateMCPConfiguration(snapshot.Config); err != nil {
 		t.Fatal(err)
@@ -1440,10 +1470,10 @@ func TestJavaScriptOAuthAuthorizationCodePKCEFlow(t *testing.T) {
 	stateDirectory := t.TempDir()
 	resource := "https://example.test:8443/server_mcp"
 	snapshot := &APIConfigSnapshot{Config: APIConfig{
-		"server_mcp":                             {Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{"2025-11-25"}, AllowedOrigins: []string{"https://chatgpt.com"}, RedirectURIAllowedPrefixes: []string{"https://chatgpt.com/connector/oauth/"}, OAuth: MCPOAuthHooks{AuthorizationServerMetadata: ".well-known/oauth-authorization-server", ProtectedResourceMetadataAPI: ".well-known/oauth-protected-resource/server_mcp", Authorize: "oauth/authorize", Token: "oauth/token", Register: "oauth/register", AdminUser: "oauth/admin/users", VerifyAccess: "oauth/verify_access"}, Tools: []MCPToolConfig{{Name: "sample", API: "sample"}}},
+		"server_mcp":                             {Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{"2025-11-25"}, AllowedOrigins: []string{"https://chatgpt.com"}, RedirectURIAllowedPrefixes: []string{"https://chatgpt.com/connector/oauth/"}, OAuth: MCPOAuthHooks{AuthorizationServerMetadata: ".well-known/oauth-authorization-server", ProtectedResourceMetadataAPI: ".well-known/oauth-protected-resource/server_mcp", Authorize: "oauth/authorize", Token: "oauth/token", Register: "oauth/register", VerifyAccess: "oauth/verify_access"}, Tools: []MCPToolConfig{{Name: "sample", API: "sample"}}},
 		"sample":                                 {Type: "api", Script: toolScript, SecuritySchemes: []map[string]interface{}{{"type": "oauth2", "scopes": []string{"nyanpui:read"}}}},
 		".well-known/oauth-authorization-server": {Type: "api"}, ".well-known/oauth-protected-resource/server_mcp": {Type: "api"},
-		"oauth/authorize": {Type: "api", Script: hook}, "oauth/token": {Type: "api", Script: hook}, "oauth/register": {Type: "api", Script: hook}, "oauth/admin/users": {Type: "api", Script: hook}, "oauth/verify_access": {Type: "api", Script: hook, Scopes: []string{"nyanpui:read"}},
+		"oauth/authorize": {Type: "api", Script: hook}, "oauth/token": {Type: "api", Script: hook}, "oauth/register": {Type: "api", Script: hook}, "oauth/verify_access": {Type: "api", Script: hook, Scopes: []string{"nyanpui:read"}},
 	}}
 	if err := validateMCPConfiguration(snapshot.Config); err != nil {
 		t.Fatal(err)
@@ -1451,8 +1481,25 @@ func TestJavaScriptOAuthAuthorizationCodePKCEFlow(t *testing.T) {
 	oldSnapshot := currentAPISnapshot()
 	oldConfig := globalConfig
 	publishAPISnapshot(snapshot)
-	globalConfig = Config{Name: "NyanPUI", Version: "test", BasicAuth: BasicAuthConfig{Username: "operator", Password: "operator-password"}, OAuthStateRoot: stateDirectory}
+	globalConfig = Config{Name: "NyanPUI", Version: "test", OAuthStateRoot: stateDirectory}
 	t.Cleanup(func() { publishAPISnapshot(oldSnapshot); globalConfig = oldConfig })
+	// Provision this fixture directly; the server has no user management API.
+	passwordHash, err := argon2idHash("oauth-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usernameDigest := sha256.Sum256([]byte("neko"))
+	usernameHash := base64.RawURLEncoding.EncodeToString(usernameDigest[:])
+	userRecord, err := json.Marshal(map[string]interface{}{
+		"version": 1, "kind": "user", "username": "neko", "usernameHash": usernameHash,
+		"passwordHash": passwordHash, "disabled": false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := oauthWriteState(mcpOAuthStateDirectory(snapshot, "server_mcp"), "users/"+usernameHash+".json", string(userRecord)); err != nil {
+		t.Fatal(err)
+	}
 	router := gin.New()
 	router.NoRoute(func(c *gin.Context) {
 		c.Request.Host = "example.test:8443"
@@ -1462,15 +1509,6 @@ func TestJavaScriptOAuthAuthorizationCodePKCEFlow(t *testing.T) {
 		}
 	})
 
-	adminBody := strings.NewReader(`{"username":"neko","password":"oauth-password"}`)
-	adminRequest := httptest.NewRequest(http.MethodPost, "/oauth/admin/users", adminBody)
-	adminRequest.Header.Set("Content-Type", "application/json")
-	adminRequest.SetBasicAuth("operator", "operator-password")
-	admin := httptest.NewRecorder()
-	router.ServeHTTP(admin, adminRequest)
-	if admin.Code != http.StatusCreated {
-		t.Fatalf("admin status=%d body=%s", admin.Code, admin.Body.String())
-	}
 	badRegisterRequest := httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(`{"redirect_uris":["https://attacker.test/callback"],"scope":"nyanpui:read"}`))
 	badRegisterRequest.Header.Set("Content-Type", "application/json")
 	badRegistration := httptest.NewRecorder()
@@ -1598,6 +1636,13 @@ func TestCurrentMCPConfigRejectsRemovedAndUnknownFields(t *testing.T) {
 		if _, err := decodeAPIConfig([]byte(body), dir); err == nil {
 			t.Fatalf("invalid MCP config accepted: %s", body)
 		}
+	}
+}
+
+func TestMCPConfigRejectsRemovedAdminUser(t *testing.T) {
+	data := []byte(`{"server":{"type":"mcp","transport":"streamable_http","oauth":{"adminUser":"oauth/admin/users"}}}`)
+	if _, err := decodeAPIConfig(data, t.TempDir()); err == nil || !strings.Contains(err.Error(), "unknown OAuth field adminUser") {
+		t.Fatalf("removed oauth.adminUser must be rejected explicitly: %v", err)
 	}
 }
 
@@ -1849,7 +1894,6 @@ func TestJSONRPCRejectsNonPublicAPIs(t *testing.T) {
 		{name: "authorize", oauth: MCPOAuthHooks{Authorize: target}},
 		{name: "token", oauth: MCPOAuthHooks{Token: target}},
 		{name: "register", oauth: MCPOAuthHooks{Register: target}},
-		{name: "adminUser", oauth: MCPOAuthHooks{AdminUser: target}},
 		{name: "verifyAccess", oauth: MCPOAuthHooks{VerifyAccess: target}},
 	}
 	for _, tc := range cases {

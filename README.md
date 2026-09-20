@@ -82,10 +82,6 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
   "port": 8009,
   "certPath": "path/to/cert.crt",
   "keyPath": "path/to/key.key",
-  "BasicAuth": {
-    "Username": "operator",
-    "Password": "change-this-password"
-  },
   "javascript_include": [
     "javascript/lib/nyanPlateToJson.js"
   ],
@@ -104,8 +100,6 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
   }
 }
 ```
-
-`BasicAuth` はOAuth管理用の `/oauth/admin/users` だけを保護する運用者認証です。ChatGPTからOAuthログインするときは、ここではなくJavaScript hookが管理するOAuthユーザー名とパスワードを使用します。MCP/OAuthを使わない場合は省略できます。
 
 ### api.json のホットリロード
 
@@ -193,7 +187,7 @@ Nyan8・NyanQLと同じく、全リクエストのURL・ステータス・処理
 https://nyanpui.stamps.necomori.asia/server_mcp_http
 ```
 
-ChatGPTへはこのURLを登録します。認証画面ではJavaScript hook側に作成したOAuthユーザーを使用します。`config.json` の `BasicAuth` は初期ユーザーを登録する運用者用であり、ChatGPTのログイン情報ではありません。現在のscopeは `nyanpui:read` です。
+ChatGPTへはこのURLを登録します。認証画面ではJavaScript hook側で認証するOAuthユーザーを使用します。ユーザーは利用前に別途用意してください。現在のscopeは `nyanpui:read` です。
 
 ### MCP設定例
 
@@ -237,10 +231,6 @@ ChatGPTへはこのURLを登録します。認証画面ではJavaScript hook側�
     "type": "api",
     "script": "./runtime/oauth_policy.js"
   },
-  "oauth/admin/users": {
-    "type": "api",
-    "script": "./runtime/oauth_policy.js"
-  },
   "oauth/verify_access": {
     "type": "api",
     "script": "./runtime/oauth_policy.js",
@@ -260,7 +250,6 @@ ChatGPTへはこのURLを登録します。認証画面ではJavaScript hook側�
       "authorize": "oauth/authorize",
       "token": "oauth/token",
       "register": "oauth/register",
-      "adminUser": "oauth/admin/users",
       "verifyAccess": "oauth/verify_access"
     },
     "tools": ["sample/json"]
@@ -321,7 +310,6 @@ OAuthを有効にしたMCPで公開する各Toolは、`securitySchemes` の定�
 | `token` | 必須 | token endpointのAPI |
 | `register` | 必須 | Dynamic Client Registration API |
 | `verifyAccess` | 必須 | access tokenを検証するAPI。この通常APIの `scopes` にMCPで許可する重複のないscopeを1件以上指定 |
-| `adminUser` | 省略可 | OAuthユーザー管理API |
 
 HTTP endpointは `/server_mcp_http` になり、`/?api=server_mcp_http` でも呼び出せます。公開URLはrequestのschemeとHostから生成するため、固定domain、`path`、`resource` は設定しません。Toolの名前、説明、schema、security scheme、annotation、実行scriptは参照先の通常APIから解決されます。
 
@@ -333,21 +321,13 @@ stdioは次のように起動します。stdoutはJSON-RPC専用で、HTTP liste
 
 ### OAuthの責務と状態保存
 
-Goの `main.go` はMCP/OAuthのHTTP受付、request由来URL生成、安全な状態ファイル操作、JavaScript policy呼出しを担当します。ユーザー認証、PKCE検証、認可コードの一回限り消費、access tokenの発行・検証は参照先APIのJavaScript側の責務です。JavaScriptファイル名は固定されません。
+Goの `main.go` はMCP/OAuthのHTTP受付、request由来URL生成、JavaScript hook呼出し、hookの結果に基づく処理の許可・拒否と応答を担当します。安全な状態ファイル操作やパスワードハッシュなどの汎用ヘルパーも提供します。ユーザー認証、PKCE検証、認可コードの一回限り消費、access tokenの発行・検証は参照先APIのJavaScript側の責務です。JavaScriptファイル名は固定されません。
 
 状態保存rootは `config.json` の `oauth_state_directory` で指定します。実際の保存先はその下のMCP API名ごとに分離されます。未指定時はMCP定義元の `oauth-state/MCP API名` です。
 
-初期OAuthユーザーは、提供しているJavaScript hookでは `config.json` の `BasicAuth` で保護された管理endpointから作成します。公開ネットワークを経由させず、VPS上からbackendへ接続する運用を推奨します。
+NyanPUIには組み込みのOAuthユーザー管理APIはありません。ユーザーの作成・更新・管理が必要な場合は、利用者がJavaScriptなどで実装し、その処理へのアクセス制御も行ってください。ローカルサンプルのOAuth hookは状態ファイルに保存されたユーザーを認証するため、利用前にhookが扱う形式のユーザーデータを別途用意する必要があります。既存のユーザーデータは引き続き利用できます。
 
-```sh
-curl --resolve 'nyanpui.stamps.necomori.asia:8443:127.0.0.1' \
-  -u 'operator:operator-password' \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"oauth-user","password":"replace-with-a-long-password"}' \
-  https://nyanpui.stamps.necomori.asia:8443/oauth/admin/users
-```
-
-`--resolve` により通信先だけをloopbackへ固定しつつ、TLSのhostname検証には証明書のFQDNを使用します。hostname、backend port、証明書の構成は配置環境に合わせてください。運用者パスワードやOAuthユーザーのパスワードを設定ファイル、シェル履歴、Gitへ残さないでください。
+旧設定から移行する場合は、`config.json` の `BasicAuth`、MCP定義の `oauth.adminUser`、その参照先の管理API定義を削除してください。`oauth.adminUser` が残ったAPI設定は読み込みエラーになります。管理認証用の `nyanOAuthAdminAuthorized` と、hookへの `operator_username`・`operator_password`・`admin_user_endpoint` の受け渡しも廃止しています。
 
 OAuth discovery endpointは次のとおりです。
 
@@ -358,7 +338,6 @@ OAuth discovery endpointは次のとおりです。
 | `/oauth/register` | Dynamic Client Registration |
 | `/oauth/authorize` | ログイン、同意、認可コード発行 |
 | `/oauth/token` | PKCE検証とaccess token発行 |
-| `/oauth/admin/users` | Basic認証によるOAuthユーザー登録 |
 
 ### api.jsonの分割と多段include
 
@@ -870,7 +849,7 @@ JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
 
 `method` には `api.json` の API 名を指定します。JSON-RPCから呼べるのは `type: "api"` またはtypeを省略した通常APIで、`script` が必須です。`ws_client`、`public`、`schedule`、`mcp` など、それ以外の種別は呼び出せません。
 
-また、いずれかのMCP定義の `oauth` から参照されるAPIは、通常APIとして定義されていてもJSON-RPCからは呼び出せません。対象は `authorizationServerMetadata`、`protectedResourceMetadata`、`authorize`、`token`、`register`、`adminUser`、`verifyAccess` の全役割です。対象外のAPIにはHTTP 200でJSON-RPCエラー `-32601`（`Method not found`）を返し、チェック・本体・Pushを実行しません。この制限はホットリロード後の定義にも適用されます。
+また、いずれかのMCP定義の `oauth` から参照されるAPIは、通常APIとして定義されていてもJSON-RPCからは呼び出せません。対象は `authorizationServerMetadata`、`protectedResourceMetadata`、`authorize`、`token`、`register`、`verifyAccess` の全役割です。対象外のAPIにはHTTP 200でJSON-RPCエラー `-32601`（`Method not found`）を返し、チェック・本体・Pushを実行しません。この制限はホットリロード後の定義にも適用されます。
 
 成功時の `result` は JavaScript の戻り値を文字列化した値です。
 
