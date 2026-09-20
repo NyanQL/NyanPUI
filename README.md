@@ -906,7 +906,23 @@ JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
 
 また、いずれかのMCP定義の `oauth` から参照されるAPIは、通常APIとして定義されていてもJSON-RPCからは呼び出せません。対象は `authorizationServerMetadata`、`protectedResourceMetadata`、`authorize`、`token`、`register`、`verifyAccess` の全役割です。対象外のAPIにはHTTP 200でJSON-RPCエラー `-32601`（`Method not found`）を返し、チェック・本体・Pushを実行しません。この制限はホットリロード後の定義にも適用されます。
 
-成功時の `result` は JavaScript の戻り値を文字列化した値です。
+成功時の `result` は JavaScript の戻り値の型を保ちます。オブジェクト、配列、数値、真偽値は対応するJSONの値になり、`null` または `undefined` は `null` になります。文字列はそのまま文字列として返します。`JSON.stringify(...)` の結果など、JSON形式の文字列を自動で解析することはありません。
+
+例えば、スクリプトが次のオブジェクトを返す場合です。
+
+```javascript
+({ ok: true, count: 3, items: [1, 2, 3] });
+```
+
+JSON-RPCの応答は次のようになります。
+
+```json
+{"jsonrpc":"2.0","result":{"ok":true,"count":3,"items":[1,2,3]},"id":1}
+```
+
+通常HTTP向けの `{status, headers, contentType, body}` 形式を返した場合も、オブジェクト全体が `result` になります。`body` だけを取り出したり、そのヘッダーをJSON-RPCのHTTP応答に設定したりはしません。戻り値をJSONに変換できない場合は、HTTP 200でJSON-RPCエラー `-32603`（`Invalid script response`）を返し、Pushを実行しません。
+
+以前は数値・真偽値・配列・オブジェクトも文字列化していたため、その文字列形式を前提にしたクライアントは修正が必要です。スクリプトが `JSON.stringify(...)` で文字列を返し、クライアントが `JSON.parse(response.result)` で復元する構成は引き続き使用できます。
 
 JSON-RPCでも `paramCheck` と `outCheck` を実行します。チェックが `success: true` かつ `status: 200` を満たさなかった場合、HTTP 200で次のJSON-RPCエラーを返します。`id` はリクエストの値を保持し、`error.code` は `-32000`、`error.message` は `paramCheck rejected` または `outCheck rejected` です。元のチェック結果は `error.data` に保持します。
 
@@ -933,7 +949,7 @@ JSON-RPCでも `paramCheck` と `outCheck` を実行します。チェックが 
 ---
 
 ## JavaScriptのレスポンス形式（拡張）
-JavaScript が文字列を返した場合は従来どおり `text/html; charset=utf-8` として返します。`null` や `undefined` の場合は空ボディになります。
+通常HTTPのAPIでは、JavaScript が文字列を返した場合は従来どおり `text/html; charset=utf-8` として返します。`null` や `undefined` の場合は空ボディになります。
 オブジェクトを返すと、HTTPレスポンスを制御できます。
 
 ```javascript

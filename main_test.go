@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -2857,6 +2858,12 @@ func TestJSONRPCRequestAndScriptErrors(t *testing.T) {
 		{name: "reserved_tool_query", query: "?mcp_tool=forged", wantCode: -32602, wantMessage: "Invalid params", wantDetail: "reserved parameter mcp_tool"},
 		{name: "script_exception", script: `throw new Error("main failed");`, wantCode: -32603, wantMessage: "Script execution error", wantDetail: "main failed", wantMain: true},
 		{name: "invalid_base64", script: `({body:{encoding:"base64",data:"!"}});`, wantCode: -32603, wantMessage: "Invalid script response", wantDetail: "invalid base64 body", wantMain: true},
+		{name: "cyclic_result", script: `const result = {}; result.self = result; result;`, wantCode: -32603, wantMessage: "Invalid script response", wantMain: true},
+		{name: "nan_result", script: `NaN;`, wantCode: -32603, wantMessage: "Invalid script response", wantMain: true},
+		{name: "infinite_result", script: `({value: Infinity});`, wantCode: -32603, wantMessage: "Invalid script response", wantMain: true},
+		{name: "function_result", script: `(function () { return "not JSON"; });`, wantCode: -32603, wantMessage: "Invalid script response", wantMain: true},
+		{name: "throwing_getter", script: `({get body() { throw new Error("getter failed"); }});`, wantCode: -32603, wantMessage: "Invalid script response", wantDetail: "getter failed", wantMain: true},
+		{name: "throwing_array_conversion", script: `Array.prototype.toString = function () { throw new Error("conversion failed"); }; [1,2];`, wantCode: -32603, wantMessage: "Invalid script response", wantDetail: "conversion failed", wantMain: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -2903,6 +2910,102 @@ func TestJSONRPCRequestAndScriptErrors(t *testing.T) {
 			assertJSONRPCExecutionMarker(t, mainMarker, tc.wantMain)
 			assertJSONRPCExecutionMarker(t, outMarker, false)
 			assertJSONRPCExecutionMarker(t, pushMarker, false)
+		})
+	}
+}
+
+func TestJSONRPCPreservesResultTypes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		script string
+		want   string
+	}{
+		{name: "object", script: `({ok:true,count:3,nested:{items:[false,null,"value"]}});`, want: `{"ok":true,"count":3,"nested":{"items":[false,null,"value"]}}`},
+		{name: "empty_object", script: `({});`, want: `{}`},
+		{name: "array", script: `[1,"two",false,null,{ok:true}];`, want: `[1,"two",false,null,{"ok":true}]`},
+		{name: "empty_array", script: `[];`, want: `[]`},
+		{name: "zero", script: `0;`, want: `0`},
+		{name: "integer", script: `123;`, want: `123`},
+		{name: "fraction", script: `-1.25;`, want: `-1.25`},
+		{name: "false", script: `false;`, want: `false`},
+		{name: "true", script: `true;`, want: `true`},
+		{name: "null", script: `null;`, want: `null`},
+		{name: "undefined", script: `undefined;`, want: `null`},
+		{name: "string", script: `"hello";`, want: `"hello"`},
+		{name: "empty_string", script: `"";`, want: `""`},
+		{name: "json_string", script: `JSON.stringify({ok:true});`, want: `"{\"ok\":true}"`},
+		{name: "numeric_string", script: `"123";`, want: `"123"`},
+		{name: "null_string", script: `"null";`, want: `"null"`},
+		{name: "http_response_object", script: `({status:201,contentType:"application/json",headers:{"X-Test":"ok"},body:{ok:true}});`, want: `{"status":201,"contentType":"application/json","headers":{"X-Test":"ok"},"body":{"ok":true}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "push-ran")
+			push := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); "pushed";`, marker))
+			router := newRequestRegressionRouter(t, APIConfig{
+				"private": {Script: writeFixtureFile(t, tc.script), Push: "updates"},
+				"updates": {Script: push},
+			})
+			rec := serveJSONRPCCheckRequest(router, `"typed-result"`, `{}`)
+			response := decodeJSONRPCCheckResponse(t, rec, `"typed-result"`)
+			if _, exists := response["error"]; exists {
+				t.Fatalf("successful script returned error: %s", rec.Body.String())
+			}
+			result, exists := response["result"]
+			if !exists {
+				t.Fatalf("success omitted result: %s", rec.Body.String())
+			}
+			var got, want interface{}
+			if err := json.Unmarshal(result, &got); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal([]byte(tc.want), &want); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("result = %s, want %s", result, tc.want)
+			}
+			assertJSONRPCExecutionMarker(t, marker, true)
+		})
+	}
+}
+
+func TestJSONRPCStructuredResultOutCheckUsesSingleExport(t *testing.T) {
+	for _, allowed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("allowed_%t", allowed), func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "push-ran")
+			outCheck := writeFixtureFile(t, fmt.Sprintf(`
+if (nyanAllParams.nyan_output_status !== 201 ||
+    nyanAllParams.nyan_output_content_type !== "application/json" ||
+    nyanAllParams.nyan_output.headers["X-Test"] !== "ok" ||
+    JSON.parse(nyanAllParams.nyan_output_body).count !== 1) {
+  throw new Error("outCheck input changed");
+}
+({success:%t,status:%d,result:"checked"});`, allowed, map[bool]int{true: 200, false: 403}[allowed]))
+			router := newRequestRegressionRouter(t, APIConfig{
+				"private": {
+					// The getter must be evaluated once so the checked body and RPC result agree.
+					Script:   writeFixtureFile(t, `let count = 0; ({status:201,contentType:"application/json",headers:{"X-Test":"ok"},get body() { return {count: ++count}; }});`),
+					OutCheck: outCheck,
+					Push:     "updates",
+				},
+				"updates": {Script: writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); "pushed";`, marker))},
+			})
+			rec := serveJSONRPCCheckRequest(router, "42", `{}`)
+			if allowed {
+				response := decodeJSONRPCCheckResponse(t, rec, "42")
+				var result struct {
+					Status int `json:"status"`
+					Body   struct {
+						Count int `json:"count"`
+					} `json:"body"`
+				}
+				if err := json.Unmarshal(response["result"], &result); err != nil || result.Status != 201 || result.Body.Count != 1 || response["error"] != nil {
+					t.Fatalf("outCheck altered structured result: %s; error=%v", rec.Body.String(), err)
+				}
+			} else {
+				assertJSONRPCCheckError(t, rec, "42", "outCheck", false, http.StatusForbidden)
+			}
+			assertJSONRPCExecutionMarker(t, marker, allowed)
 		})
 	}
 }

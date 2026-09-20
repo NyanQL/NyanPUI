@@ -1496,6 +1496,14 @@ func writeParamCheckResponse(c *gin.Context, resp ParamCheckResponse) {
 }
 
 func responseFromJSValue(value goja.Value) (APIResponse, bool, error) {
+	var exported interface{}
+	if value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
+		exported = value.Export()
+	}
+	return responseFromExportedJSValue(value, exported)
+}
+
+func responseFromExportedJSValue(value goja.Value, exported interface{}) (APIResponse, bool, error) {
 	response := APIResponse{
 		Status:      http.StatusOK,
 		ContentType: "text/html; charset=utf-8",
@@ -1507,7 +1515,6 @@ func responseFromJSValue(value goja.Value) (APIResponse, bool, error) {
 		return response, false, nil
 	}
 
-	exported := value.Export()
 	respMap, ok := exported.(map[string]interface{})
 	if !ok {
 		response.Body = []byte(value.String())
@@ -2785,7 +2792,7 @@ func handleJSONRPC(c *gin.Context) {
 		respondJSONRPCError(c, rpcReq.ID, -32603, "Script execution error", err.Error())
 		return
 	}
-	response, _, err := responseFromJSValue(resultValue)
+	result, response, err := jsonRPCResultFromJSValue(resultValue)
 	if err != nil {
 		respondJSONRPCError(c, rpcReq.ID, -32603, "Invalid script response", err.Error())
 		return
@@ -2801,10 +2808,35 @@ func handleJSONRPC(c *gin.Context) {
 	// 10) JSON-RPC 成功レスポンスを構築して返却
 	rpcResp := JSONRPCResponse{
 		JSONRPC: "2.0",
-		Result:  resultValue.String(),
+		Result:  result,
 		ID:      rpcReq.ID,
 	}
 	c.JSON(http.StatusOK, rpcResp)
+}
+
+func jsonRPCResultFromJSValue(value goja.Value) (result json.RawMessage, response APIResponse, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if exception, ok := recovered.(*goja.Exception); ok {
+				result, err = nil, exception
+			} else {
+				panic(recovered)
+			}
+		}
+	}()
+
+	// Reuse one export for the result and HTTP response fields used by outCheck.
+	var exported interface{}
+	if value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
+		exported = value.Export()
+	}
+	// Pre-encode before Push, including a non-nil "null" result for empty values.
+	result, err = json.Marshal(exported)
+	if err != nil {
+		return nil, response, err
+	}
+	response, _, err = responseFromExportedJSValue(value, exported)
+	return result, response, err
 }
 
 func writeJSONRPCCheckResponse(c *gin.Context, id interface{}, checkName string, response ParamCheckResponse) {
