@@ -2047,8 +2047,8 @@ func serviceLog(level slog.Level, event string, fields ...interface{}) {
 func logServiceError(level slog.Level, event string, err error, fields ...interface{}) {
 	if err != nil {
 		cause := err
-		for errors.Unwrap(cause) != nil {
-			cause = errors.Unwrap(cause)
+		for next := errors.Unwrap(cause); next != nil; next = errors.Unwrap(cause) {
+			cause = next
 		}
 		fields = append(fields, "error_type", fmt.Sprintf("%T", cause))
 		var state interface{ SQLState() string }
