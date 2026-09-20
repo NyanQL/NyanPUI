@@ -991,15 +991,5 @@ const data = nyanReadFileB64("./html/images/nyan.png");
 
 ---
 
-## ワイヤーフレームデザインプレビューについて
-以下のファイルをプロジェクトに含めることで、ワイヤーフレーム用のプレビュー機能を利用できます：
-* **CSS**: `html/css/wf_style.css` にワイヤーフレーム用のスタイルを定義
-* **HTML**: `html/wf_html.html` にサンプルレイアウトを記述
-
-これらを配置した状態でサーバーを起動すると、デフォルトで以下の URL からプレビューが表示されます：
-
-> [http://localhost:8009/wf](http://localhost:8009/wf)
-
-
 ## 予約語
 エンドポイント名や変数名など、`nyan` で始まる名前は予約語になりますので使用しないでください。`nyan`, `nyan-rpc` は固定ルートで使われます。`api` は `nyanAllParams` で呼び出し先 API 名に使う予約パラメータです。
