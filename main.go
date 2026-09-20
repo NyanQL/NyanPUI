@@ -2294,6 +2294,17 @@ func setupGojaRuntimeWithContext(snapshot *APIConfigSnapshot, requestContext *gi
 		return vm.ToValue(nil)
 	})
 
+	vm.Set("nyanRemoveItem", func(call goja.FunctionCall) goja.Value {
+		if len(call.Arguments) < 1 {
+			return vm.ToValue(nil)
+		}
+		key := call.Argument(0).String()
+		storageMu.Lock()
+		delete(storage, key)
+		storageMu.Unlock()
+		return vm.ToValue(nil)
+	})
+
 	// Keep file operations anchored to the root API definition captured by this VM.
 	fileBaseDir := ""
 	if snapshot != nil && filepath.IsAbs(snapshot.RootPath) {

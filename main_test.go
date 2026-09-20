@@ -2898,7 +2898,8 @@ func TestRawAPICannotForgeMCPPrincipal(t *testing.T) {
 	assertJSONRPCExecutionMarker(t, marker, false)
 }
 
-func TestStorageConcurrency(t *testing.T) {
+func isolateTestStorage(t *testing.T) {
+	t.Helper()
 	storageMu.Lock()
 	oldStorage := storage
 	storage = make(map[string]string)
@@ -2908,9 +2909,54 @@ func TestStorageConcurrency(t *testing.T) {
 		storage = oldStorage
 		storageMu.Unlock()
 	})
+}
+
+func TestRemoveItemSharesStorageAcrossRuntimes(t *testing.T) {
+	isolateTestStorage(t)
 	vmA, vmB := setupGojaRuntime(), setupGojaRuntime()
+	if _, err := vmA.RunString(`
+		nyanSetItem("target", "remove");
+		nyanSetItem("keep", "preserve");
+		nyanSetItem("undefined", "preserve undefined");
+		nyanSetItem(7, "numeric");
+		nyanSetItem("", "empty");
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vmB.RunString(`
+		if (nyanGetItem("target") !== "remove" || nyanGetItem("7") !== "numeric" || nyanGetItem("") !== "empty") {
+			throw new Error("values are not shared between runtimes");
+		}
+		for (const key of ["target", "target", "missing", 7, ""]) {
+			if (nyanRemoveItem(key) !== null || nyanGetItem(key) !== null) {
+				throw new Error("removal did not return null and remove key: " + key);
+			}
+		}
+		if (nyanRemoveItem() !== null) {
+			throw new Error("removal without a key did not return null");
+		}
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vmA.RunString(`
+		for (const key of ["target", "7", ""]) {
+			if (nyanGetItem(key) !== null) {
+				throw new Error("removal is not visible in the original runtime: " + key);
+			}
+		}
+		if (nyanGetItem("keep") !== "preserve" || nyanGetItem("undefined") !== "preserve undefined") {
+			throw new Error("removal changed an unrelated key");
+		}
+	`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStorageConcurrency(t *testing.T) {
+	isolateTestStorage(t)
+	vmA, vmB, vmC := setupGojaRuntime(), setupGojaRuntime(), setupGojaRuntime()
 	start := make(chan struct{})
-	results := make(chan error, 2)
+	results := make(chan error, 3)
 	go func() {
 		<-start
 		_, err := vmA.RunString(`for (let i = 0; i < 100; i++) nyanSetItem("key", "value-" + i);`)
@@ -2921,15 +2967,30 @@ func TestStorageConcurrency(t *testing.T) {
 		_, err := vmB.RunString(`for (let i = 0; i < 100; i++) nyanGetItem("key");`)
 		results <- err
 	}()
+	go func() {
+		<-start
+		_, err := vmC.RunString(`for (let i = 0; i < 100; i++) nyanRemoveItem("key");`)
+		results <- err
+	}()
 	close(start)
-	for range 2 {
+	for range 3 {
 		if err := <-results; err != nil {
 			t.Error(err)
 		}
 	}
+	if _, err := vmA.RunString(`nyanSetItem("key", "final");`); err != nil {
+		t.Fatal(err)
+	}
 	value, err := vmB.RunString(`nyanGetItem("key");`)
-	if err != nil || value.String() != "value-99" {
+	if err != nil || value.String() != "final" {
 		t.Fatalf("stored value = %v, error = %v", value, err)
+	}
+	if _, err := vmC.RunString(`nyanRemoveItem("key");`); err != nil {
+		t.Fatal(err)
+	}
+	value, err = vmA.RunString(`nyanGetItem("key") === null;`)
+	if err != nil || !value.ToBoolean() {
+		t.Fatalf("removed key was retained: result = %v, error = %v", value, err)
 	}
 }
 

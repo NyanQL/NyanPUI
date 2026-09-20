@@ -677,7 +677,7 @@ schedule の `script` では通常 API と同じ Goja 環境を使えます。�
 * コンソール出力: `console.log()`
 * リクエストヘッダーの取得: `nyanGetRequestHeaders()`
 * Cookie 操作: `nyanGetCookie()` / `nyanSetCookie()`
-* localStorage 操作: `nyanGetItem()` / `nyanSetItem()`
+* プロセス内の共有ストレージ操作: `nyanGetItem()` / `nyanSetItem()` / `nyanRemoveItem()`
 * 外部 APIの呼び出し : `nyanGetAPI()` / `nyanJsonAPI()` / `nyanCallAPI()`
 * ホスト側でコマンドを実行し、結果を取得する: `nyanHostExec()`
 * ファイル読み込み: `nyanGetFile()`
@@ -714,15 +714,24 @@ console.log("Cookie Value: " + cookieValue);
 // Cookie の設定
 nyanSetCookie("cookieName", "cookieValue");
 ```
-### 5. **nyanGetItem / nyanSetItem**
-ローカルストレージを操作制御します。
+### 5. **nyanGetItem / nyanSetItem / nyanRemoveItem**
+
+NyanPUIプロセス内のメモリにキーと値を保存します。同じプロセスの各API・JavaScript実行で共有され、API設定の再読込でも保持されます。プロセスを再起動すると消えます。
+
+`nyanSetItem(key, value)` はキーと値を文字列に変換して保存し、同じキーがあれば上書きします。`nyanGetItem(key)` は保存した文字列を返し、キーが存在しなければ `null` を返します。`nyanRemoveItem(key)` は文字列に変換したキーのデータを削除します。存在しないキーの削除や、引数なしの呼び出しでは何もしません。`nyanSetItem` と `nyanRemoveItem` の戻り値は `null` です。
+
 ```javascript
-// ローカルストレージから値を取得
+// 値を保存
+nyanSetItem("itemKey", "itemValue");
+// 値を取得
 var itemValue = nyanGetItem("itemKey");
 console.log("Item Value: " + itemValue);
-// ローカルストレージに値を設定
-nyanSetItem("itemKey", "itemValue");
+// 不要になったデータを削除
+nyanRemoveItem("itemKey");
+console.log(nyanGetItem("itemKey")); // null
 ```
+
+自動削除や有効期限、件数・サイズの上限はありません。動的にキーを増やす場合は、不要になった時点でJavaScript側から削除してください。空文字を保存してもキー自体は削除されません。
 
 ### 6. **nyanGetAPI / nyanJsonAPI / nyanCallAPI**
 外部 API を呼び出します。
