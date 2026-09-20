@@ -186,17 +186,17 @@ Nyan8・NyanQLと同じく、全リクエストのURL・ステータス・処理
 
 `type: "mcp"` を複数定義でき、既存のNyanPUI APIをToolとして共有できます。transportは定義ごとに `streamable_http` または `stdio` のどちらか1つです。Streamable HTTPはstatelessで、MCP protocol version `2025-11-25` と `2025-06-18`、`initialize`、`ping`、`tools/list`、`tools/call` に対応しています。
 
-現在の接続確認用MCP URLは次のとおりです。
+Streamable HTTPを利用するMCPクライアントには、利用するサーバーの公開URLとMCP API名に対応するendpointを登録します。MCP API名が `server_mcp_http` の場合、URLは次の形式です。
 
 ```text
-https://nyanpui.stamps.necomori.asia/server_mcp_http
+https://example.com/server_mcp_http
 ```
 
-ChatGPTへはこのURLを登録します。認証画面ではJavaScript hook側で認証するOAuthユーザーを使用します。ユーザーは利用前に別途用意してください。現在のscopeは `nyanpui:read` です。
+`example.com` は利用するサーバーのドメインに置き換えてください。OAuth認証を有効にする場合は、JavaScript hookで認証・認可の処理を実装します。
 
 ### MCP設定例
 
-公開環境の `api.vps.json`、OAuth hook、状態ファイル、Ansible設定は環境ごとの運用ファイルとしてGit管理しません。次は構造を示す例です。
+次はMCPとOAuthの設定構造を示す例です。参照するJavaScriptは用途に合わせて用意してください。`nyanpui:read` はscopeの例であり、アプリケーションで必要な権限に合わせて設定します。
 
 ```json
 {
@@ -336,7 +336,7 @@ OAuthのJavaScript hookでは、`nyanArgon2idHash(password)` でパスワード�
 
 ハッシュの再生成・保存は自動では行いません。将来、生成設定を変更して既存ハッシュを更新する場合は、検証成功後に入力されたパスワードから再生成し、JavaScript側で保存してください。ログインの許可・拒否や更新の判断もJavaScript側で行います。
 
-NyanPUIには組み込みのOAuthユーザー管理APIはありません。ユーザーの作成・更新・管理が必要な場合は、利用者がJavaScriptなどで実装し、その処理へのアクセス制御も行ってください。ローカルサンプルのOAuth hookは状態ファイルに保存されたユーザーを認証するため、利用前にhookが扱う形式のユーザーデータを別途用意する必要があります。既存のユーザーデータは引き続き利用できます。
+NyanPUIには組み込みのOAuthユーザー管理APIはありません。ユーザーの作成・更新・管理が必要な場合は、利用者がJavaScriptなどで実装し、その処理へのアクセス制御も行ってください。認証方法やユーザーデータの保存形式は、アプリケーション側で定めてください。
 
 旧設定から移行する場合は、`config.json` の `BasicAuth`、MCP定義の `oauth.adminUser`、その参照先の管理API定義を削除してください。`oauth.adminUser` が残ったAPI設定は読み込みエラーになります。管理認証用の `nyanOAuthAdminAuthorized` と、hookへの `operator_username`・`operator_password`・`admin_user_endpoint` の受け渡しも廃止しています。
 
