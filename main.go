@@ -4972,6 +4972,8 @@ func writeMCPStdioMessage(output io.Writer, payload interface{}) error {
 	return nil
 }
 
+const oauthStateTempPattern = ".nyanpui-oauth-*.tmp"
+
 var oauthStateMu sync.Mutex
 var oauthStateNamespacePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 var oauthArgon2Slots = make(chan struct{}, 2)
@@ -5160,7 +5162,7 @@ func oauthWriteState(root, key, value string) error {
 	if err != nil {
 		return err
 	}
-	temp, err := os.CreateTemp(filepath.Dir(path), ".nyanpui-oauth-*.tmp")
+	temp, err := os.CreateTemp(filepath.Dir(path), oauthStateTempPattern)
 	if err != nil {
 		return err
 	}
@@ -5226,7 +5228,14 @@ func oauthListState(root, namespace string) ([]string, error) {
 	keys := []string{}
 	for _, entry := range entries {
 		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() || oauthPermissionsTooBroad(info.Mode(), 0077) || filepath.Ext(entry.Name()) != ".json" {
+		if err != nil || !info.Mode().IsRegular() || oauthPermissionsTooBroad(info.Mode(), 0077) {
+			return nil, fmt.Errorf("unsafe state entry")
+		}
+		// Ignore safe temporary files left behind by interrupted writes.
+		if temporary, _ := filepath.Match(oauthStateTempPattern, entry.Name()); temporary {
+			continue
+		}
+		if filepath.Ext(entry.Name()) != ".json" {
 			return nil, fmt.Errorf("unsafe state entry")
 		}
 		keys = append(keys, namespace+"/"+entry.Name())

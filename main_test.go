@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -1426,6 +1427,96 @@ if (typeof nyanOAuthAdminAuthorized !== "undefined") {
 	}
 	if strings.Contains(rec.Body.String(), hook) {
 		t.Fatal("hook filesystem path leaked in MCP response")
+	}
+}
+
+func TestOAuthListStatePreservesInterruptedWrite(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "oauth-state")
+	for _, key := range []string{"tokens/z.json", "tokens/a.json"} {
+		if err := oauthWriteState(root, key, `{"valid":true}`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	temp, err := os.CreateTemp(filepath.Join(root, "tokens"), ".nyanpui-oauth-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const incompleteJSON = `{"unfinished":`
+	if _, err := temp.WriteString(incompleteJSON); err != nil {
+		temp.Close()
+		t.Fatal(err)
+	}
+	if err := temp.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	keys, err := oauthListState(root, "tokens")
+	if err != nil || strings.Join(keys, ",") != "tokens/a.json,tokens/z.json" {
+		t.Fatalf("interrupted write broke listing: keys=%v error=%v", keys, err)
+	}
+	script := writeFixtureFile(t, `JSON.stringify(nyanOAuthList("tokens"));`)
+	value, err := runJavaScriptValueWithSnapshot(&APIConfigSnapshot{}, script, "", map[string]interface{}{"state_directory": root})
+	if err != nil {
+		t.Fatalf("interrupted write broke JavaScript listing: %v", err)
+	}
+	if got := value.String(); got != `["tokens/a.json","tokens/z.json"]` {
+		t.Fatalf("JavaScript listing = %s", got)
+	}
+	content, err := os.ReadFile(temp.Name())
+	if err != nil || string(content) != incompleteJSON {
+		t.Fatalf("listing changed the temporary file: content=%q error=%v", content, err)
+	}
+}
+
+func TestOAuthListStateRejectsUnsafeEntries(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		filename string
+		kind     string
+	}{
+		{name: "unknown_tmp", filename: "other.tmp"},
+		{name: "wrong_prefix", filename: "nyanpui-oauth-123.tmp"},
+		{name: "wrong_suffix", filename: ".nyanpui-oauth-123.tmp.bak"},
+		{name: "temporary_directory", filename: ".nyanpui-oauth-123.tmp", kind: "directory"},
+		{name: "temporary_symlink", filename: ".nyanpui-oauth-123.tmp", kind: "symlink"},
+		{name: "temporary_permissions", filename: ".nyanpui-oauth-123.tmp", kind: "permissions"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.kind == "permissions" && runtime.GOOS == "windows" {
+				t.Skip("OAuth state does not enforce POSIX permissions on Windows")
+			}
+			root := filepath.Join(t.TempDir(), "oauth-state")
+			if err := oauthWriteState(root, "tokens/valid.json", `{"valid":true}`); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, "tokens", tc.filename)
+			switch tc.kind {
+			case "directory":
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Symlink(filepath.Join(root, "tokens", "valid.json"), path); err != nil {
+					t.Skipf("cannot create a symbolic link: %v", err)
+				}
+			default:
+				if err := os.WriteFile(path, []byte(`{"unfinished":`), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if tc.kind == "permissions" {
+					if err := os.Chmod(path, 0644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if keys, err := oauthListState(root, "tokens"); err == nil || len(keys) != 0 {
+				t.Fatalf("unsafe entry was accepted: keys=%v error=%v", keys, err)
+			}
+			script := writeFixtureFile(t, `nyanOAuthList("tokens");`)
+			if _, err := runJavaScriptValueWithSnapshot(&APIConfigSnapshot{}, script, "", map[string]interface{}{"state_directory": root}); err == nil {
+				t.Fatal("JavaScript listing accepted an unsafe state entry")
+			}
+		})
 	}
 }
 
