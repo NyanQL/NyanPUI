@@ -3589,7 +3589,7 @@ func TestStartupLoggingFailuresStayOffStdout(t *testing.T) {
 	}{
 		{"missing_config", "", "startup_options_failed"},
 		{"invalid_json", `{"log":`, "config_load_failed"},
-		{"invalid_level", `{"log":{"Level":"verbose"}}`, "Invalid log.Level: expected debug, info, warn, or error"},
+		{"invalid_level", `{"log":{"Level":"verbose"}}`, "log_level_invalid"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()

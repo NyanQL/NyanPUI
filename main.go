@@ -670,7 +670,7 @@ func main() {
 	adjustConfigPaths(configBaseDir, &config)
 	globalConfig = config
 	if err := setupLogger(configBaseDir); err != nil {
-		fatalServiceError("Invalid log.Level: expected debug, info, warn, or error", err)
+		fatalServiceError("log_level_invalid", err)
 	}
 	// Suppress Gin's unstructured route and listener diagnostics.
 	gin.DefaultWriter = io.Discard
