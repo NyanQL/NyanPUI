@@ -1946,9 +1946,8 @@ func isMCPOrOAuthHTTPRequest(request *http.Request) bool {
 	if request.URL.Path == "/" {
 		name = request.URL.Query().Get("api")
 	}
-	for _, mcpName := range sortedMCPNames(snapshot.Config) {
-		mcp := snapshot.Config[mcpName]
-		if mcp.Transport != "streamable_http" {
+	for mcpName, mcp := range snapshot.Config {
+		if mcp.Type != apiTypeMCP || mcp.Transport != "streamable_http" {
 			continue
 		}
 		if name == mcpName {
@@ -4010,9 +4009,8 @@ func dispatchMCPOrOAuth(c *gin.Context) bool {
 	if c.Request.URL.Path == "/" {
 		apiName = strings.TrimSpace(c.Query("api"))
 	}
-	for _, name := range sortedMCPNames(snapshot.Config) {
-		mcp := snapshot.Config[name]
-		if mcp.Transport != "streamable_http" {
+	for name, mcp := range snapshot.Config {
+		if mcp.Type != apiTypeMCP || mcp.Transport != "streamable_http" {
 			continue
 		}
 		if apiName == name {
@@ -4025,17 +4023,6 @@ func dispatchMCPOrOAuth(c *gin.Context) bool {
 		}
 	}
 	return false
-}
-
-func sortedMCPNames(config APIConfig) []string {
-	names := []string{}
-	for name, e := range config {
-		if e.Type == apiTypeMCP {
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
-	return names
 }
 
 func mcpOAuthRoleForAPI(mcp EndpointConfig, apiName string) (string, bool) {
