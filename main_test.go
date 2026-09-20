@@ -683,6 +683,87 @@ func TestBackgroundRuntimeManagerReconnectsOnlyForURLChange(t *testing.T) {
 	waitForRuntimeSignal(t, runtime.done, "ws client stop")
 }
 
+func TestWSClientBackoffResetsAfterSuccessfulConnection(t *testing.T) {
+	type attempt struct {
+		at   time.Time
+		conn *websocket.Conn
+	}
+	attempts := make(chan attempt, 8)
+	var requestMu sync.Mutex
+	requestCount := 0
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local listener unavailable: %v", err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		requestMu.Lock()
+		requestCount++
+		count := requestCount
+		requestMu.Unlock()
+		if count <= 2 {
+			attempts <- attempt{at: started}
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		conn, err := (&websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}).Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade failed: %v", err)
+			return
+		}
+		defer conn.Close()
+		attempts <- attempt{at: started, conn: conn}
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	runtime := newWSClientRuntime(wsClientConfig{name: "backoff", connectURL: "ws" + server.URL[len("http"):]})
+	go runtime.run()
+	t.Cleanup(func() {
+		runtime.update(nil)
+		waitForRuntimeSignal(t, runtime.done, "ws client stop")
+	})
+	waitAttempt := func(timeout time.Duration) attempt {
+		t.Helper()
+		select {
+		case result := <-attempts:
+			return result
+		case <-time.After(timeout):
+			t.Fatalf("no connection attempt within %s", timeout)
+			return attempt{}
+		}
+	}
+	previous := waitAttempt(3 * time.Second)
+	for _, minimum := range []time.Duration{time.Second, 2 * time.Second} {
+		next := waitAttempt(5 * time.Second)
+		if elapsed := next.at.Sub(previous.at); elapsed < minimum-100*time.Millisecond {
+			t.Fatalf("retry after %s, want at least %s", elapsed, minimum)
+		}
+		previous = next
+	}
+	// After two failed dials the old implementation waits four seconds, even
+	// though the third dial succeeded. Every later successful session must
+	// also reset the delay; normal disconnects must not accumulate backoff.
+	for i := 0; i < 3; i++ {
+		if previous.conn == nil {
+			t.Fatal("expected a successful WebSocket connection")
+		}
+		disconnected := time.Now()
+		if err := previous.conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+		previous = waitAttempt(3 * time.Second)
+		if elapsed := previous.at.Sub(disconnected); elapsed < 900*time.Millisecond {
+			t.Fatalf("reconnected after %s, want the one-second delay", elapsed)
+		}
+	}
+}
+
 func newHotReloadWebSocketServer(t *testing.T) (string, <-chan struct{}, <-chan struct{}) {
 	t.Helper()
 	connected, disconnected := make(chan struct{}, 1), make(chan struct{}, 1)

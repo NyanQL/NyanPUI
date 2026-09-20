@@ -4068,7 +4068,7 @@ func (runtime *wsClientRuntime) run() {
 		if !active {
 			return
 		}
-		err := runtime.connectAndListen(cfg)
+		connected, err := runtime.connectAndListen(cfg)
 		latest, active := runtime.current(true)
 		if !active {
 			return
@@ -4083,6 +4083,9 @@ func (runtime *wsClientRuntime) run() {
 		}
 		if err != nil {
 			logWebSocketDisconnect("ws_client_disconnected", cfg.name, err)
+		}
+		if connected {
+			backoff = time.Second
 		}
 		timer := time.NewTimer(backoff)
 		select {
@@ -4103,19 +4106,20 @@ func (runtime *wsClientRuntime) run() {
 	}
 }
 
-func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
+// connectAndListen reports whether a connection was established, even if it later failed.
+func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) (bool, error) {
 	ctx, cancel, ok := runtime.beginDial(cfg)
 	if !ok {
-		return nil
+		return false, nil
 	}
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, cfg.connectURL, nil)
 	runtime.finishDial(cancel)
 	if err != nil {
-		return fmt.Errorf("dial failed: %w", err)
+		return false, fmt.Errorf("dial failed: %w", err)
 	}
 	if !runtime.acceptConnection(conn, cfg.connectURL) {
 		_ = conn.Close()
-		return nil
+		return false, nil
 	}
 	serviceLog(slog.LevelInfo, "ws_client_connected", "client", cfg.name)
 	defer runtime.clearConnection(conn)
@@ -4123,11 +4127,11 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 	for {
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
-			return fmt.Errorf("read error: %w", err)
+			return true, fmt.Errorf("read error: %w", err)
 		}
 		latest, active := runtime.current(false)
 		if !active || latest.connectURL != cfg.connectURL {
-			return nil
+			return true, nil
 		}
 		serviceLog(slog.LevelDebug, "ws_client_message_received", "client", latest.name, "message_type", websocketMessageTypeLabel(msgType), "bytes", len(data))
 		params := map[string]interface{}{"api": latest.name, "ws_client": latest.name, "ws_message_type": websocketMessageTypeLabel(msgType), "ws_message_text": string(data), "ws_connect_url": latest.connectURL, "ws_description": latest.description}
@@ -4147,7 +4151,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) error {
 		}
 		if result = strings.TrimSpace(result); result != "" {
 			if err := conn.WriteMessage(websocket.TextMessage, []byte(result)); err != nil {
-				return fmt.Errorf("send error: %w", err)
+				return true, fmt.Errorf("send error: %w", err)
 			}
 		}
 	}
