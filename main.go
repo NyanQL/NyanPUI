@@ -2295,10 +2295,15 @@ func setupGojaRuntimeWithContext(snapshot *APIConfigSnapshot, requestContext *gi
 		return vm.ToValue(nil)
 	})
 
-	vm.Set("nyanGetFile", nyanGetFile(vm))
-	vm.Set("nyanSaveFile", nyanSaveFile(vm))
-	vm.Set("nyanDeleteFile", nyanDeleteFile(vm))
-	vm.Set("nyanReadFileB64", nyanReadFileB64(vm))
+	// Keep file operations anchored to the root API definition captured by this VM.
+	fileBaseDir := ""
+	if snapshot != nil && filepath.IsAbs(snapshot.RootPath) {
+		fileBaseDir = filepath.Dir(snapshot.RootPath)
+	}
+	vm.Set("nyanGetFile", nyanGetFile(vm, fileBaseDir))
+	vm.Set("nyanSaveFile", nyanSaveFile(vm, fileBaseDir))
+	vm.Set("nyanDeleteFile", nyanDeleteFile(vm, fileBaseDir))
+	vm.Set("nyanReadFileB64", nyanReadFileB64(vm, fileBaseDir))
 	vm.Set("nyanRandomBase64URL", func(call goja.FunctionCall) goja.Value {
 		count := 32
 		if len(call.Arguments) > 0 {
@@ -2555,24 +2560,23 @@ func handleNyanDetail(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-func nyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+func resolveJavaScriptFilePath(vm *goja.Runtime, baseDir, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	if baseDir == "" {
+		panic(vm.NewTypeError("root API configuration path is unavailable for relative file paths"))
+	}
+	return filepath.Join(baseDir, path)
+}
+
+func nyanGetFile(vm *goja.Runtime, baseDir string) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		// 引数のチェック
 		if len(call.Arguments) < 1 {
 			panic(vm.NewTypeError("nyanGetFileには1つの引数（ファイルパス）が必要です"))
 		}
-		relativePath := call.Arguments[0].String()
-
-		// 実行中のバイナリのディレクトリからの相対パスに解決
-		exePath, err := os.Executable()
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		exeDir := filepath.Dir(exePath)
-		fullPath := relativePath
-		if !filepath.IsAbs(fullPath) {
-			fullPath = filepath.Join(exeDir, fullPath)
-		}
+		fullPath := resolveJavaScriptFilePath(vm, baseDir, call.Arguments[0].String())
 
 		// ディレクトリ指定なら null
 		if fi, err := os.Stat(fullPath); err == nil && fi.IsDir() {
@@ -2594,19 +2598,12 @@ func nyanGetFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 	}
 }
 
-func nyanSaveFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+func nyanSaveFile(vm *goja.Runtime, baseDir string) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 2 {
 			panic(vm.NewTypeError("nyanSaveFileにはファイルパスと内容が必要です"))
 		}
-		exePath, err := os.Executable()
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		path := call.Arguments[0].String()
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(filepath.Dir(exePath), path)
-		}
+		path := resolveJavaScriptFilePath(vm, baseDir, call.Arguments[0].String())
 		if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
 			panic(vm.ToValue(err.Error()))
 		}
@@ -2640,19 +2637,12 @@ func nyanSaveFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 	}
 }
 
-func nyanDeleteFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+func nyanDeleteFile(vm *goja.Runtime, baseDir string) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
 			panic(vm.NewTypeError("nyanDeleteFile requires a file path"))
 		}
-		exePath, err := os.Executable()
-		if err != nil {
-			panic(vm.ToValue(err.Error()))
-		}
-		path := call.Arguments[0].String()
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(filepath.Dir(exePath), path)
-		}
+		path := resolveJavaScriptFilePath(vm, baseDir, call.Arguments[0].String())
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			panic(vm.ToValue(err.Error()))
 		}
@@ -2660,20 +2650,13 @@ func nyanDeleteFile(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
 	}
 }
 
-func nyanReadFileB64(vm *goja.Runtime) func(call goja.FunctionCall) goja.Value {
+func nyanReadFileB64(vm *goja.Runtime, baseDir string) func(call goja.FunctionCall) goja.Value {
 	return func(call goja.FunctionCall) goja.Value {
 		if len(call.Arguments) < 1 {
 			panic(vm.NewTypeError("nyanReadFileB64には1つの引数（ファイルパス）が必要です"))
 		}
-		path := call.Arguments[0].String()
-
-		abs := path
-		if !filepath.IsAbs(path) {
-			wd, _ := os.Getwd()
-			abs = filepath.Join(wd, path)
-		}
-
-		content, err := os.ReadFile(abs)
+		path := resolveJavaScriptFilePath(vm, baseDir, call.Arguments[0].String())
+		content, err := os.ReadFile(path)
 		if err != nil {
 			panic(vm.ToValue(err.Error()))
 		}

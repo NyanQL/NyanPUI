@@ -1417,6 +1417,212 @@ func TestNyanCallMeKeepsCapturedSnapshotGeneration(t *testing.T) {
 	}
 }
 
+func TestFileHelpersUseRootAPIPathAcrossNestedIncludes(t *testing.T) {
+	rootDir := t.TempDir()
+	childDir := filepath.Join(rootDir, "child")
+	grandchildDir := filepath.Join(childDir, "grandchild")
+	workingDir := t.TempDir()
+	t.Chdir(workingDir)
+
+	rootPath := filepath.Join(rootDir, "root-api.json")
+	writeTestFile(t, rootPath, `{"files":{"script":"./scripts/files.js","html":"./page.html"},"child":{"type":"include","path":"./child/api.json"}}`)
+	writeTestFile(t, filepath.Join(childDir, "api.json"), `{"files":{"script":"./scripts/files.js","html":"./page.html"},"grandchild":{"type":"include","path":"./grandchild/api.json"}}`)
+	writeTestFile(t, filepath.Join(grandchildDir, "api.json"), `{"files":{"script":"./scripts/files.js","html":"./page.html"},"assets":{"type":"public","path":"./assets"}}`)
+	const script = `
+const before = nyanGetFile("./data/shared.txt");
+const saved = nyanSaveFile("./data/shared.txt", "updated root");
+const after = nyanGetFile("./data/shared.txt");
+const b64 = nyanReadFileB64("./data/binary.bin");
+const deleted = nyanDeleteFile("./data/delete.txt");
+({status:200,contentType:"application/json",body:{
+  before:before, saved:saved, after:after, b64:b64, deleted:deleted,
+  missingAfterDelete:nyanGetFile("./data/delete.txt") === null, html:nyanHtmlCode
+}});`
+	for _, entry := range []struct{ dir, label string }{
+		{rootDir, "root"}, {childDir, "child"}, {grandchildDir, "grandchild"}, {workingDir, "cwd"},
+	} {
+		writeTestFile(t, filepath.Join(entry.dir, "scripts", "files.js"), script)
+		writeTestFile(t, filepath.Join(entry.dir, "page.html"), entry.label+" html")
+		writeTestFile(t, filepath.Join(entry.dir, "data", "shared.txt"), entry.label)
+		writeTestFile(t, filepath.Join(entry.dir, "data", "delete.txt"), entry.label)
+		writeTestFile(t, filepath.Join(entry.dir, "data", "binary.bin"), entry.label)
+	}
+	writeTestFile(t, filepath.Join(rootDir, "data", "binary.bin"), "\x00\x01\xff")
+	writeTestFile(t, filepath.Join(grandchildDir, "assets", "file.txt"), "grandchild public file")
+
+	loaded, err := readAPIConfigGraph(rootPath, rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Snapshot.RootPath != rootPath {
+		t.Fatalf("root path = %q, want %q", loaded.Snapshot.RootPath, rootPath)
+	}
+	router := newRequestRegressionRouter(t, loaded.Snapshot.Config)
+	publishAPISnapshot(loaded.Snapshot)
+	for _, tc := range []struct{ api, html string }{
+		{"files", "root html"}, {"child/files", "child html"}, {"child/grandchild/files", "grandchild html"},
+	} {
+		t.Run(tc.api, func(t *testing.T) {
+			writeTestFile(t, filepath.Join(rootDir, "data", "shared.txt"), "root")
+			writeTestFile(t, filepath.Join(rootDir, "data", "delete.txt"), "root")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/"+tc.api, nil))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			var body struct {
+				Before, After, B64, HTML           string
+				Saved, Deleted, MissingAfterDelete bool
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Before != "root" || body.After != "updated root" || body.B64 != "AAH/" || body.HTML != tc.html || !body.Saved || !body.Deleted || !body.MissingAfterDelete {
+				t.Fatalf("unexpected file operation result: %+v", body)
+			}
+			data, err := os.ReadFile(filepath.Join(rootDir, "data", "shared.txt"))
+			if err != nil || string(data) != "updated root" {
+				t.Fatalf("root file = %q, error = %v", data, err)
+			}
+			if _, err := os.Stat(filepath.Join(rootDir, "data", "delete.txt")); !os.IsNotExist(err) {
+				t.Fatalf("root delete file remains: %v", err)
+			}
+			for _, entry := range []struct{ dir, label string }{{childDir, "child"}, {grandchildDir, "grandchild"}, {workingDir, "cwd"}} {
+				for _, name := range []string{"shared.txt", "delete.txt", "binary.bin"} {
+					data, err := os.ReadFile(filepath.Join(entry.dir, "data", name))
+					if err != nil || string(data) != entry.label {
+						t.Fatalf("%s/%s changed: content = %q, error = %v", entry.label, name, data, err)
+					}
+				}
+			}
+		})
+	}
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/child/grandchild/assets/file.txt", nil))
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "grandchild public file" {
+		t.Fatalf("included public path: status = %d, body = %q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestFileHelpersPreserveAbsolutePathsAndMissingFileBehavior(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		snapshot *APIConfigSnapshot
+	}{
+		{"nil snapshot", nil},
+		{"empty root", &APIConfigSnapshot{}},
+		{"different root", &APIConfigSnapshot{RootPath: filepath.Join(t.TempDir(), "api.json")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			file := filepath.Join(dir, "new", "nested", "file.txt")
+			binary := filepath.Join(dir, "binary.bin")
+			writeTestFile(t, binary, "\x00\x01\xff")
+			vm := setupGojaRuntimeWithSnapshot(tc.snapshot)
+			value, err := vm.RunString(fmt.Sprintf(`
+const path = %q;
+const binary = %q;
+const directory = %q;
+const missingBefore = nyanGetFile(path) === null;
+const directoryIsNull = nyanGetFile(directory) === null;
+const saved = nyanSaveFile(path, "absolute contents");
+const read = nyanGetFile(path);
+const b64 = nyanReadFileB64(binary);
+const deleted = nyanDeleteFile(path);
+const missingAfter = nyanGetFile(path) === null;
+const deletedMissing = nyanDeleteFile(path);
+let missingB64Throws = false;
+try { nyanReadFileB64(path); } catch (error) { missingB64Throws = true; }
+missingBefore && directoryIsNull && saved === true && read === "absolute contents" &&
+  b64 === "AAH/" && deleted === true && missingAfter && deletedMissing === true && missingB64Throws;
+`, file, binary, dir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !value.ToBoolean() {
+				t.Fatal("absolute paths or missing-file behavior changed")
+			}
+			if _, err := os.Stat(file); !os.IsNotExist(err) {
+				t.Fatalf("absolute file was not deleted: %v", err)
+			}
+		})
+	}
+}
+
+func TestFileHelpersRejectRelativePathsWithoutRootAPI(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	writeTestFile(t, filepath.Join(dir, "existing.txt"), "keep cwd file")
+	for _, tc := range []struct {
+		name     string
+		snapshot *APIConfigSnapshot
+	}{
+		{"nil snapshot", nil},
+		{"empty root", &APIConfigSnapshot{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, script := range []string{
+				`nyanGetFile("existing.txt")`,
+				`nyanSaveFile("existing.txt", "changed")`,
+				`nyanDeleteFile("existing.txt")`,
+				`nyanReadFileB64("existing.txt")`,
+			} {
+				vm := setupGojaRuntimeWithSnapshot(tc.snapshot)
+				if _, err := vm.RunString(script); err == nil || !strings.Contains(err.Error(), "root API configuration path is unavailable") {
+					t.Errorf("%s error = %v, want unavailable root API path", script, err)
+				}
+			}
+			data, err := os.ReadFile(filepath.Join(dir, "existing.txt"))
+			if err != nil || string(data) != "keep cwd file" {
+				t.Fatalf("cwd fallback changed file: content = %q, error = %v", data, err)
+			}
+		})
+	}
+}
+
+func TestFileHelpersKeepCapturedRootAfterSnapshotChanges(t *testing.T) {
+	capturedDir, latestDir := t.TempDir(), t.TempDir()
+	for _, entry := range []struct{ dir, contents string }{{capturedDir, "captured"}, {latestDir, "latest"}} {
+		writeTestFile(t, filepath.Join(entry.dir, "read.txt"), entry.contents)
+		writeTestFile(t, filepath.Join(entry.dir, "delete.txt"), entry.contents)
+		writeTestFile(t, filepath.Join(entry.dir, "write.txt"), entry.contents)
+	}
+	captured := &APIConfigSnapshot{RootPath: filepath.Join(capturedDir, "api.json")}
+	latest := &APIConfigSnapshot{RootPath: filepath.Join(latestDir, "api.json")}
+	old := currentAPISnapshot()
+	publishAPISnapshot(captured)
+	t.Cleanup(func() { publishAPISnapshot(old) })
+	vm := setupGojaRuntime()
+	publishAPISnapshot(latest)
+
+	value, err := vm.RunString(`
+const before = nyanGetFile("read.txt");
+const b64 = nyanReadFileB64("read.txt");
+const saved = nyanSaveFile("write.txt", "updated captured");
+const deleted = nyanDeleteFile("delete.txt");
+before === "captured" && b64 === "Y2FwdHVyZWQ=" && saved === true && deleted === true;
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !value.ToBoolean() {
+		t.Fatal("runtime did not retain its captured root API path")
+	}
+	data, err := os.ReadFile(filepath.Join(capturedDir, "write.txt"))
+	if err != nil || string(data) != "updated captured" {
+		t.Fatalf("captured write file = %q, error = %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(capturedDir, "delete.txt")); !os.IsNotExist(err) {
+		t.Fatalf("captured delete file remains: %v", err)
+	}
+	for _, name := range []string{"read.txt", "write.txt", "delete.txt"} {
+		data, err := os.ReadFile(filepath.Join(latestDir, name))
+		if err != nil || string(data) != "latest" {
+			t.Fatalf("latest %s changed: content = %q, error = %v", name, data, err)
+		}
+	}
+}
+
 func TestStaticSchemaParserRejectsDynamicValues(t *testing.T) {
 	if _, err := parseStaticJavaScriptValue("schema.js", `{type:createType()}`); err == nil {
 		t.Fatal("dynamic function call was accepted")

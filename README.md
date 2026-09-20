@@ -66,11 +66,16 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
 | `--api`, `--config` | NyanPUI を起動したカレントディレクトリ |
 | `NYAN_API_PATH`, `NYAN_CONFIG_PATH` | NyanPUI を起動したカレントディレクトリ |
 | デフォルトの `api.json`, `config.json` | 実行ファイルと同じディレクトリ |
-| `api.json` の `script`, `html`, `paramCheck`, `outCheck`、`public` / `include` の `path` | `api.json` が置かれているディレクトリ |
+| `api.json` の `script`, `html`, `paramCheck`, `outCheck`、`public` / `include` の `path` | その定義を書いた `api.json` が置かれているディレクトリ |
+| JavaScript の `nyanGetFile`, `nyanSaveFile`, `nyanDeleteFile`, `nyanReadFileB64` | 最上位の API 定義ファイルが置かれているディレクトリ |
 | `api.json` の `type: "mcp"` | `path` は指定せず、API名をendpointに使用 |
 | `config.json` の `certPath`, `keyPath`, `javascript_include`, `log.Filename` | `config.json` が置かれているディレクトリ |
 | `api.json` の `connectURL` | URL 文字列として扱うため相対パス解決なし |
 | `/css`, `/images`, `/js`, `/favicon.ico` | 実行ファイルと同じディレクトリの `html/` 配下 |
+
+最上位の API 定義ファイルとは、起動時に `--api`、`NYAN_API_PATH`、またはデフォルトで最初に読み込むファイルです。ファイル名が `api.json` 以外でも同じ扱いです。JavaScript の上記4関数は、多段 `include` のどの API から実行してもこのディレクトリを基準にします。実行ファイルの配置場所やカレントディレクトリには依存せず、絶対パスはそのまま使用します。
+
+従来の `nyanGetFile` / `nyanSaveFile` / `nyanDeleteFile` は実行ファイルのあるディレクトリ、`nyanReadFileB64` はカレントディレクトリを相対パスの基準としていました。最上位の API 定義ファイルと異なる場所を基準にしていたスクリプトは、同じファイルを指すよう相対パスを調整するか、絶対パスを指定してください。
 
 ### config.json
 
@@ -768,7 +773,7 @@ console.log("Command Result: " + result.stdout);
 
 ### 8. **nyanGetFile**
 ファイルを読み込み、内容を文字列として取得します。
-ファイルのパスは実行ファイル(NyanPUI)からの相対パスでも指定できます。
+ファイルのパスは最上位の API 定義ファイルがあるディレクトリからの相対パス、または絶対パスで指定できます。
 指定したファイルが存在しない場合はnullが返ります。
 ```javascript
 var fileContent = nyanGetFile("./path/to/file.txt");
@@ -777,7 +782,7 @@ console.log("File Content: " + fileContent);
 
 ### 9. **nyanSaveFile / nyanDeleteFile**
 
-テキストファイルを保存・削除します。相対パスは実行ファイルと同じディレクトリを基準にします。絶対パスも指定できます。
+テキストファイルを保存・削除します。相対パスは最上位の API 定義ファイルがあるディレクトリを基準にします。絶対パスも指定できます。
 
 ```javascript
 nyanSaveFile("./state/example.json", JSON.stringify({ok: true}));
@@ -800,7 +805,7 @@ var plain = nyanBase64Decode("dXNlcjpwYXNzd29yZA==");
 
 ### 11. **nyanReadFileB64**
 バイナリファイルをBase64文字列として取得します。
-ファイルのパスはカレントディレクトリからの相対パス、または絶対パスで指定できます。存在しない場合は JavaScript 例外になります。
+ファイルのパスは最上位の API 定義ファイルがあるディレクトリからの相対パス、または絶対パスで指定できます。存在しない場合は JavaScript 例外になります。
 ```javascript
 var b64 = nyanReadFileB64("./html/images/nyan.png");
 console.log(b64);
