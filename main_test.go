@@ -1970,6 +1970,289 @@ func TestOAuthHooksReceiveHTTPContextAndControlResponse(t *testing.T) {
 	}
 }
 
+func TestOAuthHTTPChecksReceiveContextAndWireResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name, api, hook, method, contentType, requestBody, script, body, outputField string
+		status                                                                       int
+	}{
+		{api: "authorize", hook: "oauthAuthorize", method: http.MethodGet, script: `"approved";`, body: `"approved"`, status: 200},
+		{api: "token", hook: "oauthToken", method: http.MethodPost, contentType: "application/x-www-form-urlencoded", requestBody: "grant_type=fixture", script: `({status:201,contentType:"text/plain",headers:{"X-OAuth-Result":"accepted"},body:"issued"});`, body: "issued", status: 201},
+		{api: "register", hook: "oauthRegister", method: http.MethodPost, contentType: "application/json", requestBody: `{"client_name":"fixture"}`, script: `({client_id:"fixture"});`, body: `{"client_id":"fixture"}`, status: 200},
+		{api: "metadata", hook: "authorizationServerMetadata", method: http.MethodGet, outputField: "issuer", status: 200},
+		{api: "resource_metadata", hook: "protectedResourceMetadata", method: http.MethodGet, outputField: "resource", status: 200},
+		{name: "authorize_null", api: "authorize", hook: "oauthAuthorize", method: http.MethodGet, script: `null;`, body: `{"error":"OAuth hook denied the request"}`, status: 401},
+		{name: "authorize_undefined", api: "authorize", hook: "oauthAuthorize", method: http.MethodGet, script: `undefined;`, body: `{"error":"OAuth hook denied the request"}`, status: 401},
+	} {
+		name := tc.name
+		if name == "" {
+			name = tc.api
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			paramMarker, outMarker := filepath.Join(dir, "param"), filepath.Join(dir, "out")
+			hook := writeFixtureFile(t, tc.script)
+			cfg := APIConfig{"tool": {Script: hook}, "verify": {Script: hook}, "mcp": {Type: apiTypeMCP, Transport: "streamable_http", Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}}}
+			completeTestOAuthConfiguration(t, cfg)
+			contextCheck := fmt.Sprintf(`
+if (nyanAllParams.oauth_api !== %q || nyanAllParams.oauth_hook !== %q ||
+    nyanAllParams.method !== %q || nyanAllParams.path !== %q ||
+    nyanAllParams.request_path !== %q || nyanAllParams.endpoint !== "mcp" ||
+    nyanAllParams.issuer !== "https://example.test" || nyanAllParams.resource !== "https://example.test/mcp" ||
+    nyanAllParams.authorization !== "Bearer fixture" || nyanAllParams.cookies.session !== "fixture-cookie" ||
+    nyanAllParams.query.state[0] !== "fixture-state" || nyanGetRequestHeaders()["X-Check"] !== "fixture-header") {
+  throw new Error("OAuth context did not reach check");
+}
+if (nyanAllParams.oauth_api === "token" && nyanAllParams.form.grant_type[0] !== "fixture") throw new Error("missing form");
+if (nyanAllParams.oauth_api === "register" && nyanAllParams.body.client_name !== "fixture") throw new Error("missing JSON body");
+`, tc.api, tc.hook, tc.method, "/"+tc.api, "/"+tc.api)
+			outputCheck := fmt.Sprintf(`
+if (nyanAllParams.nyan_output.status !== %d) throw new Error("wrong output status");
+if (%q !== "") {
+  const body = JSON.parse(nyanAllParams.nyan_output.body);
+  if (!body[%q] || body.scopes_supported[0] !== "read") throw new Error("missing metadata");
+} else if (nyanAllParams.nyan_output.body !== %q) throw new Error("wrong wire body");
+if (nyanAllParams.oauth_api === "token") {
+  if (nyanAllParams.nyan_output.contentType !== "text/plain" || nyanAllParams.nyan_output.headers["X-OAuth-Result"] !== "accepted") throw new Error("missing response headers");
+} else if (nyanAllParams.nyan_output.contentType.indexOf("application/json") !== 0) throw new Error("wrong content type");
+`, tc.status, tc.outputField, tc.outputField, tc.body)
+			endpoint := cfg[tc.api]
+			endpoint.ParamCheck = writeFixtureFile(t, contextCheck+fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({success:true,status:200,result:null});`, paramMarker))
+			endpoint.OutCheck = writeFixtureFile(t, contextCheck+outputCheck+fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({success:true,status:200,result:null});`, outMarker))
+			cfg[tc.api] = endpoint
+			router := newRequestRegressionRouter(t, cfg)
+			req := httptest.NewRequest(tc.method, "https://example.test/"+tc.api+"?state=fixture-state", strings.NewReader(tc.requestBody))
+			req.Header.Set("Content-Type", tc.contentType)
+			req.Header.Set("Authorization", "Bearer fixture")
+			req.Header.Set("X-Check", "fixture-header")
+			req.AddCookie(&http.Cookie{Name: "session", Value: "fixture-cookie"})
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != tc.status || tc.outputField == "" && rec.Body.String() != tc.body {
+				t.Fatalf("OAuth response status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if tc.api == "token" && rec.Header().Get("X-OAuth-Result") != "accepted" {
+				t.Fatalf("hook response header missing: %v", rec.Header())
+			}
+			assertJSONRPCExecutionMarker(t, paramMarker, true)
+			assertJSONRPCExecutionMarker(t, outMarker, true)
+		})
+	}
+}
+
+func TestOAuthHTTPCheckRejections(t *testing.T) {
+	for _, api := range []string{"authorize", "token", "register", "metadata", "resource_metadata"} {
+		for _, stage := range []string{"paramCheck", "outCheck"} {
+			for _, tc := range []struct {
+				name, script string
+				success      bool
+				status       int
+			}{
+				{name: "denied", script: `({success:false,status:403,result:"check rejected"});`, status: 403},
+				{name: "false_with_200", script: `({success:false,status:200,result:"check rejected"});`, status: 200},
+				{name: "true_with_non_200", script: `({success:true,status:201,result:"check rejected"});`, success: true, status: 201},
+				{name: "json_string", script: `JSON.stringify({success:false,status:401,result:"check rejected"});`, status: 401},
+				{name: "exception", script: `throw new Error("check failed");`, status: 500},
+				{name: "malformed", script: `({status:403,result:"check rejected"});`, status: 500},
+			} {
+				t.Run(api+"/"+stage+"/"+tc.name, func(t *testing.T) {
+					dir := t.TempDir()
+					hookMarker, outMarker := filepath.Join(dir, "hook"), filepath.Join(dir, "out")
+					hook := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({status:201,headers:{"X-OAuth-Result":"private"},body:"PRIVATE_RESULT"});`, hookMarker))
+					cfg := APIConfig{"tool": {Script: hook}, "verify": {Script: hook}, "mcp": {Type: apiTypeMCP, Transport: "streamable_http", Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}}}
+					completeTestOAuthConfiguration(t, cfg)
+					param, out := `({success:true,status:200,result:null});`, `({success:true,status:200,result:null});`
+					if stage == "paramCheck" {
+						param = tc.script
+					} else {
+						out = tc.script
+					}
+					endpoint := cfg[api]
+					endpoint.ParamCheck = writeFixtureFile(t, param)
+					endpoint.OutCheck = writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); `, outMarker)+out)
+					cfg[api] = endpoint
+					router := newRequestRegressionRouter(t, cfg)
+					rec := httptest.NewRecorder()
+					router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "https://example.test/"+api, nil))
+					if rec.Code != tc.status || strings.Contains(rec.Body.String(), "PRIVATE_RESULT") || rec.Header().Get("X-OAuth-Result") != "" {
+						t.Fatalf("rejected OAuth response status=%d headers=%v body=%s", rec.Code, rec.Header(), rec.Body.String())
+					}
+					assertParamCheckResponse(t, rec.Body.Bytes(), tc.success, tc.status)
+					if tc.status != 500 && !strings.Contains(rec.Body.String(), `"result":"check rejected"`) {
+						t.Fatalf("check result was replaced: %s", rec.Body.String())
+					}
+					assertJSONRPCExecutionMarker(t, hookMarker, stage == "outCheck" && api != "metadata" && api != "resource_metadata")
+					assertJSONRPCExecutionMarker(t, outMarker, stage == "outCheck")
+				})
+			}
+		}
+	}
+}
+
+func TestOAuthMetadataOptionsSkipsChecks(t *testing.T) {
+	for _, api := range []string{"metadata", "resource_metadata"} {
+		t.Run(api, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "check")
+			hook := writeFixtureFile(t, `({authenticated:true});`)
+			cfg := APIConfig{"tool": {Script: hook}, "verify": {Script: hook}, "mcp": {Type: apiTypeMCP, Transport: "streamable_http", Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}}}
+			completeTestOAuthConfiguration(t, cfg)
+			check := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({success:false,status:403,result:null});`, marker))
+			cfg[api] = EndpointConfig{ParamCheck: check, OutCheck: check}
+			router := newRequestRegressionRouter(t, cfg)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodOptions, "https://example.test/"+api, nil))
+			if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+				t.Fatalf("metadata preflight status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			assertJSONRPCExecutionMarker(t, marker, false)
+		})
+	}
+}
+
+func TestOAuthVerifierChecksProtectToolExecution(t *testing.T) {
+	for _, stage := range []string{"paramCheck", "outCheck"} {
+		for _, tc := range []struct {
+			name, script, decision string
+			allowed                bool
+		}{
+			{name: "authenticated", script: `({success:true,status:200,result:null});`, decision: "authenticated", allowed: true},
+			{name: "allowed", script: `({success:true,status:200,result:null});`, decision: "allowed", allowed: true},
+			{name: "denied", script: `({success:false,status:403,result:"private rejection"});`},
+			{name: "false_with_200", script: `({success:false,status:200,result:null});`},
+			{name: "true_with_non_200", script: `({success:true,status:201,result:null});`},
+			{name: "exception", script: `throw new Error("private check failure");`},
+			{name: "malformed", script: `({status:200});`},
+		} {
+			t.Run(stage+"/"+tc.name, func(t *testing.T) {
+				dir := t.TempDir()
+				paramMarker, hookMarker, outMarker, toolMarker := filepath.Join(dir, "param"), filepath.Join(dir, "hook"), filepath.Join(dir, "out"), filepath.Join(dir, "tool")
+				decision := tc.decision
+				if decision == "" {
+					decision = "authenticated"
+				}
+				hook := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({%s:true,principal:{id:"checked-user"}});`, hookMarker, decision))
+				tool := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({user:nyanAllParams.mcp_principal.id});`, toolMarker))
+				cfg := APIConfig{"tool": {Script: tool}, "verify": {Script: hook}, "mcp": {Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocol20251125}, Tools: []MCPToolConfig{{Name: "tool", API: "tool", InputSchema: map[string]interface{}{"type": "object"}}}}}
+				completeTestOAuthConfiguration(t, cfg)
+				contextCheck := `if (nyanAllParams.oauth_hook !== "oauthValidateAccessToken" || nyanAllParams.oauth_api !== "verify" || nyanAllParams.request_path !== "/mcp" || nyanAllParams.path !== "/verify" || nyanAllParams.tool !== "tool" || nyanAllParams.required_scopes[0] !== "read" || nyanAllParams.body.method !== "tools/call") throw new Error("missing verification context"); `
+				param, out := `({success:true,status:200,result:null});`, `({success:true,status:200,result:null});`
+				if stage == "paramCheck" {
+					param = tc.script
+				} else {
+					out = tc.script
+				}
+				endpoint := cfg["verify"]
+				endpoint.ParamCheck = writeFixtureFile(t, contextCheck+fmt.Sprintf(`nyanSaveFile(%q,"ran"); `, paramMarker)+param)
+				endpoint.OutCheck = writeFixtureFile(t, contextCheck+fmt.Sprintf(`const result=JSON.parse(nyanAllParams.nyan_output.body); if (nyanAllParams.nyan_output.status !== 200 || result.%s !== true || result.principal.id !== "checked-user") throw new Error("verification result was replaced"); nyanSaveFile(%q,"ran"); `, decision, outMarker)+out)
+				cfg["verify"] = endpoint
+				router := newRequestRegressionRouter(t, cfg)
+				rec := serveMCPRegressionRequest(router, `{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"tool","arguments":{}}}`)
+				if tc.allowed {
+					if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"structuredContent":{"user":"checked-user"}`) {
+						t.Fatalf("verified principal did not reach tool: status=%d body=%s", rec.Code, rec.Body.String())
+					}
+				} else if rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") == "" || strings.Contains(rec.Body.String(), "private") {
+					t.Fatalf("verifier check did not fail closed: status=%d headers=%v body=%s", rec.Code, rec.Header(), rec.Body.String())
+				}
+				var envelope map[string]json.RawMessage
+				if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil || string(envelope["jsonrpc"]) != `"2.0"` || string(envelope["id"]) != "17" {
+					t.Fatalf("MCP response envelope changed: body=%s error=%v", rec.Body.String(), err)
+				}
+				assertJSONRPCExecutionMarker(t, paramMarker, true)
+				assertJSONRPCExecutionMarker(t, hookMarker, tc.allowed || stage == "outCheck")
+				assertJSONRPCExecutionMarker(t, outMarker, tc.allowed || stage == "outCheck")
+				assertJSONRPCExecutionMarker(t, toolMarker, tc.allowed)
+			})
+		}
+	}
+}
+
+func TestOAuthCheckOnlySkipsExecution(t *testing.T) {
+	for _, tc := range []struct {
+		name, api, method, query, contentType, body string
+		noCheck, reject                             bool
+	}{
+		{name: "authorize_query", api: "authorize", method: http.MethodGet, query: "?nyan_mode=checkOnly"},
+		{name: "token_form", api: "token", method: http.MethodPost, contentType: "application/x-www-form-urlencoded", body: "nyan_mode=checkOnly"},
+		{name: "register_json", api: "register", method: http.MethodPost, contentType: "application/json", body: `{"nyan_mode":"checkOnly"}`},
+		{name: "metadata", api: "metadata", method: http.MethodGet, query: "?nyan_mode=checkOnly"},
+		{name: "resource_metadata", api: "resource_metadata", method: http.MethodGet, query: "?nyan_mode=checkOnly"},
+		{name: "no_param_check", api: "authorize", method: http.MethodGet, query: "?nyan_mode=checkOnly", noCheck: true},
+		{name: "check_rejected", api: "authorize", method: http.MethodGet, query: "?nyan_mode=checkOnly", reject: true},
+		{name: "query_overrides_json", api: "register", method: http.MethodPost, query: "?nyan_mode=checkOnly", contentType: "application/json", body: `{"nyan_mode":"run"}`},
+		{name: "verifier", api: "verify", method: http.MethodPost, query: "?nyan_mode=checkOnly"},
+		{name: "verifier_no_param_check", api: "verify", method: http.MethodPost, query: "?nyan_mode=checkOnly", noCheck: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			paramMarker, hookMarker, outMarker, toolMarker := filepath.Join(dir, "param"), filepath.Join(dir, "hook"), filepath.Join(dir, "out"), filepath.Join(dir, "tool")
+			hook := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({authenticated:true,principal:{id:"user"}});`, hookMarker))
+			tool := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({ok:true});`, toolMarker))
+			cfg := APIConfig{"tool": {Script: tool}, "verify": {Script: hook}, "mcp": {Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocol20251125}, Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}}}
+			completeTestOAuthConfiguration(t, cfg)
+			endpoint := cfg[tc.api]
+			status := http.StatusOK
+			if tc.reject {
+				status = http.StatusForbidden
+			}
+			if !tc.noCheck {
+				endpoint.ParamCheck = writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({success:%t,status:%d,result:"checked"});`, paramMarker, !tc.reject, status))
+			}
+			endpoint.OutCheck = writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({success:true,status:200,result:null});`, outMarker))
+			cfg[tc.api] = endpoint
+			router := newRequestRegressionRouter(t, cfg)
+			target, body, contentType := tc.api, tc.body, tc.contentType
+			if tc.api == "verify" {
+				target, contentType = "mcp", "application/json"
+				body = `{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"tool","arguments":{}}}`
+			}
+			req := httptest.NewRequest(tc.method, "https://example.test/"+target+tc.query, strings.NewReader(body))
+			req.Header.Set("Content-Type", contentType)
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			req.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if tc.api == "verify" {
+				if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), `"isError":true`) {
+					t.Fatalf("checkOnly must not authenticate: status=%d body=%s", rec.Code, rec.Body.String())
+				}
+			} else {
+				if rec.Code != status {
+					t.Fatalf("checkOnly status=%d body=%s", rec.Code, rec.Body.String())
+				}
+				assertParamCheckResponse(t, rec.Body.Bytes(), !tc.reject, status)
+			}
+			assertJSONRPCExecutionMarker(t, paramMarker, !tc.noCheck)
+			for _, marker := range []string{hookMarker, outMarker, toolMarker} {
+				assertJSONRPCExecutionMarker(t, marker, false)
+			}
+		})
+	}
+}
+
+func TestOAuthVerifierPassingChecksCannotOverrideDenial(t *testing.T) {
+	for _, decision := range []string{`({authenticated:false});`, `({allowed:false});`, `false;`, `null;`, `undefined;`, `({status:401,body:{error:"invalid_token"}});`} {
+		t.Run(decision, func(t *testing.T) {
+			dir := t.TempDir()
+			outMarker, toolMarker := filepath.Join(dir, "out"), filepath.Join(dir, "tool")
+			hook := writeFixtureFile(t, decision)
+			tool := writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({ok:true});`, toolMarker))
+			cfg := APIConfig{"tool": {Script: tool}, "verify": {Script: hook}, "mcp": {Type: apiTypeMCP, Transport: "streamable_http", ProtocolVersions: []string{mcpProtocol20251125}, Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}}}
+			completeTestOAuthConfiguration(t, cfg)
+			endpoint := cfg["verify"]
+			endpoint.ParamCheck = writeFixtureFile(t, `({success:true,status:200,result:null});`)
+			endpoint.OutCheck = writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); ({success:true,status:200,result:null});`, outMarker))
+			cfg["verify"] = endpoint
+			router := newRequestRegressionRouter(t, cfg)
+			rec := serveMCPRegressionRequest(router, `{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"tool","arguments":{}}}`)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("passing checks must not override verifier: status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			assertJSONRPCExecutionMarker(t, outMarker, true)
+			assertJSONRPCExecutionMarker(t, toolMarker, false)
+		})
+	}
+}
+
 func TestArgon2idHashAndVerify(t *testing.T) {
 	const password = "fixture-password"
 	encoded, err := argon2idHash(password)
@@ -4042,6 +4325,383 @@ func TestStartupLoggingFailuresStayOffStdout(t *testing.T) {
 			if record["level"] != "ERROR" || record["msg"] != tc.event {
 				t.Fatalf("unexpected startup error: %#v; want event %q", record, tc.event)
 			}
+		})
+	}
+}
+
+func TestMCPToolRunsChecksOnBothTransports(t *testing.T) {
+	const allow = `({success:true,status:200,result:{checked:true}});`
+	for _, transport := range []string{"streamable_http", "stdio"} {
+		for _, tc := range []struct {
+			name, paramResult, outResult, script            string
+			checkOnly, noParam, invalidInput, invalidOutput bool
+			wantError, wantMain, wantOut                    bool
+		}{
+			{name: "plain_object", wantMain: true, wantOut: true},
+			{name: "structured_response", script: `({status:201,contentType:"application/json",headers:{"X-Tool":"accepted"},body:{value:"private-output"}});`, wantMain: true, wantOut: true},
+			{name: "param_false_200", paramResult: `({success:false,status:200,result:"denied"});`, wantError: true},
+			{name: "param_non_200", paramResult: `({success:true,status:201,result:"denied"});`, wantError: true},
+			{name: "param_exception", paramResult: `throw new Error("check failed");`, wantError: true},
+			{name: "param_invalid", paramResult: `({success:true});`, wantError: true},
+			{name: "out_false_200", outResult: `({success:false,status:200,result:"denied"});`, wantError: true, wantMain: true, wantOut: true},
+			{name: "out_non_200", outResult: `({success:true,status:201,result:"denied"});`, wantError: true, wantMain: true, wantOut: true},
+			{name: "out_exception", outResult: `throw new Error("check failed");`, wantError: true, wantMain: true, wantOut: true},
+			{name: "out_invalid", outResult: `({status:200});`, wantError: true, wantMain: true, wantOut: true},
+			{name: "check_only", checkOnly: true},
+			{name: "check_only_without_param", checkOnly: true, noParam: true},
+			{name: "check_only_rejected", checkOnly: true, paramResult: `({success:false,status:403,result:"denied"});`, wantError: true},
+			{name: "input_schema", invalidInput: true, wantError: true},
+			{name: "output_schema", invalidOutput: true, wantError: true, wantMain: true, wantOut: true},
+		} {
+			t.Run(transport+"/"+tc.name, func(t *testing.T) {
+				dir := t.TempDir()
+				paramMarker, mainMarker, outMarker := filepath.Join(dir, "param"), filepath.Join(dir, "main"), filepath.Join(dir, "out")
+				paramResult, outResult, script := tc.paramResult, tc.outResult, tc.script
+				if paramResult == "" {
+					paramResult = allow
+				}
+				if outResult == "" {
+					outResult = allow
+				}
+				if script == "" {
+					script = `({value:"private-output"});`
+				}
+				contextCheck := fmt.Sprintf(`
+if (nyanAllParams.api !== "tool" || nyanAllParams.mcp_tool !== "tool" || nyanAllParams.id !== 7 || nyanAllParams.mcp_principal.transport !== %q) throw new Error("wrong tool context");
+if (%q === "streamable_http" && nyanGetRequestHeaders()["X-Check"] !== "fixture") throw new Error("missing HTTP context");
+`, transport, transport)
+				param := writeFixtureFile(t, `const nyanInputSchema = {type:"object",properties:{id:{type:"integer"},nyan_mode:{type:"string"}},required:["id"],additionalProperties:false};`+contextCheck+fmt.Sprintf(`nyanSaveFile(%q,"ran");`, paramMarker)+paramResult)
+				outSchema := `const nyanOutputSchema = {type:"object",properties:{value:{const:"private-output"}},required:["value"]};`
+				if tc.invalidOutput {
+					outSchema = `const nyanOutputSchema = {type:"object",required:["missing"]};`
+				}
+				outputCheck := `if (JSON.parse(nyanAllParams.nyan_output.body).value !== "private-output") throw new Error("wrong output body");`
+				if tc.name == "structured_response" {
+					outputCheck += `if (nyanAllParams.nyan_output.status !== 201 || nyanAllParams.nyan_output.contentType !== "application/json" || nyanAllParams.nyan_output.headers["X-Tool"] !== "accepted") throw new Error("wrong output metadata");`
+				}
+				out := writeFixtureFile(t, outSchema+contextCheck+outputCheck+fmt.Sprintf(`nyanSaveFile(%q,"ran");`, outMarker)+outResult)
+				if tc.noParam {
+					param = ""
+				}
+				cfg := APIConfig{
+					"tool": {Script: writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran");`, mainMarker)+script), ParamCheck: param, OutCheck: out},
+					"mcp":  {Type: apiTypeMCP, Transport: transport, AllowedOrigins: []string{"https://client.example"}, Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}},
+				}
+				if err := validateMCPConfiguration(cfg); err != nil {
+					t.Fatal(err)
+				}
+				args := map[string]interface{}{"id": 7}
+				if tc.checkOnly {
+					args["nyan_mode"] = "checkOnly"
+				}
+				if tc.invalidInput {
+					args["id"] = "invalid"
+				}
+				request, err := json.Marshal(map[string]interface{}{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": map[string]interface{}{"name": "tool", "arguments": args}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var response []byte
+				if transport == "streamable_http" {
+					router := newRequestRegressionRouter(t, cfg)
+					req := httptest.NewRequest(http.MethodPost, "https://example.test/mcp", bytes.NewReader(request))
+					req.Header.Set("Content-Type", "application/json")
+					req.Header.Set("Accept", "application/json, text/event-stream")
+					req.Header.Set("MCP-Protocol-Version", mcpProtocol20251125)
+					req.Header.Set("X-Check", "fixture")
+					rec := httptest.NewRecorder()
+					router.ServeHTTP(rec, req)
+					if rec.Code != http.StatusOK {
+						t.Fatalf("HTTP status=%d body=%s", rec.Code, rec.Body.String())
+					}
+					response = rec.Body.Bytes()
+				} else {
+					input := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}` + "\n" + `{"jsonrpc":"2.0","method":"notifications/initialized"}` + "\n" + string(request) + "\n"
+					var output bytes.Buffer
+					if err := serveMCPStdio(strings.NewReader(input), &output, &APIConfigSnapshot{Config: cfg}, cfg["mcp"]); err != nil {
+						t.Fatal(err)
+					}
+					lines := bytes.Split(bytes.TrimSpace(output.Bytes()), []byte("\n"))
+					if len(lines) != 2 {
+						t.Fatalf("stdio responses=%s", output.String())
+					}
+					response = lines[1]
+				}
+				var envelope struct {
+					Result map[string]interface{} `json:"result"`
+					Error  json.RawMessage        `json:"error"`
+				}
+				if err := json.Unmarshal(response, &envelope); err != nil {
+					t.Fatal(err)
+				}
+				if tc.invalidInput && transport == "streamable_http" {
+					if len(envelope.Error) == 0 {
+						t.Fatalf("input schema accepted: %s", response)
+					}
+				} else if len(envelope.Error) != 0 || envelope.Result["isError"] != tc.wantError {
+					t.Fatalf("unexpected MCP result: %s", response)
+				}
+				if tc.wantError && bytes.Contains(response, []byte("private-output")) {
+					t.Fatalf("rejected output leaked: %s", response)
+				}
+				if tc.checkOnly && !tc.wantError {
+					check, _ := json.Marshal(envelope.Result["structuredContent"])
+					assertParamCheckResponse(t, check, true, http.StatusOK)
+				} else if !tc.wantError {
+					structured, ok := envelope.Result["structuredContent"].(map[string]interface{})
+					if !ok || structured["value"] != "private-output" {
+						t.Fatalf("success result changed: %s", response)
+					}
+				}
+				assertJSONRPCExecutionMarker(t, paramMarker, !tc.invalidInput && !tc.noParam)
+				assertJSONRPCExecutionMarker(t, mainMarker, tc.wantMain)
+				assertJSONRPCExecutionMarker(t, outMarker, tc.wantOut)
+			})
+		}
+	}
+}
+
+func TestNyanCallMeRunsTargetChecks(t *testing.T) {
+	const allow = `({success:true,status:200,result:{checked:true}});`
+	for _, withContext := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, script, paramResult, outResult, wantValue, wantOutput string
+			checkOnly, noParam, wantError, wantMain, wantOut            bool
+		}{
+			{name: "json_string", script: `JSON.stringify({value:"private-output",count:7});`, wantMain: true, wantOut: true},
+			{name: "plain_object", script: `({value:"private-output",count:7});`, wantMain: true, wantOut: true},
+			{name: "array", script: `[7,"private-output",false];`, wantValue: `[7,"private-output",false]`, wantMain: true, wantOut: true},
+			{name: "number", script: `7;`, wantValue: `7`, wantMain: true, wantOut: true},
+			{name: "null", script: `null;`, wantValue: `null`, wantMain: true, wantOut: true},
+			{name: "undefined", script: `undefined;`, wantValue: `null`, wantMain: true, wantOut: true},
+			{name: "structured_response", script: `({status:201,contentType:"application/json",headers:{"X-Target":"accepted"},body:{value:"private-output",count:7}});`, wantValue: `{"status":201,"contentType":"application/json","headers":{"X-Target":"accepted"},"body":{"value":"private-output","count":7}}`, wantOutput: `{"value":"private-output","count":7}`, wantMain: true, wantOut: true},
+			{name: "param_false", paramResult: `({success:false,status:200,result:"denied"});`, wantError: true},
+			{name: "param_non_200", paramResult: `({success:true,status:201,result:"denied"});`, wantError: true},
+			{name: "param_exception", paramResult: `throw new Error("check failed");`, wantError: true},
+			{name: "out_false", outResult: `({success:false,status:200,result:"denied"});`, wantError: true, wantMain: true, wantOut: true},
+			{name: "out_non_200", outResult: `({success:true,status:201,result:"denied"});`, wantError: true, wantMain: true, wantOut: true},
+			{name: "out_exception", outResult: `throw new Error("check failed");`, wantError: true, wantMain: true, wantOut: true},
+			{name: "check_only", checkOnly: true},
+			{name: "check_only_without_param", checkOnly: true, noParam: true},
+			{name: "check_only_rejected", checkOnly: true, paramResult: `({success:false,status:403,result:"denied"});`, wantError: true},
+		} {
+			t.Run(fmt.Sprintf("context_%t/%s", withContext, tc.name), func(t *testing.T) {
+				dir := t.TempDir()
+				paramMarker, mainMarker, outMarker := filepath.Join(dir, "param"), filepath.Join(dir, "main"), filepath.Join(dir, "out")
+				paramResult, outResult, script := tc.paramResult, tc.outResult, tc.script
+				if paramResult == "" {
+					paramResult = allow
+				}
+				if outResult == "" {
+					outResult = allow
+				}
+				if script == "" {
+					script = `JSON.stringify({value:"private-output",count:7});`
+				}
+				contextCheck := `if (nyanAllParams.api !== "target" || nyanAllParams.id !== 7) throw new Error("wrong API parameters");`
+				if withContext {
+					contextCheck += `if (nyanGetCookie("session") !== "owner" || nyanGetRequestHeaders()["X-Check"] !== "fixture") throw new Error("missing request context");`
+				}
+				param := writeFixtureFile(t, contextCheck+fmt.Sprintf(`nyanSaveFile(%q,"ran");`, paramMarker)+paramResult)
+				if tc.noParam {
+					param = ""
+				}
+				out := writeFixtureFile(t, contextCheck+fmt.Sprintf(`nyanSaveFile(%q,JSON.stringify(nyanAllParams.nyan_output));`, outMarker)+outResult)
+				snapshot := &APIConfigSnapshot{Config: APIConfig{"target": {Script: writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran");`, mainMarker)+script), ParamCheck: param, OutCheck: out}}}
+				var requestContext *gin.Context
+				if withContext {
+					requestContext, _ = gin.CreateTestContext(httptest.NewRecorder())
+					requestContext.Request = httptest.NewRequest(http.MethodGet, "https://example.test/caller", nil)
+					requestContext.Request.Header.Set("X-Check", "fixture")
+					requestContext.Request.AddCookie(&http.Cookie{Name: "session", Value: "owner"})
+				}
+				mode := ""
+				if tc.checkOnly {
+					mode = `,nyan_mode:"checkOnly"`
+				}
+				caller := writeFixtureFile(t, `try { JSON.stringify({caught:false,value:nyanCallMe({api:"target",id:7`+mode+`})}); } catch (error) { JSON.stringify({caught:true,message:String(error)}); }`)
+				value, err := runJavaScriptValueWithContext(snapshot, requestContext, caller, "", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var result struct {
+					Caught  bool            `json:"caught"`
+					Value   json.RawMessage `json:"value"`
+					Message string          `json:"message"`
+				}
+				if err := json.Unmarshal([]byte(value.String()), &result); err != nil {
+					t.Fatal(err)
+				}
+				if result.Caught != tc.wantError {
+					t.Fatalf("catch result=%s", value.String())
+				}
+				if tc.wantError {
+					if strings.Contains(value.String(), "private-output") {
+						t.Fatalf("denied result leaked: %s", value.String())
+					}
+					if !strings.Contains(result.Message, "paramCheck") && !strings.Contains(result.Message, "outCheck") {
+						t.Fatalf("check failure lacks stage: %s", value.String())
+					}
+				} else if tc.checkOnly {
+					assertParamCheckResponse(t, result.Value, true, http.StatusOK)
+				} else {
+					wantValue := tc.wantValue
+					if wantValue == "" {
+						wantValue = `{"value":"private-output","count":7}`
+					}
+					var got, want interface{}
+					if err := json.Unmarshal(result.Value, &got); err != nil {
+						t.Fatal(err)
+					}
+					if err := json.Unmarshal([]byte(wantValue), &want); err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(got, want) {
+						t.Fatalf("JSON parsing or result types changed: got=%s want=%s", result.Value, wantValue)
+					}
+				}
+				assertJSONRPCExecutionMarker(t, paramMarker, !tc.noParam)
+				assertJSONRPCExecutionMarker(t, mainMarker, tc.wantMain)
+				assertJSONRPCExecutionMarker(t, outMarker, tc.wantOut)
+				if tc.wantOut {
+					data, err := os.ReadFile(outMarker)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var output struct {
+						Body        string            `json:"body"`
+						Status      int               `json:"status"`
+						ContentType string            `json:"contentType"`
+						Headers     map[string]string `json:"headers"`
+					}
+					if err := json.Unmarshal(data, &output); err != nil {
+						t.Fatal(err)
+					}
+					wantOutput := tc.wantOutput
+					if wantOutput == "" {
+						wantOutput = tc.wantValue
+					}
+					if wantOutput == "" {
+						wantOutput = `{"value":"private-output","count":7}`
+					}
+					var got, want interface{}
+					if err := json.Unmarshal([]byte(output.Body), &got); err != nil {
+						t.Fatal(err)
+					}
+					if err := json.Unmarshal([]byte(wantOutput), &want); err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(got, want) {
+						t.Fatalf("outCheck body=%s want=%s", output.Body, wantOutput)
+					}
+					if tc.name == "structured_response" && (output.Status != 201 || output.ContentType != "application/json" || output.Headers["X-Target"] != "accepted") {
+						t.Fatalf("outCheck metadata=%s", data)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestPushRunsTargetChecksBeforeBroadcast(t *testing.T) {
+	const allow = `({success:true,status:200,result:null});`
+	for _, tc := range []struct {
+		name, paramResult, outResult              string
+		htmlOnly, withContext, checkOnly, noParam bool
+		wantMain, wantOut, wantPush               bool
+	}{
+		{name: "script", wantMain: true, wantOut: true, wantPush: true},
+		{name: "request_context", withContext: true, wantMain: true, wantOut: true, wantPush: true},
+		{name: "html", htmlOnly: true, wantOut: true, wantPush: true},
+		{name: "param_false", paramResult: `({success:false,status:200,result:"denied"});`},
+		{name: "param_non_200", paramResult: `({success:true,status:201,result:"denied"});`},
+		{name: "param_exception", paramResult: `throw new Error("check failed");`},
+		{name: "out_false", outResult: `({success:false,status:200,result:"denied"});`, wantMain: true, wantOut: true},
+		{name: "out_non_200", outResult: `({success:true,status:201,result:"denied"});`, wantMain: true, wantOut: true},
+		{name: "out_exception", outResult: `throw new Error("check failed");`, wantMain: true, wantOut: true},
+		{name: "html_out_rejected", htmlOnly: true, outResult: `({success:false,status:403,result:"denied"});`, wantOut: true},
+		{name: "check_only", checkOnly: true},
+		{name: "check_only_without_param", checkOnly: true, noParam: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			paramMarker, mainMarker, outMarker := filepath.Join(dir, "param"), filepath.Join(dir, "main"), filepath.Join(dir, "out")
+			paramResult, outResult := tc.paramResult, tc.outResult
+			if paramResult == "" {
+				paramResult = allow
+			}
+			if outResult == "" {
+				outResult = allow
+			}
+			contextCheck := `if (nyanAllParams.api !== "caller" || nyanAllParams.id !== "item") throw new Error("Push parameters changed");`
+			if tc.withContext {
+				contextCheck += `if (nyanGetCookie("session") !== "owner" || nyanGetRequestHeaders()["X-Check"] !== "fixture") throw new Error("missing request context");`
+			}
+			push := EndpointConfig{
+				Script:     writeFixtureFile(t, fmt.Sprintf(`nyanSaveFile(%q,"ran"); "PRIVATE_PUSH";`, mainMarker)),
+				ParamCheck: writeFixtureFile(t, contextCheck+fmt.Sprintf(`nyanSaveFile(%q,"ran");`, paramMarker)+paramResult),
+				OutCheck:   writeFixtureFile(t, contextCheck+`if (nyanAllParams.nyan_output.body !== "PRIVATE_PUSH" || nyanAllParams.nyan_output.status !== 200 || nyanAllParams.nyan_output.contentType !== "text/html; charset=utf-8") throw new Error("wrong Push output");`+fmt.Sprintf(`nyanSaveFile(%q,"ran");`, outMarker)+outResult),
+			}
+			if tc.htmlOnly {
+				push.Script, push.HTML = "", writeFixtureFile(t, "PRIVATE_PUSH")
+			}
+			if tc.noParam {
+				push.ParamCheck = ""
+			}
+			// The subscriber's handshake has its own checks; isolate the later Push target checks.
+			router := newRequestRegressionRouter(t, APIConfig{"updates": {HTML: writeFixtureFile(t, "subscriber")}})
+			server := httptest.NewServer(router)
+			defer server.Close()
+			conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/updates", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{}`)); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := conn.ReadMessage(); err != nil {
+				t.Fatal(err)
+			}
+			var requestContext *gin.Context
+			if tc.withContext {
+				requestContext, _ = gin.CreateTestContext(httptest.NewRecorder())
+				requestContext.Request = httptest.NewRequest(http.MethodGet, "https://example.test/caller", nil)
+				requestContext.Request.Header.Set("X-Check", "fixture")
+				requestContext.Request.AddCookie(&http.Cookie{Name: "session", Value: "owner"})
+			}
+			params := map[string]interface{}{"api": "caller", "id": "item"}
+			if tc.checkOnly {
+				params["nyan_mode"] = "checkOnly"
+			}
+			performPushWithContext(&APIConfigSnapshot{Config: APIConfig{"updates": push}}, requestContext, EndpointConfig{Push: "updates"}, params)
+			// Push is synchronous: the following echo must come after any broadcast.
+			const echo = `{"echo":"after-push"}`
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(echo)); err != nil {
+				t.Fatal(err)
+			}
+			_, body, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantPush {
+				if string(body) != "PRIVATE_PUSH" {
+					t.Fatalf("Push payload=%q", body)
+				}
+				_, body, err = conn.ReadMessage()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if string(body) != echo {
+				t.Fatalf("unexpected broadcast after rejected/checkOnly Push: %q", body)
+			}
+			assertJSONRPCExecutionMarker(t, paramMarker, !tc.noParam)
+			assertJSONRPCExecutionMarker(t, mainMarker, tc.wantMain)
+			assertJSONRPCExecutionMarker(t, outMarker, tc.wantOut)
 		})
 	}
 }
