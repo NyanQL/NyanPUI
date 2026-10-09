@@ -106,6 +106,55 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
 }
 ```
 
+
+### HTTP通信のタイムアウト（3製品共通）
+
+`config.json` の `httpTimeouts` で設定します。未指定・`null`・`"0s"` は下記の既定値を使い、無制限にはなりません。
+
+```json
+"httpTimeouts": {
+  "readHeaderTimeout": "30s",
+  "readTimeout": "20m",
+  "writeTimeout": "30m",
+  "idleTimeout": "5m"
+}
+```
+
+| 設定 | 既定値 | 対象 |
+|---|---|---|
+| `readHeaderTimeout` | 30秒 | HTTPヘッダーの受信 |
+| `readTimeout` | 20分 | 本文を含むHTTPリクエスト全体の受信 |
+| `writeTimeout` | 30分 | HTTP応答の書き込み期限 |
+| `idleTimeout` | 5分 | Keep-Aliveで次のHTTPリクエストを待つ時間 |
+
+値は `"30s"`・`"20m"`・`"1h"`・`"500ms"` のような時間単位付き文字列です。負数・空文字列・単位なしの数値・範囲外は設定エラーです。変更の反映には再起動が必要です。
+
+受信時間は「最後にデータを受け取ってから」ではなく受信全体の期限です。通常のHTTP/1では応答期限はヘッダー読込後から進むため、本文受信に20分かかった場合は処理・送信に残り約10分となります。TLSやHTTP/2ではプロトコルに応じた期限の適用になります。タイムアウトは通信を制限するもので、実行中のJavaScriptやDB処理を強制終了する設定ではありません。HTTPステータスが返るとは限らず、接続終了やHTTP/2ストリームのエラーとなる場合もあります。
+
+サイズ上限 `receiveLimits` と時間上限の両方が適用されます。WebSocketへ切り替えた後はHTTPの期限を引き継がず、既存のWebSocket接続管理を使います。ログインやセッションの有効期限には影響しません。前段プロキシや利用側クライアントに短い期限がある場合は、そちらが先に適用されます。
+
+### 受信サイズの上限（3製品共通）
+
+`config.json` の `receiveLimits` で受信上限を `"20MB"`・`"1GB"`・`"2MB"` のような文字列で指定できます。従来の整数によるバイト指定も使用できます。
+
+```json
+"receiveLimits": {
+  "httpBodyBytes": "20MB",
+  "webSocketMessageBytes": "20MB"
+}
+```
+
+| 設定 | 対象 | 未指定・0の場合 |
+|---|---|---|
+| `httpBodyBytes` | 通常API・JSON-RPC・MCP/OAuth・静的配信等のHTTPリクエスト本文全体 | 20 MB（20 MiB = 20,971,520バイト） |
+| `webSocketMessageBytes` | WebSocketの1メッセージ全体。受信接続と `ws_client` の受信の両方 | 20 MB（20 MiB = 20,971,520バイト） |
+
+上限と同じサイズは受理し、超過時はHTTP 413、WebSocketはclose code 1009で拒否します。HTTPはJSON・フォーム・multipart等の本文形式を問わず、`Content-Length` がない場合も読み込んだバイト数で制限します。multipartは添付ファイルだけでなく境界やフォーム項目も含む本文全体、WebSocketは複数フレームを合計したメッセージ単位です。上限超過した本文・メッセージをJavaScriptへ渡しません（WebSocket接続時のチェックはメッセージ受信前に実行されます）。
+
+MCPのHTTP endpointでは、本文の読み取り前にOrigin検証・レート制限・同時実行制限を適用します。OAuth endpointでもOrigin検証は本文の読み取り前に行います。MCPの `verifyAccess` による認証は、本文を解析して `tools/call` で呼び出すToolを特定した後に実行します。JavaScriptの `paramCheck` は受信サイズの検証と必要な本文解析の後に実行します。許可されたOriginへの413応答にもCORSヘッダーを付けます。上限超過時は残りの本文を待たずに応答し、HTTP/1接続は再利用しません。
+
+単位は `B`・`KB`・`MB`・`GB`（`KiB`・`MiB`・`GiB` も可）で、大文字・小文字は区別しません。既定値との整合のため1024倍で換算します（`1MB = 1,048,576` バイト、`1GB = 1,073,741,824` バイト）。前後および数値と単位の間の空白は許可し、単位なしの文字列はバイト数として扱います。負数・小数・不明な単位・空文字列・換算後にint64の範囲外となる値は設定エラーです。0は無制限にはなりません。変更の反映にはサービスの再起動が必要です。この設定はURL・HTTPヘッダー・HTTPクライアントの取得応答・出力本文・MCPのstdioメッセージには適用しません。MCP/OAuthのHTTP本文の従来の固定1 MiB上限はこの設定へ置き換わり、出力・state等の既存上限は維持します。
+
 ### api.json のホットリロード
 
 ルートの `api.json` と、そこからincludeされたすべての `api.json` は既定で1秒ごとに確認され、いずれかの内容が変化した場合にルートから再読み込みされます。`APIHotReload.Enabled` を `false` にすると無効化できます。`Interval` は `500ms`、`1s`、`1m`、`24h` などのGo duration形式で指定し、省略時は `1s` です。0以下または解析できない値は起動エラーになります。
@@ -279,12 +328,14 @@ https://example.com/server_mcp_http
 | `allowedOrigins` | Streamable HTTPで必須 | HTTPS originの配列。schemeとhostだけを指定し、path、query、fragmentは含めない |
 | `redirectURIAllowedPrefixes` | OAuth使用時に必須 | 許可するHTTPS redirect URI prefixの配列。各prefixは `/` で終える |
 | `rateLimit` | 省略可 | 接続元ごとの呼出し制限。`requests`は1〜10000、`window`は1秒〜24時間のGo duration形式 |
-| `maxConcurrent` | 省略可 | Toolの同時実行数。1〜256。省略時または0は16 |
+| `maxConcurrent` | 省略可 | MCPのHTTP endpointへのPOSTリクエストの同時処理数。1〜256。省略時または0は16 |
 | `oauth` | 省略可 | OAuthで使用する通常APIの参照。詳細は後述 |
 | `tools` | 必須 | Toolとして公開する通常API名の配列。1件以上必要 |
 | `instructions` | 省略可 | MCPの `initialize` 応答に含めるサーバー利用説明 |
 
 `streamable_http` のendpointはMCP API名から自動生成されます。`stdio` では `allowedOrigins` は不要で、OAuthは使用できません。
+
+`maxConcurrent` はHTTP endpointごとに、本文受信から応答処理までを対象とします。`tools/call` に加え、`initialize`、`ping`、`tools/list` などのPOSTリクエストも含み、上限超過時はHTTP 503を返します。`stdio` には適用しません。
 
 ### MCP Toolとして参照する通常API
 
@@ -312,7 +363,9 @@ HTTP応答形式 `{status, contentType, headers, body}` を使う場合、判定
 
 MCP用のチェックファイルにも、スキーマ宣言に加えて `{success, status, result}` のチェック結果が必要です。スキーマを宣言するだけではチェックに成功しません。
 
-チェックでは、本体と同じ `nyanAllParams` の引数、`mcp_principal`、`mcp_tool` を参照できます。`outCheck` の `nyan_output.body` にはToolの応答本文となるJSONが入ります。`nyan_mode: "checkOnly"` を引数に渡した場合は、入力JSON Schema検証後に `paramCheck` の結果だけを返し、本体・`outCheck`・出力JSON Schema検証を実行しません。`nyan_mode` は任意の文字列プロパティ（許可値は空文字列と `checkOnly`）として入力スキーマへ自動追加し、`tools/list` と実行時検証で共用します。`additionalProperties: false` の場合も指定できます。他の必須項目・型の制約は維持します。入力チェック未設定時はToolエラーです。
+チェックでは、本体と同じ `nyanAllParams` の引数、`mcp_principal`、`mcp_tool` を参照できます。`outCheck` の `nyan_output.body` にはToolの応答本文となるJSONを表す文字列が入ります。`nyan_mode: "checkOnly"` を引数に渡した場合は、入力JSON Schema検証後に `paramCheck` の結果だけを返し、本体・`outCheck`・出力JSON Schema検証を実行しません。`nyan_mode` は任意の文字列プロパティ（許可値は空文字列と `checkOnly`）として入力スキーマへ自動追加し、`tools/list` と実行時検証で共用します。`additionalProperties: false` の場合も指定できます。他の必須項目・型の制約は維持します。入力チェック未設定時はToolエラーです。
+
+最上位の入力スキーマが同一リソース内の `$ref`（例：`#/$defs/Input`、ローカルアンカー）を使う場合は、参照の連鎖をたどって入力全体に適用するスキーマにも `nyan_mode` を追加します。公開用の参照先を複製するため、同じ定義を子オブジェクトに使っていても、その子の許可項目は増えません。`$anchor`・`$dynamicAnchor` は元の定義に保持し、複製先では再宣言しません。子の `$dynamicRef` による再帰検証も元の定義を使用します。必須項目・型・その他の追加項目の禁止は維持します。Version1では、参照先が `$id` を持つ埋め込みリソース、Draft-04で `id`（アンカーを含む）を持つ定義や、`allOf` 等の合成先への自動追加は対象外です。それらを使う場合は、入力全体を検証する各スキーマで `nyan_mode` を明示的に許可してください。外部 `$ref` は引き続き使用できません。
 
 ### OAuth設定フィールド
 
@@ -362,7 +415,7 @@ Metadata用の2つのAPIも `paramCheck` → Goが生成するメタデータ �
 
 OAuthでの `nyanSetCookie` は、内部の `nyanCallMe` による設定も含めて一旦保留し、前後チェックと本体処理が通過した場合に応答へ反映します。出力チェックの拒否・例外で、本体が設定したCookieが送信されることはありません。HTTPの `checkOnly` が成功した場合は、入力チェックで設定したCookieだけを反映します。ファイルやサーバーメモリへの保存など、実行済みの副作用は取り消しません。
 
-OAuthのPOST本文はチェック前に解析します。不正なJSON・フォーム、本文の読み取り失敗はHTTP 400、1 MiBを超える本文はHTTP 413で拒否し、チェック・本体を実行しません。`nyan_mode=checkOnly` でもこのHTTP入力検証を行います。
+OAuthのPOST本文はチェック前に解析します。不正なJSON・フォーム、本文の読み取り失敗はHTTP 400、`receiveLimits.httpBodyBytes`（未指定時20 MB）を超える本文はHTTP 413で拒否し、チェック・本体を実行しません。`nyan_mode=checkOnly` でもこのHTTP入力検証を行います。
 
 OAuth用APIのチェックとMCP Toolのチェックは、それぞれの参照先APIの設定に従って実行します。OAuth用APIにチェックを指定しても `push` は実行せず、汎用JSON-RPCからの呼び出し制限も変わりません。
 
@@ -487,14 +540,14 @@ URLクエリと `application/x-www-form-urlencoded` のフォーム本文では�
 }
 ```
 
-`paramCheck` は次の JSON 形式を返します。
+`paramCheck` は次の JSON 形式を返します。JavaScriptの最後の評価値をチェック結果として使うため、オブジェクトを返す例では `({ ... });` と記述します。条件分岐で `return` を使う場合は、後述の例のように即時実行関数で囲んでください。
 
 ```js
-return {
+({
   success: true,
   status: 200,
   result: {}
-};
+});
 ```
 
 `paramCheck`・`outCheck` の `status` は必須で、200〜599の整数を指定してください。省略・`null`・文字列・小数（`200.5` など）・範囲外（1xxを含む）はチェック結果の形式エラーです。小数の切り捨てや既定値への補完は行いません。`success: false` の場合も同じ検証を行います。
@@ -509,13 +562,13 @@ return {
 
 チェックの通過・拒否は `success` で判定します。例えば `{success:true,status:403}` も通過します。`paramCheck` が通過した場合は本体へ進み、その `status` を本体のHTTPステータスとしては使用しません。`checkOnly` は本体を実行せず、チェック結果を返します。
 
-`outCheck` が通過した場合、本体の本文・ヘッダーを保持し、最終HTTPステータスを出力チェックの `status` に変更します。本体が201でも、出力チェックが固定の200を返せば最終応答は200です。本体のステータスを維持する出力チェックは次のように書きます。
+`outCheck` は、本体の応答が想定されたデータになっているかを確認する出荷前検査です。`success:true` なら本体のステータス・本文・ヘッダーを保持し、チェックの `status`・`result` で変更しません。例えば、本体が201でチェックが200でも最終応答は201です。チェックが503でも `success:true` なら通過し、本体の成功・失敗やPush可否を変更しません。
 
 ```javascript
-({success: true, status: nyanAllParams.nyan_output.status, result: null});
+({success: true, status: 200, result: null});
 ```
 
-通常HTTP・public・OAuthのHTTP応答とJSON-RPCで、この出力ステータスを使用します。JSON-RPCの本体結果の格納形式は従来どおりで、`outCheck` がない場合のHTTPステータスは従来の200です。publicの出力チェックが200以外を返す場合は、そのステータスでファイル全体を送り、HEADでは本文を省略します。この場合のContent-Typeは、NyanQLと同じくファイル内容から判定します。200の場合は通常のファイル配信処理（Range等）に進みます。
+チェックの `status` は通過時も200〜599の整数を必須とします。拒否は `success:false` で表し、本体の出力を止めて拒否内容を返します。通常HTTP・public・OAuthでは本体や配信処理のステータスを保持し、publicのRange・HEAD・条件付き要求にも通常どおり対応します。JSON-RPCの通常の本体結果は `outCheck` の有無によらずHTTP 200で返します。
 
 MCP・内部呼び出し・WebSocket・Push先のチェックも `success` で通過を判定します。内部呼び出しの戻り値やWebSocketの本文を書き換えるものではありません。MCPのHTTP転送ステータスもチェックのステータスへ変更しません。OAuthの `verifyAccess` ではチェック通過後も、本体の認証判定が必要です。
 
@@ -525,13 +578,13 @@ JSON文字列で返す場合の `status` は `200` のように整数表記に�
 `success: true`（`status` は200〜599の整数）の場合だけ次の処理へ進みます。それ以外は、通常のHTTP呼び出しでは `paramCheck` の結果を JSON として返し、HTTP ステータスも `status` の値になります。JSON-RPC呼び出し時は、後述のJSON-RPCエラー形式で返します。
 
 ```js
-return {
+({
   success: false,
   status: 401,
   result: {
     message: "login required"
   }
-};
+});
 ```
 
 `nyan_mode=checkOnly` を指定した場合は `paramCheck` だけを実行し、成功時も本処理へ進まずチェック結果を返します。`paramCheck` 未設定の場合はHTTP 404のエラーを返します。本体・出力チェック・Pushは実行しません。
@@ -578,58 +631,62 @@ var path = nyanAllParams.nyan_public_path;         // 例: "docs/a.txt"
 `outCheck` は `paramCheck` と同じ JSON 形式を返します。
 
 ```js
-return {
+({
   success: true,
   status: 200,
   result: {}
-};
+});
 ```
 
-`success: true`（`status` は200〜599の整数）の場合に本体の本文・ヘッダーを維持し、最終HTTPステータスをチェックの `status` にして出力します。それ以外は、通常のHTTP呼び出しでは `outCheck` の結果を JSON として返し、HTTP ステータスも `status` の値になります。
+`success: true`（`status` は200〜599の整数）の場合に本体のステータス・本文・ヘッダーを維持して出力します。それ以外は、通常のHTTP呼び出しでは `outCheck` の結果を JSON として返し、HTTP ステータスも `status` の値になります。
 
 本体の実行結果は `nyanAllParams.nyan_output` で参照できます。
 
 ```js
-if (nyanAllParams.nyan_output.body.indexOf("expected") >= 0) {
-  return {
-    success: true,
-    status: 200,
-    result: {}
-  };
-}
-
-return {
-  success: false,
-  status: 409,
-  result: {
-    message: "output mismatch"
+(function () {
+  if (nyanAllParams.nyan_output.body.indexOf("expected") >= 0) {
+    return {
+      success: true,
+      status: 200,
+      result: {}
+    };
   }
-};
+
+  return {
+    success: false,
+    status: 409,
+    result: {
+      message: "output mismatch"
+    }
+  };
+})();
 ```
 
-`nyan_output` には `status`, `contentType`, `headers`, `body`, `bodyBase64`, `bodyLength` が入ります。互換用に `nyan_output_status`, `nyan_output_content_type`, `nyan_output_body`, `nyan_output_body_base64` も利用できます。
+`nyan_output` には `status`, `contentType`, `headers`, `body`, `bodyBase64`, `bodyLength` が入ります。互換用に `nyan_output_status`, `nyan_output_content_type`, `nyan_output_body`, `nyan_output_body_base64` も利用できます。`nyan_output.body` と `nyan_output_body` はどちらも文字列です。JSONの本文をオブジェクトや配列として扱う場合は、`JSON.parse(nyanAllParams.nyan_output.body)` などで解析してください。
 
 `type: "public"` の `outCheck` でも、リクエストされた公開ファイル名を参照できます。
 
 ```js
-var path = nyanAllParams.nyan_public_path;
+(function () {
+  var path = nyanAllParams.nyan_public_path;
 
-if (path === "test.txt" && nyanAllParams.nyan_output.body === "expected") {
-  return {
-    success: true,
-    status: 200,
-    result: {}
-  };
-}
-
-return {
-  success: false,
-  status: 409,
-  result: {
-    message: "file output mismatch",
-    path: path
+  if (path === "test.txt" && nyanAllParams.nyan_output.body === "expected") {
+    return {
+      success: true,
+      status: 200,
+      result: {}
+    };
   }
-};
+
+  return {
+    success: false,
+    status: 409,
+    result: {
+      message: "file output mismatch",
+      path: path
+    }
+  };
+})();
 ```
 
 ### `/nyan`と入出力スキーマ
@@ -659,7 +716,7 @@ const nyanOutputSchema = {
 
 スキーマはJavaScriptを実行せずASTから静的に読み取ります。オブジェクト、配列、文字列、数値、真偽値、`null`を利用できます。関数呼び出し、spread、識別子参照などの動的な定義はスキーマ解決エラーになります。スキーマファイルは詳細リクエストごとに読み直されます。
 
-公開したJSON Schemaによるリクエスト・レスポンスの自動検証は行いません。実際の検証は従来どおり`paramCheck`と`outCheck`が担当します。
+通常APIへのHTTP・JSON-RPC呼び出しでは、ここで公開するJSON Schemaによるリクエスト・レスポンスの自動検証は行いません。実際の検証は従来どおり `paramCheck` と `outCheck` が担当します。一方、MCP Toolでは入力JSON Schemaによる自動検証を行い、出力スキーマがあり応答の `status` が400未満の場合は出力JSON Schemaでも検証します。MCPの `checkOnly` では入力検証と `paramCheck` だけを実行し、出力検証は行いません。
 
 ### WebSocket レシーバー（`type: "ws_client"`）
 
@@ -686,12 +743,14 @@ const nyanOutputSchema = {
 | キー | 内容 |
 | --- | --- |
 | `ws_client` | ws_client 名 |
-| `ws_message_type` | `text`, `binary`, `close`, `ping`, `pong` など |
+| `ws_message_type` | `text` または `binary` |
 | `ws_message_text` | 受信内容の文字列 |
 | `ws_message_base64` | バイナリ受信時の Base64 文字列 |
 | `ws_message_json` | テキスト受信内容が JSON として読めた場合の値 |
 | `ws_connect_url` | 接続先 URL |
 | `ws_description` | `api.json` の説明文 |
+
+`ping`・`pong`・`close` の制御フレームはWebSocketライブラリが処理し、レシーバーの `script` には渡しません。
 
 #### 動作確認（NyanPUI 自身に接続）
 
@@ -1034,7 +1093,7 @@ WebSocket による双方向通信とプッシュ通知のサンプルを同梱�
 
 通常HTTP・JSON-RPC・`nyanCallMe()` の呼び出し先・MCP Tool（HTTP・stdio）の参照先APIに `push` を設定すると、チェックと結果の検証を通過した場合に、指定先の内容をWebSocket接続へ配信します。通常HTTPでは応答を書き込んだ後、内部呼び出しとMCPでは結果を返す前にPushを実行します。元の応答内容・戻り値の型・MCPの `isError` 判定は維持します。
 
-Push元は、本体と出力チェック適用後のステータスが両方とも200〜399で、JSON結果の最上位に真偽値の `success:false` がないことを条件とします。JSON文字列も解析して判定し、数値の `status` がある場合は200〜399の整数が必要です。構造化HTTP応答では外側のステータス・成功フラグと、`body` のJSON最上位も確認します。任意の入れ子を再帰的に調べるものではありません。フラグの省略、文字列の `"false"`、通常のHTML・テキスト・空の応答は、それだけでは業務エラーとしません。本文やヘッダーを書き換えるものではありません。
+Push元は、本体の応答ステータスが200〜399で、JSON結果の最上位に真偽値の `success:false` がないことを条件とします。JSON文字列も解析して判定し、数値の `status` がある場合は200〜399の整数が必要です。構造化HTTP応答では外側のステータス・成功フラグと、`body` のJSON最上位も確認します。任意の入れ子を再帰的に調べるものではありません。フラグの省略、文字列の `"false"`、通常のHTML・テキスト・空の応答は、それだけでは業務エラーとしません。本文やヘッダーを書き換えるものではありません。
 
 MCPではJSON形式・出力スキーマ・サイズの検証後にPushを起動します。リクエストID・エスケープ・結果の重複フィールドを含む応答全体が4 MiBを超える場合も、Push前にToolエラーにします。
 
@@ -1087,6 +1146,8 @@ JSON-RPC 2.0 API を実装しています。（Batch は未実装）。
 
 成功時の `result` は JavaScript の戻り値の型を保ちます。オブジェクト、配列、数値、真偽値は対応するJSONの値になり、`null` または `undefined` は `null` になります。文字列はそのまま文字列として返します。`JSON.stringify(...)` の結果など、JSON形式の文字列を自動で解析することはありません。
 
+配列の戻り値は、`outCheck` の `nyan_output_body` にJSON配列を表す文字列として渡します。JavaScriptの配列として扱う場合は `JSON.parse(nyanAllParams.nyan_output_body)` で解析してください。このとき `nyan_output_status` は200、`nyan_output_content_type` は `application/json` です。配列要素の `toString` による文字列変換は行わず、要素内の `success:false` や `status:500`、それらを含む文字列だけを理由にPushを抑止しません。出力チェックが拒否した場合は、従来どおりPushを実行しません。
+
 例えば、スクリプトが次のオブジェクトを返す場合です。
 
 ```javascript
@@ -1101,9 +1162,11 @@ JSON-RPCの応答は次のようになります。
 
 通常HTTP向けの `{status, headers, contentType, body}` 形式を返した場合も、オブジェクト全体が `result` になります。`body` だけを取り出したり、そのヘッダーをJSON-RPCのHTTP応答に設定したりはしません。戻り値をJSONに変換できない場合は、HTTP 200でJSON-RPCエラー `-32603`（`Invalid script response`）を返し、Pushを実行しません。
 
-JSON-RPCからのPushは前後チェック通過後、本体結果と出力チェック適用後の `status` が両方とも200〜399で、トップレベルの `success` が真偽値の `false` ではない場合に実行します。`status` 省略時は200として扱います。本体のエラー結果によってPushを抑止した場合も、JSON-RPC応答の `result` は変更しません。
+JSON-RPCからのPushは前後チェック通過後、本体結果の `status` が200〜399で、トップレベルの `success` が真偽値の `false` ではない場合に実行します。`status` 省略時は200として扱います。本体のエラー結果によってPushを抑止した場合も、JSON-RPC応答の `result` は変更しません。
 
 以前は数値・真偽値・配列・オブジェクトも文字列化していたため、その文字列形式を前提にしたクライアントは修正が必要です。スクリプトが `JSON.stringify(...)` で文字列を返し、クライアントが `JSON.parse(response.result)` で復元する構成は引き続き使用できます。
+
+JSON-RPCの `checkOnly` 成功時にはチェック結果を返します。チェックのstatusが204・205・304の場合は外側のHTTPだけ200にし、結果内のstatusを維持して応答本文を返します。
 
 JSON-RPCでも `paramCheck` と `outCheck` を実行します。チェックが `success: true`（`status` は200〜599の整数）を満たさなかった場合、HTTP 200で次のJSON-RPCエラーを返します。`id` はリクエストの値を保持し、`error.code` は `-32000`、`error.message` は `paramCheck rejected` または `outCheck rejected` です。元のチェック結果は `error.data` に保持します。
 
@@ -1125,7 +1188,7 @@ JSON-RPCでも `paramCheck` と `outCheck` を実行します。チェックが 
 
 `paramCheck` の拒否時は本体とPushを実行しません。`outCheck` の拒否時は実行済みの本体結果を返さず、Pushも実行しません。チェックスクリプトの例外や不正な戻り値も同じエラー形式となり、`error.data.status` は `500`、`error.data.result.message` に詳細が入ります。
 
-`nyan_mode=checkOnly` では本体とPushを実行せず、成功時はチェック結果の `status` をHTTPステータスにし、チェック結果オブジェクトをJSON-RPCの `result` に格納します。`paramCheck` 未設定時や不正なモード指定時はHTTP 400・`error.code:-32602` を返します。チェック拒否時は上記のエラー形式になります。
+`nyan_mode=checkOnly` では本体とPushを実行せず、成功時はチェック結果の `status` をHTTPステータスにし、チェック結果オブジェクトをJSON-RPCの `result` に格納します。ただし、`status` が204・205・304の場合は外側のHTTPステータスだけ200に置き換え、結果内の `status` と応答本文を保持します。`paramCheck` 未設定時や不正なモード指定時はHTTP 400・`error.code:-32602` を返します。チェック拒否時は上記のエラー形式になります。
 
 ---
 
