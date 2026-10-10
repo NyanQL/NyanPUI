@@ -46,18 +46,210 @@ import (
 	"golang.org/x/text/transform"
 )
 
-// Config は設定データを表します。
+// ReceiveLimitsConfig bounds incoming bodies and WebSocket messages, in bytes.
+// Zero keeps a safe default; negative limits are configuration errors.
+type ReceiveLimitsConfig struct {
+	HTTPBodyBytes         int64 `json:"httpBodyBytes"`
+	WebSocketMessageBytes int64 `json:"webSocketMessageBytes"`
+}
+
+const defaultReceiveBytes int64 = 20 << 20
+
+// receiveByteCount accepts legacy byte counts and human-readable binary units.
+type receiveByteCount int64
+
+func (count *receiveByteCount) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	var value int64
+	if len(data) > 0 && data[0] == '"' {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return err
+		}
+		text = strings.ToUpper(strings.TrimSpace(text))
+		end := 0
+		for end < len(text) && text[end] >= '0' && text[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			return fmt.Errorf("receiveLimits requires a non-negative integer with an optional B, KB, MB or GB unit")
+		}
+		parsed, err := strconv.ParseInt(text[:end], 10, 64)
+		if err != nil {
+			return fmt.Errorf("receiveLimits byte count is out of range")
+		}
+		var multiplier int64
+		switch strings.TrimSpace(text[end:]) {
+		case "", "B":
+			multiplier = 1
+		case "KB", "KIB":
+			multiplier = 1 << 10
+		case "MB", "MIB":
+			multiplier = 1 << 20
+		case "GB", "GIB":
+			multiplier = 1 << 30
+		default:
+			return fmt.Errorf("receiveLimits has an invalid size unit (use B, KB, MB or GB)")
+		}
+		if parsed > math.MaxInt64/multiplier {
+			return fmt.Errorf("receiveLimits byte count is out of range")
+		}
+		value = parsed * multiplier
+	} else if err := json.Unmarshal(data, &value); err != nil {
+		return fmt.Errorf("receiveLimits requires an integer byte count or a size string: %w", err)
+	}
+	if value < 0 {
+		return fmt.Errorf("receiveLimits values must be non-negative byte counts")
+	}
+	*count = receiveByteCount(value)
+	return nil
+}
+
+func (limits *ReceiveLimitsConfig) UnmarshalJSON(data []byte) error {
+	var decoded struct {
+		HTTPBodyBytes         receiveByteCount `json:"httpBodyBytes"`
+		WebSocketMessageBytes receiveByteCount `json:"webSocketMessageBytes"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*limits = ReceiveLimitsConfig{HTTPBodyBytes: int64(decoded.HTTPBodyBytes), WebSocketMessageBytes: int64(decoded.WebSocketMessageBytes)}
+	return nil
+}
+
+func (limits ReceiveLimitsConfig) httpBodyBytes() int64 {
+	if limits.HTTPBodyBytes > 0 {
+		return limits.HTTPBodyBytes
+	}
+	return defaultReceiveBytes
+}
+
+func (limits ReceiveLimitsConfig) webSocketMessageBytes() int64 {
+	if limits.WebSocketMessageBytes > 0 {
+		return limits.WebSocketMessageBytes
+	}
+	return defaultReceiveBytes
+}
+
+// Avoid net/http draining a body that the rejected client may never send.
+func closeUnreadRequestBody(w http.ResponseWriter, r *http.Request) {
+	if r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0 {
+		r.Close = true
+		if r.ProtoMajor < 2 {
+			w.Header().Set("Connection", "close")
+			// Stop net/http's post-response body drain without expiring writes.
+			// ResponseController also unwraps Gin's response writer.
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		}
+	}
+}
+
+// Read only after the route's header-based authentication and admission checks.
+// Never close a partially read server body here: Close can drain unread bytes
+// and delay an error response while the peer has stopped sending.
+func readBoundedRequestBody(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, error) {
+	var body []byte
+	var err error
+	if r.ContentLength > limit {
+		err = &http.MaxBytesError{Limit: limit}
+	} else if r.Body != nil {
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	}
+	if err != nil {
+		// Gin's writer does not expose net/http's private requestTooLarge hook.
+		// Explicitly disable HTTP/1 reuse so the server does not drain the body
+		// before flushing a rejection. HTTP/2 closes only the affected stream.
+		r.Close = true
+		if w != nil && r.ProtoMajor < 2 {
+			w.Header().Set("Connection", "close")
+			// Stop net/http's post-response body drain without expiring writes.
+			// ResponseController also unwraps Gin's response writer.
+			_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		}
+	}
+	return body, err
+}
+
+func enforceReceiveBodyLimit(w http.ResponseWriter, r *http.Request) bool {
+	limit := globalConfig.ReceiveLimits.httpBodyBytes()
+	body, err := readBoundedRequestBody(w, r, limit)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "request body is too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+		}
+		return false
+	}
+	// Keep MaxBytesReader visible to ParseForm, which otherwise adds a 10 MiB cap.
+	r.Body = http.MaxBytesReader(w, io.NopCloser(bytes.NewReader(body)), limit)
+	return true
+}
+
+// HTTPTimeoutsConfig controls HTTP transport deadlines; zero uses defaults.
+type HTTPTimeoutsConfig struct {
+	ReadHeaderTimeout httpTimeoutDuration `json:"readHeaderTimeout"`
+	ReadTimeout       httpTimeoutDuration `json:"readTimeout"`
+	WriteTimeout      httpTimeoutDuration `json:"writeTimeout"`
+	IdleTimeout       httpTimeoutDuration `json:"idleTimeout"`
+}
+
+type httpTimeoutDuration time.Duration
+
+func (duration *httpTimeoutDuration) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		*duration = 0
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err != nil {
+		return fmt.Errorf("httpTimeouts requires a duration string such as 30s or 20m: %w", err)
+	}
+	value, err := time.ParseDuration(strings.TrimSpace(text))
+	if err != nil || value < 0 {
+		return fmt.Errorf("httpTimeouts requires a non-negative duration such as 30s or 20m")
+	}
+	*duration = httpTimeoutDuration(value)
+	return nil
+}
+
+func (duration httpTimeoutDuration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(duration).String())
+}
+
+func (duration httpTimeoutDuration) orDefault(fallback time.Duration) time.Duration {
+	if duration > 0 {
+		return time.Duration(duration)
+	}
+	return fallback
+}
+
+func newConfiguredHTTPServer(address string, handler http.Handler, timeouts HTTPTimeoutsConfig) *http.Server {
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: timeouts.ReadHeaderTimeout.orDefault(30 * time.Second),
+		ReadTimeout:       timeouts.ReadTimeout.orDefault(20 * time.Minute),
+		WriteTimeout:      timeouts.WriteTimeout.orDefault(30 * time.Minute),
+		IdleTimeout:       timeouts.IdleTimeout.orDefault(5 * time.Minute),
+		MaxHeaderBytes:    1 << 20,
+	}
+}
+
 type Config struct {
-	Name              string             `json:"name"`
-	Profile           string             `json:"profile"`
-	Version           string             `json:"version"`
-	Port              int                `json:"port"`
-	CertFile          string             `json:"certPath"`
-	KeyFile           string             `json:"keyPath"`
-	JavaScriptInclude []string           `json:"javascript_include"`
-	Log               LogConfig          `json:"log"`
-	APIHotReload      APIHotReloadConfig `json:"APIHotReload"`
-	OAuthStateRoot    string             `json:"oauth_state_directory"`
+	HTTPTimeouts      HTTPTimeoutsConfig  `json:"httpTimeouts"`
+	ReceiveLimits     ReceiveLimitsConfig `json:"receiveLimits"`
+	Name              string              `json:"name"`
+	Profile           string              `json:"profile"`
+	Version           string              `json:"version"`
+	Port              int                 `json:"port"`
+	CertFile          string              `json:"certPath"`
+	KeyFile           string              `json:"keyPath"`
+	JavaScriptInclude []string            `json:"javascript_include"`
+	Log               LogConfig           `json:"log"`
+	APIHotReload      APIHotReloadConfig  `json:"APIHotReload"`
+	OAuthStateRoot    string              `json:"oauth_state_directory"`
 }
 
 // LogConfig はログ設定を表します。
@@ -736,6 +928,7 @@ func main() {
 	r.Use(serviceRecovery())
 	r.SetTrustedProxies(nil)
 	r.Use(CORSMiddleware())
+	r.Use(receiveLimitMiddleware())
 	r.StaticFile("/favicon.ico", resolvePath(exeDir, "./html/favicon.ico"))
 	r.Static("/css", resolvePath(exeDir, "./html/css"))
 	r.Static("/images", resolvePath(exeDir, "./html/images"))
@@ -778,11 +971,8 @@ func main() {
 	// HTTPSサーバーを起動するかどうかを判断
 	certFile := resolvePath(exeDir, globalConfig.CertFile)
 	keyFile := resolvePath(exeDir, globalConfig.KeyFile)
-	server := &http.Server{
-		Addr:     fmt.Sprintf(":%d", globalConfig.Port),
-		Handler:  r.Handler(),
-		ErrorLog: httpServerErrorLogger(),
-	}
+	server := newConfiguredHTTPServer(fmt.Sprintf(":%d", globalConfig.Port), r.Handler(), globalConfig.HTTPTimeouts)
+	server.ErrorLog = httpServerErrorLogger()
 	if globalConfig.CertFile != "" && globalConfig.KeyFile != "" {
 		serviceLog(slog.LevelInfo, "http_server_starting", "transport", "https", "port", globalConfig.Port)
 		err = server.ListenAndServeTLS(certFile, keyFile)
@@ -1043,11 +1233,15 @@ func handleWebSocketWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, en
 	if allowed, handled := runParamCheckWithSnapshot(c, snapshot, config, exeDir, config.HTML, allParams); handled || !allowed {
 		return
 	}
+	// Handshake checks are complete. Do not retain the buffered HTTP body
+	// throughout the lifetime of the WebSocket connection.
+	c.Request.Body = http.NoBody
 	rawConn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		logServiceError(slog.LevelWarn, "websocket_upgrade_failed", err, "endpoint", endpoint)
 		return
 	}
+	rawConn.SetReadLimit(globalConfig.ReceiveLimits.webSocketMessageBytes())
 	conn := &serverWebSocket{Conn: rawConn}
 	wsConnections.Lock()
 	wsConnections.conns[endpoint] = append(wsConnections.conns[endpoint], conn)
@@ -1485,6 +1679,145 @@ func setExecutionModeValues(params map[string]interface{}, values []string) {
 }
 
 func normalizedMCPInputSchema(schema map[string]interface{}) map[string]interface{} {
+	normalized := mcpInputSchemaWithExecutionMode(schema)
+	if _, hasRef := schema["$ref"]; !hasRef {
+		return normalized
+	}
+	compiled, err := compileMCPJSONSchema(normalized)
+	if err != nil {
+		return normalized // Leave invalid schemas for the caller's compiler to reject.
+	}
+	// Specialize only references that validate the arguments object itself.
+	// Keep the original definitions intact: a nested property can share them.
+	definitions, _ := schema["$defs"].(map[string]interface{})
+	definitions = cloneParams(definitions)
+	references := make(map[string]string)
+	var extendReference func(map[string]interface{}, *jsonschema.Schema)
+	extendReference = func(current map[string]interface{}, compiled *jsonschema.Schema) {
+		if compiled.Ref == nil {
+			return
+		}
+		// Use the compiler's canonical location, including for local anchors.
+		ref := compiled.Ref.Location
+		if replacement, exists := references[ref]; exists {
+			current["$ref"] = replacement
+			return
+		}
+		location, err := url.Parse(ref)
+		if err != nil || !strings.HasPrefix(location.Fragment, "/") {
+			return
+		}
+		var target interface{} = schema
+		for _, part := range strings.Split(location.Fragment[1:], "/") {
+			part = strings.ReplaceAll(strings.ReplaceAll(part, "~1", "/"), "~0", "~")
+			switch value := target.(type) {
+			case map[string]interface{}:
+				target = value[part]
+			case []interface{}:
+				index, err := strconv.Atoi(part)
+				if err != nil || index < 0 || index >= len(value) {
+					return
+				}
+				target = value[index]
+			default:
+				return
+			}
+			// Moving an embedded resource would change the base of its references.
+			// Keep such resources untouched, as well as nested property schemas.
+			if object, ok := target.(map[string]interface{}); ok {
+				if _, hasID := object["$id"].(string); hasID {
+					return
+				}
+				// Draft-04 uses id for resource and anchor identity. Use the
+				// compiler's resolved dialect, not a keyword-name heuristic.
+				if compiled.Ref.DraftVersion == 4 {
+					if _, hasID := object["id"].(string); hasID {
+						return
+					}
+				}
+			}
+		}
+		source, ok := target.(map[string]interface{})
+		if !ok {
+			return // Boolean schemas and invalid references remain unchanged.
+		}
+		name := "nyan_input"
+		for index := 1; ; index++ {
+			if _, exists := definitions[name]; !exists {
+				break
+			}
+			name = fmt.Sprintf("nyan_input_%d", index)
+		}
+		replacement := "#/$defs/" + name
+		references[ref] = replacement
+		extended := mcpInputSchemaWithExecutionMode(source)
+		// Keep anchor identities on the original definition, including the
+		// dynamic anchor used by recursive children retained below.
+		delete(extended, "$anchor")
+		delete(extended, "$dynamicAnchor")
+		definitions[name] = extended
+		extendReference(extended, compiled.Ref)
+		if reflect.DeepEqual(source, extended) {
+			// tools/list and tools/call normalize stored schemas again.
+			// Reuse an already extended reference rather than growing $defs.
+			delete(definitions, name)
+			references[ref], _ = current["$ref"].(string)
+			return
+		}
+		// Reuse subschemas at their original locations so copying this object
+		// does not duplicate anchors or embedded resources, or rebase their refs.
+		retainMCPInputSubschemaReferences(extended, location)
+		current["$ref"] = replacement
+	}
+	extendReference(normalized, compiled)
+	if len(definitions) != 0 {
+		normalized["$defs"] = definitions
+	}
+	return normalized
+}
+
+func retainMCPInputSubschemaReferences(schema map[string]interface{}, location *url.URL) {
+	reference := func(parts ...string) interface{} {
+		target := *location
+		for _, part := range parts {
+			target.Fragment += "/" + strings.ReplaceAll(strings.ReplaceAll(part, "~", "~0"), "/", "~1")
+		}
+		// Published schemas must also resolve in clients with a different base URI.
+		return map[string]interface{}{"$ref": (&url.URL{Fragment: target.Fragment}).String()}
+	}
+	delete(schema, "$defs")
+	delete(schema, "definitions")
+	for _, keyword := range []string{"properties", "patternProperties", "dependentSchemas", "dependencies"} {
+		if original, ok := schema[keyword].(map[string]interface{}); ok {
+			children := cloneParams(original)
+			for name, child := range children {
+				if keyword == "properties" && name == "nyan_mode" {
+					continue
+				}
+				if _, isSchema := child.(map[string]interface{}); isSchema {
+					children[name] = reference(keyword, name)
+				}
+			}
+			schema[keyword] = children
+		}
+	}
+	for _, keyword := range []string{"allOf", "anyOf", "oneOf", "prefixItems", "items", "additionalItems", "contains", "unevaluatedItems", "additionalProperties", "unevaluatedProperties", "propertyNames", "not", "if", "then", "else", "contentSchema"} {
+		switch value := schema[keyword].(type) {
+		case map[string]interface{}:
+			schema[keyword] = reference(keyword)
+		case []interface{}:
+			children := append([]interface{}(nil), value...)
+			for index, child := range children {
+				if _, isSchema := child.(map[string]interface{}); isSchema {
+					children[index] = reference(keyword, strconv.Itoa(index))
+				}
+			}
+			schema[keyword] = children
+		}
+	}
+}
+
+func mcpInputSchemaWithExecutionMode(schema map[string]interface{}) map[string]interface{} {
 	normalized := make(map[string]interface{}, len(schema)+1)
 	for key, value := range schema {
 		normalized[key] = value
@@ -1537,7 +1870,6 @@ func evaluateOutCheckWithSnapshot(c *gin.Context, snapshot *APIConfigSnapshot, c
 	}
 
 	if checkResponse.Success {
-		response.Status = checkResponse.Status
 		return nil
 	}
 
@@ -2114,6 +2446,7 @@ func CORSMiddleware() gin.HandlerFunc {
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
 
 		if c.Request.Method == "OPTIONS" {
+			closeUnreadRequestBody(c.Writer, c.Request)
 			c.AbortWithStatus(204)
 			return
 		}
@@ -3031,11 +3364,8 @@ func handleJSONRPC(c *gin.Context) {
 		Result:  result,
 		ID:      rpcReq.ID,
 	}
-	status := http.StatusOK
-	if strings.TrimSpace(config.OutCheck) != "" {
-		status = response.Status
-	}
-	c.JSON(status, rpcResp)
+	// Successful checks preserve the normal JSON-RPC transport status.
+	c.JSON(http.StatusOK, rpcResp)
 }
 
 func jsonRPCResultFromJSValue(value goja.Value) (result json.RawMessage, response APIResponse, allowsPush bool, err error) {
@@ -3059,15 +3389,36 @@ func jsonRPCResultFromJSValue(value goja.Value) (result json.RawMessage, respons
 	if err != nil {
 		return nil, response, false, err
 	}
-	response, _, err = responseFromExportedJSValue(value, exported)
+	if len(result) > 0 && result[0] == '[' {
+		// Preserve arrays for outCheck and Push. JavaScript string coercion
+		// loses their structure and can invoke an element's toString method.
+		response = APIResponse{
+			Status:      http.StatusOK,
+			ContentType: "application/json",
+			Headers:     map[string]string{},
+			Body:        result,
+		}
+	} else {
+		response, _, err = responseFromExportedJSValue(value, exported)
+	}
 	allowsPush = err == nil && exportedResultAllowsPush(exported) && responseAllowsPush(response)
 	return result, response, allowsPush, err
+}
+
+// JSON-RPC requires a response body. Keep the check result's own status intact.
+func jsonRPCResponseStatus(status int) int {
+	switch status {
+	case http.StatusNoContent, http.StatusResetContent, http.StatusNotModified:
+		return http.StatusOK
+	default:
+		return status
+	}
 }
 
 func writeJSONRPCCheckResponse(c *gin.Context, id interface{}, checkName string, response ParamCheckResponse) {
 	if response.Success {
 		// A successful checkOnly request returns the check result without running the API.
-		c.JSON(response.Status, JSONRPCResponse{JSONRPC: "2.0", Result: response, ID: id})
+		c.JSON(jsonRPCResponseStatus(response.Status), JSONRPCResponse{JSONRPC: "2.0", Result: response, ID: id})
 		return
 	}
 	respondJSONRPCError(c, id, -32000, checkName+" rejected", response)
@@ -4193,6 +4544,7 @@ func (runtime *wsClientRuntime) connectAndListen(cfg wsClientConfig) (bool, erro
 	if err != nil {
 		return false, fmt.Errorf("dial failed: %w", err)
 	}
+	conn.SetReadLimit(globalConfig.ReceiveLimits.webSocketMessageBytes())
 	if !runtime.acceptConnection(conn, cfg.connectURL) {
 		_ = conn.Close()
 		return false, nil
@@ -4333,10 +4685,12 @@ func mcpOAuthRoleForAPI(mcp EndpointConfig, apiName string) (string, bool) {
 func handleMCPHTTP(c *gin.Context, snapshot *APIConfigSnapshot, endpointName string, mcp EndpointConfig) {
 	runtimeURLs, err := deriveMCPRuntimeURLs(c.Request, endpointName, mcp)
 	if err != nil {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusMisdirectedRequest, gin.H{"error": "invalid Host"})
 		return
 	}
 	if !mcpOriginAllowed(c.Request.Header.Get("Origin"), mcp, runtimeURLs.Origin) {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusForbidden, gin.H{"error": "origin is not allowed"})
 		return
 	}
@@ -4348,37 +4702,43 @@ func handleMCPHTTP(c *gin.Context, snapshot *APIConfigSnapshot, endpointName str
 		c.Header("Access-Control-Expose-Headers", "WWW-Authenticate, MCP-Protocol-Version, Retry-After")
 	}
 	if c.Request.Method == http.MethodOptions {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.Status(http.StatusNoContent)
 		return
 	}
 	if c.Request.Method != http.MethodPost {
 		c.Header("Allow", "POST, OPTIONS")
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.Status(http.StatusMethodNotAllowed)
 		return
 	}
 	if allowed, retryAfter := mcpRateLimitAllows(endpointName, mcp.RateLimit, c.Request.RemoteAddr, time.Now()); !allowed {
 		c.Header("Retry-After", strconv.Itoa(max(1, int(math.Ceil(retryAfter.Seconds())))))
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
 		return
 	}
 	release, acquired := acquireMCPExecutionSlot(endpointName, mcpMaxConcurrent(mcp))
 	if !acquired {
 		c.Header("Retry-After", "1")
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "MCP server is busy"})
 		return
 	}
 	defer release()
 	contentType, _, contentTypeErr := mime.ParseMediaType(c.GetHeader("Content-Type"))
 	if contentTypeErr != nil || contentType != "application/json" {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusUnsupportedMediaType, gin.H{"error": "Content-Type must be application/json"})
 		return
 	}
 	if !strings.Contains(c.GetHeader("Accept"), "application/json") || !strings.Contains(c.GetHeader("Accept"), "text/event-stream") {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusNotAcceptable, gin.H{"error": "Accept must include application/json and text/event-stream"})
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20+1))
-	if err != nil || len(body) > 1<<20 {
+	body, err := readBoundedRequestBody(c.Writer, c.Request, globalConfig.ReceiveLimits.httpBodyBytes())
+	if err != nil {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
 		return
 	}
@@ -4717,15 +5077,16 @@ func oauthHookParams(c *gin.Context, snapshot *APIConfigSnapshot, endpointName s
 		var data []byte
 		if c.Request.Body != nil {
 			var readErr error
-			data, readErr = io.ReadAll(io.LimitReader(c.Request.Body, 1<<20+1))
-			if len(data) > 1<<20 {
+			data, readErr = readBoundedRequestBody(c.Writer, c.Request, globalConfig.ReceiveLimits.httpBodyBytes())
+			var tooLarge *http.MaxBytesError
+			if errors.As(readErr, &tooLarge) {
 				return nil, &oauthRequestInputError{status: http.StatusRequestEntityTooLarge, message: "request body is too large"}
 			}
 			if readErr != nil {
 				return nil, &oauthRequestInputError{status: http.StatusBadRequest, message: "failed to read request body"}
 			}
 		}
-		c.Request.Body = io.NopCloser(bytes.NewReader(data))
+		c.Request.Body = http.MaxBytesReader(c.Writer, io.NopCloser(bytes.NewReader(data)), globalConfig.ReceiveLimits.httpBodyBytes())
 		contentType := c.GetHeader("Content-Type")
 		if strings.HasPrefix(contentType, "application/json") {
 			var body interface{}
@@ -4886,27 +5247,41 @@ func invokeOAuthHook(c *gin.Context, snapshot *APIConfigSnapshot, endpointName s
 func handleOAuthJavaScript(c *gin.Context, snapshot *APIConfigSnapshot, endpointName string, mcp EndpointConfig, role string) {
 	runtimeURLs, err := deriveMCPRuntimeURLs(c.Request, endpointName, mcp)
 	if err != nil {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusMisdirectedRequest, gin.H{"error": "invalid Host"})
 		return
 	}
 	if !mcpOriginAllowed(c.GetHeader("Origin"), mcp, runtimeURLs.Origin) {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.JSON(http.StatusForbidden, gin.H{"error": "origin is not allowed"})
 		return
 	}
+	if origin := strings.TrimSpace(c.GetHeader("Origin")); origin != "" {
+		c.Header("Access-Control-Allow-Origin", origin)
+		c.Header("Vary", "Origin")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	}
 	if c.Request.Method == http.MethodOptions {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.Status(http.StatusNoContent)
 		return
 	}
 	if role == "authorizationServerMetadata" || role == "protectedResourceMetadata" {
 		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodOptions {
 			c.Header("Allow", "GET, OPTIONS")
+			closeUnreadRequestBody(c.Writer, c.Request)
 			c.Status(http.StatusMethodNotAllowed)
 			return
 		}
 	}
 	hookName := role
 	if hookName == "oauthValidateAccessToken" || hookName == "" {
+		closeUnreadRequestBody(c.Writer, c.Request)
 		c.Status(http.StatusNotFound)
+		return
+	}
+	if c.Request.Method != http.MethodPost && !enforceReceiveBodyLimit(c.Writer, c.Request) {
 		return
 	}
 	result := invokeOAuthHook(c, snapshot, endpointName, mcp, runtimeURLs, hookName, map[string]interface{}{})
@@ -5765,4 +6140,19 @@ func verifyBoundedArgon2id(password, encoded string) (bool, error) {
 	defer func() { <-oauthArgon2Slots }()
 	actual := argon2.IDKey([]byte(password), parsed.salt, parsed.iterations, parsed.memory, parsed.parallelism, uint32(len(parsed.digest)))
 	return subtle.ConstantTimeCompare(actual, parsed.digest) == 1, nil
+}
+
+func receiveLimitMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Protected transports own their admission checks and bounded body read.
+		if dispatchMCPOrOAuth(c) {
+			c.Abort()
+			return
+		}
+		if !enforceReceiveBodyLimit(c.Writer, c.Request) {
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
 }
