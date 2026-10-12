@@ -19,6 +19,16 @@
     "EnableLogging": false,
     "Level": "info"
   },
+  "httpTimeouts": {
+    "readHeaderTimeout": "30s",
+    "readTimeout": "20m",
+    "writeTimeout": "30m",
+    "idleTimeout": "5m"
+  },
+  "receiveLimits": {
+    "httpBodyBytes": "20MB",
+    "webSocketMessageBytes": "20MB"
+  },
   "APIHotReload": {
     "Enabled": true,
     "Interval": "1s"
