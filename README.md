@@ -9,6 +9,10 @@ NyanPUI(にゃんぷい)は、GoLangで作られたサーバーサイドレン�
 * **MCP**: Streamable HTTP、Tool公開、OAuth 2.0 Authorization Code + PKCEに対応
 * **CORS**: 通常APIは従来どおり全Originを許可し、MCPは設定したOriginだけを許可
 
+このREADMEは、Version1方針を反映したリポジトリの現行ソースを説明します。配布バイナリを使う場合は、ダウンロードしたリリースと同じタグのREADME・リリースノートを参照してください。現行ソースの機能が過去のバイナリにも含まれるとは限りません。`config.json` の `version` はサービスの表示用設定値で、バイナリの版を判定する値ではありません。
+
+はじめに：[ビルド](#ビルド) → [最小起動例](#quickstart)。公開前に[運用上の前提](#deployment)を確認してください。
+
 ## ライセンス
 
 MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照してください。
@@ -34,6 +38,49 @@ MIT ライセンスです。詳細は [LICENSE.md](LICENSE.md) を参照して�
 ├── README.md            # 本ファイル
 └── NyanPUI              # 実行ファイル
 ```
+
+<a id="quickstart"></a>
+## 最小起動例：HTMLを表示する
+
+[ビルド](#ビルド)した実行ファイル、または対象OS/CPUの[リリース](https://github.com/NyanQL/NyanPUI/releases)を用意します。配布バイナリを使う場合、Goは不要です。実行ファイルのあるディレクトリに新しい `quickstart` フォルダを作り、次の3ファイルを保存してください。
+
+`quickstart/config.json`：
+
+```json
+{
+  "name": "NyanPUI quickstart",
+  "Port": 8009,
+  "certPath": "",
+  "keyPath": "",
+  "javascript_include": [],
+  "log": {"EnableLogging": false, "Level": "info"}
+}
+```
+
+`quickstart/api.json`：
+
+```json
+{
+  "html": {"html": "./hello.html", "description": "HTMLだけを返す"}
+}
+```
+
+`quickstart/hello.html`：
+
+```html
+<!doctype html>
+<html lang="ja"><meta charset="utf-8"><title>NyanPUI</title><h1>Hello, NyanPUI!</h1></html>
+```
+
+macOS/Linuxでは次のように起動します。Windowsでは実行ファイルを `.\NyanPUI.exe` に読み替えます。このHTML表示にはJS・画像・共通ライブラリは不要です。
+
+```bash
+./NyanPUI --config ./quickstart/config.json --api ./quickstart/api.json
+```
+
+ブラウザで `http://127.0.0.1:8009/` を開くと `Hello, NyanPUI!` が表示されます。`curl http://127.0.0.1:8009/` でもHTTP 200のHTMLを確認できます。終了は起動したターミナルで `Ctrl+C` です。
+
+PUIは全インターフェースで待ち受けます。この認証なしの例は信頼できるローカル環境で確認し、外部からの到達を必要に応じてOS・ネットワークで制限してください。公開前の前提は[運用上の前提](#deployment)を参照してください。
 
 ## 設定ファイル
 
@@ -79,6 +126,8 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
 
 ### config.json
 
+以下はTLSとテンプレートライブラリを使う設定例です。証明書のパスは実在するファイルへ置き換えてください。HTTPでの最初の確認には、certPath/keyPathを空文字にした[最小起動例](#quickstart)を使います。
+
 ```json
 {
   "name": "API サーバー名",
@@ -88,6 +137,7 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
   "certPath": "path/to/cert.crt",
   "keyPath": "path/to/key.key",
   "javascript_include": [
+    "javascript/lib/nyanPlate.js",
     "javascript/lib/nyanPlateToJson.js"
   ],
   "APIHotReload": {
@@ -427,6 +477,40 @@ OAuthのJavaScript hookでは、`nyanArgon2idHash(password)` でパスワード�
 
 ハッシュの再生成・保存は自動では行いません。将来、生成設定を変更して既存ハッシュを更新する場合は、検証成功後に入力されたパスワードから再生成し、JavaScript側で保存してください。ログインの許可・拒否や更新の判断もJavaScript側で行います。
 
+### OAuth hookの入出力と状態ヘルパー
+
+hookの本体は `nyanAllParams` を参照します。通常APIの業務パラメータと異なり、OAuthのquery/form/bodyは以下のフィールドに分かれます。
+
+| 入力 | 内容 |
+|---|---|
+| `oauth_hook` | `oauthAuthorize`・`oauthToken`・`oauthRegister`・`oauthValidateAccessToken` 等の役割 |
+| `oauth_api` / `mcp_api_name` | hookのAPI名／MCPサーバーのAPI名 |
+| `issuer` / `resource` | リクエストから生成した公開URL |
+| `method` / `request_path` / `path` | HTTPメソッド／受信パス／hookの正規パス |
+| `query` / `form` | クエリ／フォーム。各項目の値は文字列配列。formはフォームPOSTで設定 |
+| `body` | JSON POSTを解析した値。通常APIのように各項目を最上位へ展開しない |
+| `headers` / `cookies` | ヘッダー値の配列／Cookie値の文字列を持つオブジェクト |
+| `authorization` | Authorizationヘッダー文字列 |
+| `scopes` / `redirect_uri_allowed_prefixes` | 設定で許可したscope／redirect URI prefix |
+| `tool` / `required_scopes` | verifyAccess呼出し時のTool名／要求scope |
+| `state_directory` | このMCPサーバー用の状態保存先 |
+
+authorize/token/registerは、JSON化できるオブジェクトを返すか、`{status,contentType,headers,body}` でHTTP応答を指定します。例えば `({status:400,contentType:"application/json",body:{error:"invalid_request"}});` はHTTP 400のJSON応答です。statusを指定しない通常オブジェクトはHTTP 200のJSONとなります。OAuthの本体結果はオブジェクトで返してください。JSON文字列を返すと文字列自体がJSON化されるため、オブジェクトとは異なります。
+
+verifyAccessはHTTP応答ではなく認可の判断を返します。`({authenticated:false});` は拒否、実際のtoken・期限・resource・scope検証に成功した場合にだけ `({authenticated:true,principal:{id:"確認済みユーザーID"}});` のように返します。`allowed` という真偽値も使用でき、両方ある場合はallowedが優先されます。この検証を省略して固定の成功を返さないでください。Go側はhookの判断を用いるため、scopeの内容を検証するのもhookの責務です。チェック用の `{success,status,result}` とは別の返却形式です。
+
+状態保存には次のヘルパーを使えます。キーは `tokens/example.json` 等、状態保存root内の相対パスで拡張子は `.json` とします。root外への参照やシンボリックリンクは拒否します。
+
+| 関数 | 戻り値・処理 |
+|---|---|
+| `nyanOAuthRead(key)` | JSONの文字列。存在しなければ空文字列 |
+| `nyanOAuthWrite(key, jsonText)` | JSON文字列を保存しtrue。1 MiB以下で重複キーのないJSONが必要 |
+| `nyanOAuthDelete(key)` | 削除してtrue。存在しなくても成功 |
+| `nyanOAuthConsume(key)` | 読取と削除を同じプロセス内で排他実行し、JSON文字列を返す。存在しなければ空文字列 |
+| `nyanOAuthList(namespace)` | namespace直下のJSONキーの配列。namespaceは英数字・`_`・`-`の1〜64文字 |
+
+その他のI/O・形式・権限エラーはJavaScript例外です。Unix系では状態ディレクトリを0700、ファイルを0600で作成し、広すぎる権限の既存ファイルを拒否します。保存先は公開フォルダや配布物に含めず、有効期限の判定・期限切れの削除・バックアップはアプリケーション側で管理してください。
+
 ### Argon2idハッシュの生成と検証
 
 `nyanArgon2idHash(password)` と `nyanArgon2idVerify(password, encodedHash)` の計算・検証条件はNyanQL・Nyan8・NyanPUIで共通です。
@@ -716,6 +800,8 @@ const nyanOutputSchema = {
 
 スキーマはJavaScriptを実行せずASTから静的に読み取ります。オブジェクト、配列、文字列、数値、真偽値、`null`を利用できます。関数呼び出し、spread、識別子参照などの動的な定義はスキーマ解決エラーになります。スキーマファイルは詳細リクエストごとに読み直されます。
 
+MCPの `tools/list` と `tools/call` は設定スナップショットの作成時に解決したスキーマを使います。スキーマファイルだけを変更してもMCPには反映されません。HTTPモードではapi.jsonの内容変更を伴う正常なリロード、または再起動が必要です。stdioモードは再起動してください。JS本体やチェックの実行時読込とは別の更新条件です。MCP参照先のスキーマが不正なら設定の読込・リロードに失敗します。
+
 通常APIへのHTTP・JSON-RPC呼び出しでは、ここで公開するJSON Schemaによるリクエスト・レスポンスの自動検証は行いません。実際の検証は従来どおり `paramCheck` と `outCheck` が担当します。一方、MCP Toolでは入力JSON Schemaによる自動検証を行い、出力スキーマがあり応答の `status` が400未満の場合は出力JSON Schemaでも検証します。MCPの `checkOnly` では入力検証と `paramCheck` だけを実行し、出力検証は行いません。
 
 ### WebSocket レシーバー（`type: "ws_client"`）
@@ -810,6 +896,7 @@ schedule の `script` では通常 API と同じ Goja 環境を使えます。�
 * `/nyan` にアクセスすると通常APIの一覧を、`/nyan/{API名}`では入出力スキーマを含む詳細をJSONで取得できます。
 * `/css`, `/images`, `/js`, `/favicon.ico` は `html/` 配下の静的ファイルとして配信されます。
 
+<a id="deployment"></a>
 ### 運用上の前提とファイル権限
 
 NyanPUIは、信頼できる管理者が用意したAPI定義とJavaScriptを実行する前提です。スクリプトはNyanPUIの実行ユーザーのOS権限で、`nyanHostExec` によるコマンド実行や、ファイルの読み書き・削除を行えます。
@@ -820,9 +907,13 @@ NyanPUIは、信頼できる管理者が用意したAPI定義とJavaScriptを実
 
 実行中のAPI定義の変更は、ホットリロードが有効な場合に自動反映されます。JavaScript本体と共通ライブラリは実行のたびに読み込むため、`APIHotReload.Enabled` を `false` にしても、JavaScriptの変更は次回の実行に反映されます。
 
+通常HTTPは全インターフェースで待ち受けます。localhostのURL例は公開範囲を制限する設定ではありません。OSのファイアウォール等で到達元を制限し、必要なAPIだけを定義してください。通常API・JSON-RPC・public・WebSocketに必要な認証・認可はparamCheck等で実装します。MCPのOAuthを設定しても、Tool参照先の通常APIへの直接呼出しが自動で保護されるわけではありません。組込の `/css`・`/images`・`/js` 等へ秘密情報を置かず、認証が必要なファイルはparamCheckを持つpublic定義等で扱います。CORSやOrigin制限は利用者認証の代わりにはなりません。
+
+外部公開ではcertPath/keyPathに証明書と秘密鍵を指定してHTTPSを使用します。MCP/OAuthのURLは実際のリクエストのschemeとHostから生成し、X-Forwarded-Proto等では自動補正しません。proxyからPUIへもTLSで接続して公開Hostを保持するなど、issuer/resourceが公開URLと一致する構成を確認してください。OAuth状態ファイルと秘密鍵は、配信フォルダや配布物から分離してください。
+
 ## ビルド
 
-ビルドには `go.mod` に記載された Go バージョンを使用してください。
+ビルドには [go.mod](go.mod) に記載されたGoバージョン（現時点では1.26.9）を使用し、リポジトリのルートで実行してください。macOSで外部リンカを使う場合はXcode Command Line Toolsも必要です。
 
 ### macOS
 
@@ -836,7 +927,7 @@ NyanPUIは、信頼できる管理者が用意したAPI定義とJavaScriptを実
 
 ### Windows / Linux
 
-`go build -o NyanPUI main.go`
+Linuxは `go build -o NyanPUI main.go`、Windowsは `go build -o NyanPUI.exe main.go` です。
 
 ## JavaScript 実行 (Goja) 環境で使用できる変数と関数
 
@@ -926,6 +1017,8 @@ const response = nyanGetAPI(url); // 認証なし
 ```
 
 以前は引数が3個未満の場合に通信せず空文字列を返していましたが、現在はURLを指定すれば認証引数を省略してもGETを実行します。
+
+HTTP 404・500でも本文を取得できればその本文の文字列を返します。URL不正・通信失敗・本文の読取失敗では、PUIはログを記録して空文字列を返します。正常な空本文との区別は戻り値だけではできません。QL/Nyan8の同関数が通信失敗を例外にする挙動とは異なります。
 
 ```javascript
 // GET リクエスト
@@ -1031,7 +1124,7 @@ var plain = nyanBase64Decode("dXNlcjpwYXNzd29yZA==");
 バイナリファイルをBase64文字列として取得します。
 ファイルのパスは最上位の API 定義ファイルがあるディレクトリからの相対パス、または絶対パスで指定できます。存在しない場合は JavaScript 例外になります。
 ```javascript
-var b64 = nyanReadFileB64("./html/images/nyan.png");
+var b64 = nyanReadFileB64("./files/example.bin"); // 利用者が用意したファイル
 console.log(b64);
 ```
 
@@ -1046,6 +1139,7 @@ console.log(result);
 
 #### 挙動
 
+* 呼び出し先には `script` が必要です。HTMLだけのAPIは内部呼出しの対象外で、`checkOnly` でもparamCheckの前に拒否します。通常HTTPではHTMLだけのAPIにもparamCheck/checkOnlyを適用できます。
 * `data.api` は必須です。呼び出し先 API 名を空でない文字列で指定してください。省略・空文字・空白だけの文字列・文字列以外の値は `nyanCallMe: api is required` の例外になります。HTTPリクエストのURLやクエリからの自動補完は行いません。
 * 引数オブジェクトは呼び出し先 API の `nyanAllParams` に渡されます（`api` は呼び出し先名で上書き）。
 * 呼び出し先に設定した `paramCheck` → 本体スクリプト → `outCheck` の順で実行します。チェック拒否・不正なチェック結果・例外は、呼び出し元のJavaScriptで `try` / `catch` できる例外になります。実行前の拒否時は本体を実行せず、出力前の拒否時は本体の結果を返しません。
@@ -1059,7 +1153,9 @@ console.log(result);
 
 ### 13. **nyanPlate(data, htmlCode)**
 
-テンプレート内に `data-nyan*` 属性を記述し、`nyanPlate(data, htmlCode)` で動的置換します。
+テンプレート内に `data-nyan*` 属性を記述し、`nyanPlate(data, htmlCode)` で動的置換します。この関数は組込ではなく、config.jsonの `javascript_include` に `./javascript/lib/nyanPlate.js` を指定して読み込みます（nyanPlateToJson.jsだけでは定義されません）。
+
+自動HTMLエスケープは行いません。`data-nyanString` と `data-nyanHtml` はいずれも値をHTMLへ直接埋め込み、属性値も直接置換します。外部入力を使う場合は、本文・属性・URL等の用途に応じたエスケープや検証をアプリケーション側で行ってください。
 詳細については [nyanPlate.js](javascript%2Flib%2FnyanPlate.js) の文頭にコメントで記載していますので
 そちらを参照してください。
 
@@ -1208,7 +1304,7 @@ JSON-RPCでも `paramCheck` と `outCheck` を実行します。チェックが 
 `body` に配列やオブジェクトを指定した場合は JSON として返します。バイナリを返す場合は `body.encoding = "base64"` を指定します。
 
 ```javascript
-const data = nyanReadFileB64("./html/images/nyan.png");
+const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII="; // 1×1 PNG
 ({
   status: 200,
   contentType: "image/png",
@@ -1220,7 +1316,7 @@ const data = nyanReadFileB64("./html/images/nyan.png");
 `api.json` には以下のサンプルを追加しています。
 
 - `http://localhost:8009/sample/json`
-- `http://localhost:8009/sample/png`
+- `http://localhost:8009/sample/png`（同梱scriptは `html/images/nyan.png` を読むため、利用者が画像を配置する必要があります。画像ファイルを用意せず試す場合は、上の埋込Base64のscriptを別APIとして使用してください）
 - `schedule_debug_every_minute`（HTTP では公開されない定期実行ジョブ）
 
 ---
