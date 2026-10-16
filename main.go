@@ -760,7 +760,7 @@ type APIResponse struct {
 var globalConfig Config
 
 // ビルド時に -ldflags "-X main.buildVersion=..." で上書き可能
-var buildVersion = "v0.0.16"
+var buildVersion = "v1.0.17"
 
 type serviceFilePath struct {
 	Path   string
