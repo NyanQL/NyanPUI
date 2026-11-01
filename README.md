@@ -1323,3 +1323,8 @@ const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACf
 
 ## 予約語
 エンドポイント名や変数名など、`nyan` で始まる名前は予約語になりますので使用しないでください。`nyan`, `nyan-rpc` は固定ルートで使われます。`api` は `nyanAllParams` で呼び出し先 API 名に使う予約パラメータです。
+
+
+## 外部MCPクライアント: nyanCallMCP
+
+設定済みの外部MCPツールをサーバー側JavaScriptから呼び出せます。既定は無効です。設定・権限・戻り値・制限は [nyanCallMCP利用ガイド](NYANCALLMCP.md) と [設定・JS例](examples/nyanCallMCP/) を参照してください。
