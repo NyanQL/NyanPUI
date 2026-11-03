@@ -140,6 +140,7 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
     "javascript/lib/nyanPlate.js",
     "javascript/lib/nyanPlateToJson.js"
   ],
+  "javascript_include_cache": false,
   "APIHotReload": {
     "Enabled": true,
     "Interval": "1s"
@@ -156,6 +157,28 @@ CLI オプションと環境変数には絶対パス、または NyanPUI を起�
 }
 ```
 
+
+### 共通JavaScriptのキャッシュ
+
+`config.json` の `javascript_include_cache` で、`javascript_include` に指定した共通JavaScriptの読み込み方法を切り替えます。NyanQLと同じ設定名・動作です。
+
+```json
+{
+  "javascript_include": ["./javascript/lib/nyanPlate.js"],
+  "javascript_include_cache": true
+}
+```
+
+| 設定 | 動作 |
+| --- | --- |
+| `false` または省略 | 従来どおり、JavaScriptの実行ごとに共通JSを読み込みます。ファイルの変更は次の実行に反映され、読み込めない場合はその実行がエラーになります。 |
+| `true` | 起動時に指定順で全ファイルを読み込み、ソース文字列を保持します。ファイルの変更・削除は再起動まで反映されません。起動時に読み込めないファイルがあれば起動を中止します。 |
+
+キャッシュ対象は共通JSのソース文字列だけです。JavaScriptのコンパイル結果・VM・実行結果は共有せず、各実行で新しいVMを作り、共通JSを指定順に評価します。処理の実行順序や同期実行の方式は変わりません。
+
+API本体のJS、`paramCheck` / `outCheck` のJS、HTMLは引き続き実行ごとに読み込みます。この設定はHTTP・JSON-RPC・WebSocket・MCP・`nyanCallMe`・バックグラウンド処理など、共通のJavaScript実行経路に適用されます。相対パスは従来どおり `config.json` のあるディレクトリを基準に解決します。
+
+設定の変更や、有効時の共通JSの更新には再起動が必要です。`api.json` のホットリロードではキャッシュを更新しません。
 
 ### HTTP通信のタイムアウト（3製品共通）
 
@@ -905,7 +928,7 @@ NyanPUIは、信頼できる管理者が用意したAPI定義とJavaScriptを実
 
 ファイル操作の相対パス基準は、最上位のAPI定義ファイルがあるディレクトリです。この基準はアクセス範囲を制限するものではなく、絶対パスや `../` も使用できます。実際に操作できる範囲は、OSのアクセス権や実行環境によって決まります。
 
-実行中のAPI定義の変更は、ホットリロードが有効な場合に自動反映されます。JavaScript本体と共通ライブラリは実行のたびに読み込むため、`APIHotReload.Enabled` を `false` にしても、JavaScriptの変更は次回の実行に反映されます。
+実行中のAPI定義の変更は、ホットリロードが有効な場合に自動反映されます。JavaScript本体は実行のたびに読み込むため、`APIHotReload.Enabled` を `false` にしても変更は次回の実行に反映されます。共通ライブラリも既定では毎回読み込みますが、`javascript_include_cache` が `true` の場合は再起動まで起動時の内容を使います。
 
 通常HTTPは全インターフェースで待ち受けます。localhostのURL例は公開範囲を制限する設定ではありません。OSのファイアウォール等で到達元を制限し、必要なAPIだけを定義してください。通常API・JSON-RPC・public・WebSocketに必要な認証・認可はparamCheck等で実装します。MCPのOAuthを設定しても、Tool参照先の通常APIへの直接呼出しが自動で保護されるわけではありません。組込の `/css`・`/images`・`/js` 等へ秘密情報を置かず、認証が必要なファイルはparamCheckを持つpublic定義等で扱います。CORSやOrigin制限は利用者認証の代わりにはなりません。
 

@@ -10,6 +10,7 @@
     "./javascript/lib/nyanPlate.js",
     "./javascript/lib/nyanPlateToJson.js"
   ],
+  "javascript_include_cache": false,
   "log": {
     "Filename": "./logs/nyanpui.log",
     "MaxSize": 5,

@@ -243,18 +243,21 @@ func newConfiguredHTTPServer(address string, handler http.Handler, timeouts HTTP
 }
 
 type Config struct {
-	HTTPTimeouts      HTTPTimeoutsConfig  `json:"httpTimeouts"`
-	ReceiveLimits     ReceiveLimitsConfig `json:"receiveLimits"`
-	Name              string              `json:"name"`
-	Profile           string              `json:"profile"`
-	Version           string              `json:"version"`
-	Port              int                 `json:"port"`
-	CertFile          string              `json:"certPath"`
-	KeyFile           string              `json:"keyPath"`
-	JavaScriptInclude []string            `json:"javascript_include"`
-	Log               LogConfig           `json:"log"`
-	APIHotReload      APIHotReloadConfig  `json:"APIHotReload"`
-	OAuthStateRoot    string              `json:"oauth_state_directory"`
+	HTTPTimeouts           HTTPTimeoutsConfig  `json:"httpTimeouts"`
+	ReceiveLimits          ReceiveLimitsConfig `json:"receiveLimits"`
+	Name                   string              `json:"name"`
+	Profile                string              `json:"profile"`
+	Version                string              `json:"version"`
+	Port                   int                 `json:"port"`
+	CertFile               string              `json:"certPath"`
+	KeyFile                string              `json:"keyPath"`
+	JavaScriptInclude      []string            `json:"javascript_include"`
+	JavaScriptIncludeCache bool                `json:"javascript_include_cache"`
+	Log                    LogConfig           `json:"log"`
+	APIHotReload           APIHotReloadConfig  `json:"APIHotReload"`
+	OAuthStateRoot         string              `json:"oauth_state_directory"`
+	// Prepared before serving requests; source text is immutable until restart.
+	cachedJavaScriptIncludes *string
 }
 
 // LogConfig はログ設定を表します。
@@ -896,6 +899,9 @@ func main() {
 	if err := setupLogger(configBaseDir); err != nil {
 		fatalServiceError("log_level_invalid", err)
 	}
+	if err := globalConfig.prepareJavaScriptIncludes(exeDir); err != nil {
+		fatalServiceError("javascript_include_load_failed", err)
+	}
 	// Suppress Gin's unstructured route and listener diagnostics.
 	gin.DefaultWriter = io.Discard
 	gin.DefaultErrorWriter = io.Discard
@@ -1467,6 +1473,46 @@ func runJavaScriptValueWithSnapshot(snapshot *APIConfigSnapshot, scriptPath stri
 	return runJavaScriptValueWithContext(snapshot, nil, scriptPath, htmlPath, allParams)
 }
 
+func readJavaScriptIncludeFiles(exeDir string, paths []string) (string, error) {
+	var source strings.Builder
+	for _, includePath := range paths {
+		includePath = resolvePath(exeDir, includePath)
+		code, err := os.ReadFile(includePath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read included JS file %s: %w", includePath, err)
+		}
+		serviceLog(slog.LevelDebug, "script_include_loaded", "file", includePath)
+		source.Write(code)
+		source.WriteByte('\n')
+	}
+	return source.String(), nil
+}
+
+// Called after config-relative paths are resolved and before starting workers.
+// Only source text is cached; each execution still creates a fresh goja runtime.
+func (cfg *Config) prepareJavaScriptIncludes(exeDir string) error {
+	cfg.cachedJavaScriptIncludes = nil
+	if !cfg.JavaScriptIncludeCache {
+		return nil
+	}
+	source, err := readJavaScriptIncludeFiles(exeDir, cfg.JavaScriptInclude)
+	if err != nil {
+		return err
+	}
+	cfg.cachedJavaScriptIncludes = &source
+	return nil
+}
+
+func (cfg *Config) javaScriptIncludes(exeDir string) (string, error) {
+	if !cfg.JavaScriptIncludeCache {
+		return readJavaScriptIncludeFiles(exeDir, cfg.JavaScriptInclude)
+	}
+	if cfg.cachedJavaScriptIncludes == nil {
+		return "", errors.New("javascript include cache has not been initialized")
+	}
+	return *cfg.cachedJavaScriptIncludes, nil
+}
+
 func runJavaScriptValueWithContext(snapshot *APIConfigSnapshot, requestContext *gin.Context, scriptPath string, htmlPath string, allParams map[string]interface{}) (_ goja.Value, runErr error) {
 	defer func() {
 		if runErr != nil {
@@ -1497,16 +1543,9 @@ func runJavaScriptValueWithContext(snapshot *APIConfigSnapshot, requestContext *
 		setupOAuthStateRuntime(runtime, stateRoot)
 	}
 
-	// ライブラリの JavaScript ファイルを読み込み
-	var jsLibCode string
-	for _, includePath := range globalConfig.JavaScriptInclude {
-		includePath = resolvePath(exeDir, includePath)
-		code, err := os.ReadFile(includePath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read included JS file %s: %v", includePath, err)
-		}
-		serviceLog(slog.LevelDebug, "script_include_loaded", "file", includePath)
-		jsLibCode += string(code) + "\n"
+	jsLibCode, err := globalConfig.javaScriptIncludes(exeDir)
+	if err != nil {
+		return nil, err
 	}
 
 	var htmlJS string

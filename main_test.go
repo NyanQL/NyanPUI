@@ -9269,3 +9269,200 @@ func TestNyanMCPBackgroundContextPreservesAbsentRequest(t *testing.T) {
 		t.Fatal("nested cancellation lost")
 	}
 }
+
+func TestJavaScriptIncludeCacheConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name, config     string
+		enabled, invalid bool
+	}{
+		{name: "omitted", config: `{}`},
+		{name: "disabled", config: `{"javascript_include_cache":false}`},
+		{name: "enabled", config: `{"javascript_include_cache":true}`, enabled: true},
+		{name: "string", config: `{"javascript_include_cache":"true"}`, invalid: true},
+		{name: "number", config: `{"javascript_include_cache":1}`, invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadConfig(writeFixtureFile(t, tc.config))
+			if (err != nil) != tc.invalid {
+				t.Fatalf("loadConfig error = %v, invalid = %v", err, tc.invalid)
+			}
+			if err == nil && cfg.JavaScriptIncludeCache != tc.enabled {
+				t.Fatalf("cache = %v, want %v", cfg.JavaScriptIncludeCache, tc.enabled)
+			}
+		})
+	}
+}
+
+func TestJavaScriptIncludeCacheHTTP(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cache=%v", enabled), func(t *testing.T) {
+			dir := t.TempDir()
+			include := filepath.Join(dir, "first.js")
+			writeTestFile(t, include, `var sharedCount = 0; const prefix = "original"; // no trailing newline`)
+			writeTestFile(t, filepath.Join(dir, "second.js"), `const sharedValue = prefix + "!";`)
+			script, html := filepath.Join(dir, "main.js"), filepath.Join(dir, "template.html")
+			paramCheck, outCheck := filepath.Join(dir, "param.js"), filepath.Join(dir, "out.js")
+			const check = `if (sharedValue !== nyanAllParams.want || ++sharedCount !== 1) throw new Error("include or VM isolation mismatch"); ({success:true,status:200,result:null});`
+			writeTestFile(t, paramCheck, check)
+			writeTestFile(t, outCheck, check)
+			writeBody := func(version string) {
+				writeTestFile(t, script, fmt.Sprintf(`({status:200,contentType:"application/json",body:{value:sharedValue,count:++sharedCount,version:%q,html:nyanHtmlCode}});`, version))
+				writeTestFile(t, html, version)
+			}
+			writeBody("one")
+			router := newRequestRegressionRouter(t, APIConfig{"cached": {Script: script, HTML: html, ParamCheck: paramCheck, OutCheck: outCheck}})
+			configPath := filepath.Join(dir, "config.json")
+			writeTestFile(t, configPath, fmt.Sprintf(`{"javascript_include":["first.js","second.js"],"javascript_include_cache":%v}`, enabled))
+			cfg, err := loadConfig(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			adjustConfigPaths(dir, &cfg)
+			globalConfig = cfg
+			// A different executable directory verifies config-relative includes.
+			exeDir := t.TempDir()
+			if err := globalConfig.prepareJavaScriptIncludes(exeDir); err != nil {
+				t.Fatal(err)
+			}
+			request := func(want string, status int) *httptest.ResponseRecorder {
+				t.Helper()
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/cached?want="+url.QueryEscape(want+"!"), nil))
+				if rec.Code != status {
+					t.Fatalf("status = %d, want %d; body = %s", rec.Code, status, rec.Body.String())
+				}
+				return rec
+			}
+			assertBody := func(want, version string) {
+				t.Helper()
+				rec := request(want, http.StatusOK)
+				var got map[string]interface{}
+				if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+					t.Fatal(err)
+				}
+				expected := map[string]interface{}{"value": want + "!", "count": float64(1), "version": version, "html": version}
+				if !reflect.DeepEqual(got, expected) {
+					t.Fatalf("body = %#v, want %#v", got, expected)
+				}
+			}
+			// Change before the first request: the cache must be prepared at startup.
+			writeTestFile(t, include, `var sharedCount = 0; const prefix = "changed";`)
+			want := "changed"
+			if enabled {
+				want = "original"
+			}
+			assertBody(want, "one")
+			writeBody("two")
+			assertBody(want, "two")
+			// Check scripts themselves remain live, as do the main script and HTML.
+			writeTestFile(t, paramCheck, `({success:false,status:403,result:null});`)
+			request(want, http.StatusForbidden)
+			writeTestFile(t, paramCheck, check)
+			writeTestFile(t, outCheck, `({success:false,status:409,result:null});`)
+			request(want, http.StatusConflict)
+			writeTestFile(t, outCheck, check)
+			// API hot reload must not replace the startup source cache.
+			publishAPISnapshot(&APIConfigSnapshot{Config: APIConfig{"cached": {Script: script, HTML: html, ParamCheck: paramCheck, OutCheck: outCheck}}})
+			if err := os.Remove(include); err != nil {
+				t.Fatal(err)
+			}
+			if enabled {
+				assertBody(want, "two")
+			} else {
+				request(want, http.StatusInternalServerError)
+			}
+			writeTestFile(t, include, `var sharedCount = 0; const prefix = "restarted";`)
+			if err := globalConfig.prepareJavaScriptIncludes(exeDir); err != nil {
+				t.Fatal(err)
+			}
+			assertBody("restarted", "two")
+		})
+	}
+}
+
+func TestJavaScriptIncludeCachePreparation(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{JavaScriptIncludeCache: true}
+	if _, err := cfg.javaScriptIncludes(dir); err == nil {
+		t.Fatal("uninitialized cache was accepted")
+	}
+	if err := cfg.prepareJavaScriptIncludes(dir); err != nil {
+		t.Fatal(err)
+	}
+	if source, err := cfg.javaScriptIncludes(dir); err != nil || source != "" {
+		t.Fatalf("empty includes: source = %q, error = %v", source, err)
+	}
+	writeTestFile(t, filepath.Join(dir, "first.js"), `const first = 1;`)
+	cfg.JavaScriptInclude = []string{"first.js", "missing.js"}
+	if err := cfg.prepareJavaScriptIncludes(dir); err == nil || !strings.Contains(err.Error(), "missing.js") {
+		t.Fatalf("missing include error = %v", err)
+	}
+	if _, err := cfg.javaScriptIncludes(dir); err == nil {
+		t.Fatal("failed preparation left a partial or stale cache")
+	}
+	cfg.JavaScriptIncludeCache = false
+	if err := cfg.prepareJavaScriptIncludes(dir); err != nil {
+		t.Fatalf("disabled cache must defer reads until execution: %v", err)
+	}
+	if _, err := cfg.javaScriptIncludes(dir); err == nil {
+		t.Fatal("disabled cache did not read the missing include")
+	}
+}
+
+func TestJavaScriptIncludeCacheConcurrentExecution(t *testing.T) {
+	previous := globalConfig
+	t.Cleanup(func() { globalConfig = previous })
+	include := writeFixtureFile(t, `globalThis.count = (globalThis.count || 0) + 1;`)
+	script := writeFixtureFile(t, `count === 1;`)
+	globalConfig = Config{JavaScriptInclude: []string{include}, JavaScriptIncludeCache: true}
+	if err := globalConfig.prepareJavaScriptIncludes(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(include); err != nil {
+		t.Fatal(err)
+	}
+	const workers = 16
+	results := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			value, err := runJavaScriptValueWithContext(nil, nil, script, "", nil)
+			if err == nil && !value.ToBoolean() {
+				err = errors.New("JavaScript global state leaked between executions")
+			}
+			results <- err
+		}()
+	}
+	for i := 0; i < workers; i++ {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+func TestJavaScriptIncludeCacheStartup(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cache=%v", enabled), func(t *testing.T) {
+			dir := t.TempDir()
+			configPath, apiPath := filepath.Join(dir, "config.json"), filepath.Join(dir, "api.json")
+			writeTestFile(t, configPath, fmt.Sprintf(`{"javascript_include":["missing.js"],"javascript_include_cache":%v}`, enabled))
+			writeTestFile(t, apiPath, `{}`)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMCPStdioLoggingHelper$", "--", "--config", configPath, "--api", apiPath, "--mcp-server", "missing")
+			cmd.Env = append(os.Environ(), "NYANPUI_TEST_STDIO_LOGGING_CHILD=1", "NYAN_MCP_CONFIG=")
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			err := cmd.Run()
+			if err == nil || ctx.Err() != nil {
+				t.Fatalf("expected startup failure, got %v; context = %v; stderr = %s", err, ctx.Err(), stderr.String())
+			}
+			want := "mcp_stdio_selection_failed"
+			if enabled {
+				want = "javascript_include_load_failed"
+			}
+			if !strings.Contains(stderr.String(), want) || stdout.Len() != 0 {
+				t.Fatalf("expected %s on stderr only; stdout = %q; stderr = %q", want, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
