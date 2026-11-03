@@ -1366,6 +1366,20 @@ func runJavaScriptWithSnapshot(snapshot *APIConfigSnapshot, scriptPath string, h
 	if err != nil {
 		return "", err
 	}
+	return javaScriptValueString(value)
+}
+
+// Result coercion can execute JavaScript even after RunString has succeeded.
+func javaScriptValueString(value goja.Value) (result string, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if exception, ok := recovered.(*goja.Exception); ok {
+				result, err = "", exception
+			} else {
+				panic(recovered)
+			}
+		}
+	}()
 	return value.String(), nil
 }
 
@@ -1567,8 +1581,15 @@ func runJavaScriptValueWithContext(snapshot *APIConfigSnapshot, requestContext *
 	if err != nil {
 		return nil, err
 	}
-	//変数に格納
-	paramsJS := fmt.Sprintf("const nyanAllParams = %s;\n", allParamsJSON)
+	// Parse JSON as data so __proto__ remains an ordinary own property. Do this
+	// before user code can shadow or replace JSON.parse.
+	paramsLiteral, err := json.Marshal(string(allParamsJSON))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := runtime.RunString(fmt.Sprintf("const nyanAllParams = JSON.parse(%s);", paramsLiteral)); err != nil {
+		return nil, err
+	}
 	// JavaScriptファイル本体を読み込み
 	jsCodeBytes, err := os.ReadFile(scriptPath)
 	if err != nil {
@@ -1576,7 +1597,7 @@ func runJavaScriptValueWithContext(snapshot *APIConfigSnapshot, requestContext *
 	}
 
 	// 全体の JavaScript コードを結合
-	fullJSCode := jsLibCode + htmlJS + paramsJS + string(jsCodeBytes)
+	fullJSCode := jsLibCode + htmlJS + string(jsCodeBytes)
 
 	// スクリプトを実行
 	value, err := runtime.RunString(fullJSCode)
@@ -3968,10 +3989,12 @@ func (loader *apiGraphLoader) readFile(path string) ([]byte, string, error) {
 	}
 	data, err := os.ReadFile(absPath)
 	if err != nil {
-		loader.states[identity] = APIFileState{Exists: false}
+		loader.states[absPath] = APIFileState{Exists: false}
 		return nil, identity, fmt.Errorf("read api file %s: %w", absPath, err)
 	}
-	loader.states[identity] = APIFileState{Exists: true, Hash: sha256.Sum256(data)}
+	// Watch the path used to read the file, including symlink replacements.
+	// The resolved identity is only used for include-cycle detection.
+	loader.states[absPath] = APIFileState{Exists: true, Hash: sha256.Sum256(data)}
 	return data, identity, nil
 }
 
@@ -4455,7 +4478,7 @@ func (runtime *scheduleRuntime) run() {
 		mcpDone()
 		result := ""
 		if err == nil {
-			result = value.String()
+			result, err = javaScriptValueString(value)
 		}
 		if err != nil {
 			logServiceError(slog.LevelError, "schedule_failed", err, "job", latest.name)
@@ -5608,6 +5631,7 @@ func handleMCPStdioToolCall(snapshot *APIConfigSnapshot, mcp EndpointConfig, req
 	var params struct {
 		Name      string                 `json:"name"`
 		Arguments map[string]interface{} `json:"arguments"`
+		Meta      map[string]interface{} `json:"_meta"`
 	}
 	if !decodeMCPParams(request.Params, &params) || params.Name == "" {
 		return mcpStdioError(request.ID, -32602, "Invalid params")
@@ -5665,22 +5689,10 @@ func executeMCPToolWithContext(snapshot *APIConfigSnapshot, requestContext *gin.
 	if err != nil {
 		return nil, "Tool execution failed."
 	}
-	var exported interface{}
-	if value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
-		exported = value.Export()
-	}
-	response, _, err := responseFromExportedJSValue(value, exported)
+	response, allowsPush, err := mcpResponseFromJSValue(value)
 	if err != nil {
 		return nil, "Tool returned invalid JSON."
 	}
-	if !hasHTTPResponseFields(exported) {
-		response.Body, err = json.Marshal(exported)
-		if err != nil {
-			return nil, "Tool returned invalid JSON."
-		}
-		response.ContentType = "application/json; charset=utf-8"
-	}
-	allowsPush := exportedResultAllowsPush(exported) && responseAllowsPush(response)
 	body := response.Body
 	if len(body) > maxMCPToolResultBytes {
 		return nil, "Tool result is too large."
@@ -5709,6 +5721,37 @@ func executeMCPToolWithContext(snapshot *APIConfigSnapshot, requestContext *gin.
 		performPushWithContext(snapshot, requestContext, backing, args)
 	}
 	return result, ""
+}
+
+func mcpResponseFromJSValue(value goja.Value) (response APIResponse, allowsPush bool, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if exception, ok := recovered.(*goja.Exception); ok {
+				response, allowsPush, err = APIResponse{}, false, exception
+			} else {
+				panic(recovered)
+			}
+		}
+	}()
+
+	// Export may invoke getters, and response conversion may invoke toString.
+	// Keep both inside the exception boundary before any Push side effects.
+	var exported interface{}
+	if value != nil && !goja.IsUndefined(value) && !goja.IsNull(value) {
+		exported = value.Export()
+	}
+	response, _, err = responseFromExportedJSValue(value, exported)
+	if err != nil {
+		return response, false, err
+	}
+	if !hasHTTPResponseFields(exported) {
+		response.Body, err = json.Marshal(exported)
+		if err != nil {
+			return response, false, err
+		}
+		response.ContentType = "application/json; charset=utf-8"
+	}
+	return response, exportedResultAllowsPush(exported) && responseAllowsPush(response), nil
 }
 
 func mcpCheckResult(check ParamCheckResponse) map[string]interface{} {
@@ -6689,7 +6732,8 @@ func (t *nyanMCPHTTP) RoundTrip(request *http.Request) (*http.Response, error) {
 			t.wire.setFailure(failure)
 		}
 	}
-	if strings.Contains(response.Header.Get("Content-Type"), "text/event-stream") {
+	mediaType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if mediaType == "text/event-stream" {
 		// SSE data fields can span lines; comments and notifications are not results.
 		var event strings.Builder
 		eventName := ""

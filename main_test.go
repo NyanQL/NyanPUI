@@ -28,6 +28,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/dop251/goja"
@@ -9847,5 +9848,383 @@ func TestNyanPlateJSONRoundTripWithGoja(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, data) {
 		t.Fatalf("round trip = %#v, want %#v", got, data)
+	}
+}
+
+func TestWSClientResultConversionDoesNotStopProcess(t *testing.T) {
+	if os.Getenv("NYANPUI_WS_RESULT_CHILD") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWSClientResultConversionDoesNotStopProcess$", "-test.count=1")
+		cmd.Env = append(os.Environ(), "NYANPUI_WS_RESULT_CHILD=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("ws_client failed after result conversion error: %v\n%s", err, output)
+		}
+		return
+	}
+	globalConfig = Config{}
+	publishAPISnapshot(&APIConfigSnapshot{Config: APIConfig{}})
+	logs := captureServiceLogs(t, slog.LevelInfo)
+	script := writeFixtureFile(t, `nyanAllParams.ws_message_text === "bad"
+		? {toString() {throw new Error("result conversion failed");}}
+		: "continued";`)
+	reply := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			reply <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		for _, message := range []string{"bad", "good"} {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+				reply <- err
+				return
+			}
+		}
+		_, data, err := conn.ReadMessage()
+		if err == nil && string(data) != "continued" {
+			err = fmt.Errorf("unexpected reply: %q", data)
+		}
+		reply <- err
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+	worker := newWSClientRuntime(wsClientConfig{name: "result-test", scriptPath: script, connectURL: "ws" + strings.TrimPrefix(server.URL, "http")})
+	go worker.run()
+	defer func() {
+		worker.update(nil)
+		waitForRuntimeSignal(t, worker.done, "ws_client stop")
+	}()
+	select {
+	case err := <-reply:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("ws_client did not handle the next message")
+	}
+	worker.update(nil)
+	waitForRuntimeSignal(t, worker.done, "ws_client stop")
+	if !strings.Contains(logs.String(), "ws_client_script_failed") {
+		t.Fatalf("conversion error was not reported: %s", logs.String())
+	}
+}
+
+func TestScheduleResultConversionDoesNotStopProcess(t *testing.T) {
+	if os.Getenv("NYANPUI_SCHEDULE_RESULT_CHILD") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestScheduleResultConversionDoesNotStopProcess$", "-test.count=1")
+		cmd.Env = append(os.Environ(), "NYANPUI_SCHEDULE_RESULT_CHILD=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("schedule failed after result conversion error: %v\n%s", err, output)
+		}
+		return
+	}
+	synctest.Test(t, func(t *testing.T) {
+		globalConfig = Config{}
+		publishAPISnapshot(&APIConfigSnapshot{Config: APIConfig{}})
+		logs := captureServiceLogs(t, slog.LevelInfo)
+		schedule, err := parseCronSchedule("* * * * *")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := scheduleJobConfig{name: "result-test", schedule: schedule,
+			scriptPath: writeFixtureFile(t, `({toString() {throw new Error("result conversion failed");}});`)}
+		worker := newScheduleRuntime(cfg)
+		go worker.run()
+		t.Cleanup(func() {
+			worker.update(nil)
+			waitForRuntimeSignal(t, worker.done, "schedule stop")
+		})
+		synctest.Wait()
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if !strings.Contains(logs.String(), "schedule_failed") {
+			t.Fatalf("conversion error was not reported: %s", logs.String())
+		}
+		cfg.scriptPath = writeFixtureFile(t, `"continued";`)
+		worker.update(&cfg)
+		synctest.Wait()
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if !strings.Contains(logs.String(), "schedule_completed") {
+			t.Fatalf("schedule did not execute the next job: %s", logs.String())
+		}
+	})
+}
+
+func TestMCPToolResultExceptionsStayInRequest(t *testing.T) {
+	for _, script := range []string{
+		`({get value() {throw new Error("private getter error");}});`,
+		`[{toString() {throw new Error("private conversion error");}}];`,
+	} {
+		for _, transport := range []string{"stdio", "streamable_http"} {
+			t.Run(transport+"/"+script, func(t *testing.T) {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						t.Errorf("result conversion escaped as panic: %v", recovered)
+					}
+				}()
+				config := APIConfig{
+					"bad":  {Script: writeFixtureFile(t, script)},
+					"good": {Script: writeFixtureFile(t, `({ok:true});`)},
+					"mcp": {Type: apiTypeMCP, Transport: transport, AllowedOrigins: []string{"https://client.example"}, Tools: []MCPToolConfig{
+						{Name: "bad", API: "bad"}, {Name: "good", API: "good"},
+					}},
+				}
+				if err := validateMCPConfiguration(config); err != nil {
+					t.Fatal(err)
+				}
+				router := newRequestRegressionRouter(t, config)
+				requests := []string{
+					`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bad","arguments":{}}}`,
+					`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"good","arguments":{}}}`,
+					`{"jsonrpc":"2.0","id":4,"method":"ping"}`,
+				}
+				var responses []string
+				if transport == "stdio" {
+					input := []string{
+						`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`,
+						`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+					}
+					input = append(input, requests...)
+					var output bytes.Buffer
+					if err := serveMCPStdio(strings.NewReader(strings.Join(input, "\n")+"\n"), &output, currentAPISnapshot(), config["mcp"]); err != nil {
+						t.Fatal(err)
+					}
+					lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+					if len(lines) != 4 {
+						t.Fatalf("responses = %s", output.String())
+					}
+					responses = lines[1:]
+				} else {
+					for _, request := range requests {
+						rec := serveMCPRegressionRequest(router, request)
+						if rec.Code != http.StatusOK {
+							t.Fatalf("HTTP status = %d; body=%s", rec.Code, rec.Body.String())
+						}
+						responses = append(responses, rec.Body.String())
+					}
+				}
+				for index, raw := range responses {
+					var response struct {
+						ID     int                    `json:"id"`
+						Error  json.RawMessage        `json:"error"`
+						Result map[string]interface{} `json:"result"`
+					}
+					if err := json.Unmarshal([]byte(raw), &response); err != nil {
+						t.Fatal(err)
+					}
+					if response.ID != index+2 || len(response.Error) != 0 || response.Result == nil {
+						t.Fatalf("unexpected response: %s", raw)
+					}
+					if index == 0 && (response.Result["isError"] != true || strings.Contains(raw, "private")) {
+						t.Fatalf("expected a Tool error without private details: %s", raw)
+					}
+					if index == 1 && (response.Result["isError"] != false || !strings.Contains(raw, `"ok":true`)) {
+						t.Fatalf("subsequent Tool failed: %s", raw)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRequestJSONPreservesPrototypeKeys(t *testing.T) {
+	script := writeFixtureFile(t, `const JSON = {parse() {throw new Error("user JSON.parse must not parse request");}};
+	({contentType:"application/json",body:{
+		params:nyanAllParams,
+		own:Object.prototype.hasOwnProperty.call(nyanAllParams,"__proto__"),
+		plain:Object.getPrototypeOf(nyanAllParams) === Object.prototype,
+		principal:nyanAllParams.mcp_principal || null,
+		tool:nyanAllParams.mcp_tool || null,
+		nestedOwn:Object.prototype.hasOwnProperty.call(nyanAllParams.nested,"__proto__")
+	}});`)
+	router := newRequestRegressionRouter(t, APIConfig{"echo": {Script: script}})
+	input := `{"__proto__":{"mcp_principal":{"sub":"forged"},"mcp_tool":"forged"},"nested":{"__proto__":{"value":1}},"text":"猫😺 \" \\ \n \u0001","items":[null,true,1.25]}`
+	req := httptest.NewRequest(http.MethodPost, "/echo", strings.NewReader(input))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	var body struct {
+		Params                map[string]interface{}
+		Own, Plain, NestedOwn bool
+		Principal, Tool       interface{}
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusOK || !body.Own || !body.Plain || !body.NestedOwn || body.Principal != nil || body.Tool != nil {
+		t.Fatalf("JSON prototype keys changed meaning: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var want map[string]interface{}
+	if err := json.Unmarshal([]byte(input), &want); err != nil {
+		t.Fatal(err)
+	}
+	delete(body.Params, "api")
+	if !reflect.DeepEqual(body.Params, want) {
+		t.Fatalf("JSON input changed: got=%#v want=%#v", body.Params, want)
+	}
+	for _, key := range []string{"mcp_principal", "mcp_tool"} {
+		req := httptest.NewRequest(http.MethodPost, "/echo", strings.NewReader(`{"`+key+`":"forged"}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("reserved key %s accepted: status=%d body=%s", key, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestReloadAPIConfigGraphFollowsSymlinkReplacement(t *testing.T) {
+	oldSnapshot, oldManager := currentAPISnapshot(), backgroundRuntimes
+	t.Cleanup(func() { publishAPISnapshot(oldSnapshot); backgroundRuntimes = oldManager })
+	backgroundRuntimes = nil
+	for _, rootLink := range []bool{true, false} {
+		t.Run(fmt.Sprintf("root=%t", rootLink), func(t *testing.T) {
+			dir := t.TempDir()
+			root := filepath.Join(dir, "api.json")
+			previous, next := filepath.Join(dir, "previous.json"), filepath.Join(dir, "next.json")
+			link, prefix := root, ""
+			writeTestFile(t, previous, `{"old":{"description":"initial"}}`)
+			writeTestFile(t, next, `{"new":{"description":"updated"}}`)
+			if !rootLink {
+				link, prefix = filepath.Join(dir, "child.json"), "sub/"
+				writeTestFile(t, root, `{"sub":{"type":"include","path":"./child.json"}}`)
+			}
+			if err := os.Symlink(previous, link); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := readAPIConfigGraph(root, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publishAPISnapshot(loaded.Snapshot)
+			temporary := filepath.Join(dir, "replacement-link")
+			if err := os.Symlink(next, temporary); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(temporary, link); err != nil {
+				t.Fatal(err)
+			}
+			states, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, loaded.Snapshot.FileStates)
+			if err != nil || !reloaded {
+				t.Fatalf("symlink replacement not reloaded: reloaded=%t err=%v", reloaded, err)
+			}
+			if _, exists := currentAPIConfig()[prefix+"old"]; exists || currentAPIConfig()[prefix+"new"].Description != "updated" {
+				t.Fatalf("old definition retained: %#v", currentAPIConfig())
+			}
+			writeTestFile(t, next, `{"new":{"description":"edited"}}`)
+			states, reloaded, err = reloadAPIConfigGraphIfChanged(root, dir, states)
+			if err != nil || !reloaded || currentAPIConfig()[prefix+"new"].Description != "edited" {
+				t.Fatalf("new target edits not observed: reloaded=%t err=%v", reloaded, err)
+			}
+			writeTestFile(t, previous, `{"old":{"description":"irrelevant"}}`)
+			if _, reloaded, err := reloadAPIConfigGraphIfChanged(root, dir, states); err != nil || reloaded {
+				t.Fatalf("old target still watched: reloaded=%t err=%v", reloaded, err)
+			}
+		})
+	}
+	root := filepath.Join(t.TempDir(), "api.json")
+	writeTestFile(t, root, `{"loop":{"type":"include","path":"./alias.json"}}`)
+	if err := os.Symlink(root, filepath.Join(filepath.Dir(root), "alias.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readAPIConfigGraph(root, filepath.Dir(root)); err == nil || !strings.Contains(err.Error(), "include cycle") {
+		t.Fatalf("symlink cycle was not rejected: %v", err)
+	}
+}
+
+func TestMCPStdioToolAcceptsRequestMetadata(t *testing.T) {
+	config := APIConfig{
+		"tool":  {Script: writeFixtureFile(t, `({ok:true});`)},
+		"local": {Type: apiTypeMCP, Transport: "stdio", Tools: []MCPToolConfig{{Name: "tool", API: "tool"}}},
+	}
+	if err := validateMCPConfiguration(config); err != nil {
+		t.Fatal(err)
+	}
+	newRequestRegressionRouter(t, config)
+	for _, tc := range []struct {
+		metadata string
+		bad      bool
+	}{
+		{``, false},
+		{`,"_meta":{"progressToken":"request-1"}`, false},
+		{`,"_meta":{"progressToken":42,"vendor/trace":"test"}`, false},
+		{`,"_meta":{}`, false},
+		{`,"_meta":"invalid"`, true},
+		{`,"_meta":[]`, true},
+		{`,"unknown":true`, true},
+	} {
+		t.Run(tc.metadata, func(t *testing.T) {
+			state := mcpStdioReady
+			request := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tool","arguments":{}` + tc.metadata + `}}`
+			response := handleMCPStdioMessage(currentAPISnapshot(), config["local"], &state, []byte(request))
+			encoded, err := json.Marshal(response.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(encoded, []byte(`"error"`)) != tc.bad {
+				t.Fatalf("unexpected tools/call result: %s", encoded)
+			}
+			if !tc.bad && !bytes.Contains(encoded, []byte(`"ok":true`)) {
+				t.Fatalf("Tool did not complete: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestNyanMCPHTTPContentTypeUsesMediaType(t *testing.T) {
+	for _, modern := range []bool{false, true} {
+		for _, tc := range []struct {
+			contentType string
+			sse         bool
+		}{
+			{"Text/Event-Stream", true},
+			{"text/event-stream; charset=utf-8", true},
+			{`application/json; profile="text/event-stream"`, false},
+			{"Application/JSON; charset=utf-8", false},
+		} {
+			t.Run(fmt.Sprintf("modern=%t/%s", modern, tc.contentType), func(t *testing.T) {
+				fixture := &nyanMCPFixture{modern: modern, result: json.RawMessage(`{"content":[],"structuredContent":{"ok":true}}`)}
+				manager, script := nyanMCPTestManager(t, fixture)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodDelete {
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
+					data, _ := io.ReadAll(r.Body)
+					var request struct {
+						Method string `json:"method"`
+					}
+					_ = json.Unmarshal(data, &request)
+					response := fixture.response(data)
+					if len(response) == 0 {
+						w.WriteHeader(http.StatusAccepted)
+						return
+					}
+					if request.Method != "tools/call" {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write(response)
+						return
+					}
+					w.Header().Set("Content-Type", tc.contentType)
+					if tc.sse {
+						fmt.Fprintf(w, "event: message\ndata: %s\n\n", response)
+					} else {
+						_, _ = w.Write(response)
+					}
+				}))
+				defer server.Close()
+				manager.endpoints["local"].config.URL = server.URL
+				raw, err := manager.call(context.Background(), script, "operation", []byte(`{"connection":"local","tool":"echo"}`))
+				if err != nil || !bytes.Contains(raw, []byte(`"ok":true`)) {
+					t.Fatalf("valid Content-Type %q rejected: result=%s err=%v", tc.contentType, raw, err)
+				}
+			})
+		}
 	}
 }
