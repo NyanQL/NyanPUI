@@ -256,6 +256,7 @@ type Config struct {
 	Log                    LogConfig           `json:"log"`
 	APIHotReload           APIHotReloadConfig  `json:"APIHotReload"`
 	OAuthStateRoot         string              `json:"oauth_state_directory"`
+	MCPClient              *nyanMCPConfig      `json:"mcpClient,omitempty"`
 	// Prepared before serving requests; source text is immutable until restart.
 	cachedJavaScriptIncludes *string
 }
@@ -863,12 +864,6 @@ func closeServerWebSocket(endpoint string, conn *serverWebSocket) {
 
 // main はメイン関数です。
 func main() {
-	var mcpConfigErr error
-	nyanMCPClient, mcpConfigErr = loadNyanMCPConfig(os.Getenv("NYAN_MCP_CONFIG"))
-	if mcpConfigErr != nil {
-		fatalServiceError("mcp_client_config_failed", mcpConfigErr)
-	}
-	watchNyanMCPShutdown(nyanMCPClient)
 	// stdout is reserved for MCP protocol responses, including during startup.
 	log.SetOutput(os.Stderr)
 	log.SetFlags(0)
@@ -899,6 +894,11 @@ func main() {
 	if err := setupLogger(configBaseDir); err != nil {
 		fatalServiceError("log_level_invalid", err)
 	}
+	nyanMCPClient, err = loadNyanMCPConfig(globalConfig.MCPClient)
+	if err != nil {
+		fatalServiceError("mcp_client_config_failed", err)
+	}
+	watchNyanMCPShutdown(nyanMCPClient)
 	if err := globalConfig.prepareJavaScriptIncludes(exeDir); err != nil {
 		fatalServiceError("javascript_include_load_failed", err)
 	}
@@ -6230,7 +6230,7 @@ func receiveLimitMiddleware() gin.HandlerFunc {
 	}
 }
 
-// BEGIN shared nyanCallMCP contract. Keep this block identical in all three products.
+// BEGIN shared nyanCallMCP contract. Review contract changes across products.
 // SDK v1.7.0 owns protocol negotiation; raw responses are retained at the wire
 // boundary because typed SDK results can omit extension fields and explicit null.
 type nyanMCPToolPolicy struct {
@@ -6260,6 +6260,21 @@ type nyanMCPConnectionConfig struct {
 type nyanMCPConfig struct {
 	Connections map[string]nyanMCPConnectionConfig `json:"connections"`
 }
+
+// Validate the MCP section strictly without changing the decoding rules for
+// unrelated config.json settings. The limit applies only to this section.
+func (cfg *nyanMCPConfig) UnmarshalJSON(data []byte) error {
+	type configValue nyanMCPConfig
+	var value configValue
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if len(data) > 1<<20 || dec.Decode(&value) != nil || dec.Decode(new(any)) != io.EOF || value.Connections == nil || len(value.Connections) > 64 {
+		return errors.New("invalid config.json mcpClient; see README.md#nyancallmcp")
+	}
+	*cfg = nyanMCPConfig(value)
+	return nil
+}
+
 type nyanMCPEndpoint struct {
 	config   nyanMCPConnectionConfig
 	slots    chan struct{}
@@ -6328,28 +6343,16 @@ func nyanMCPFailure(code string) *nyanMCPError {
 	return &nyanMCPError{Code: code, ExecutionState: "not_sent"}
 }
 
-func loadNyanMCPConfig(path string) (*nyanMCPManager, error) {
+func loadNyanMCPConfig(cfg *nyanMCPConfig) (*nyanMCPManager, error) {
 	manager := newNyanMCPManager()
-	if path == "" {
+	if cfg == nil {
 		return manager, nil
 	}
-	fail := func() (*nyanMCPManager, error) { return nil, errors.New("invalid NYAN_MCP_CONFIG; see NYANCALLMCP.md") }
-	if !filepath.IsAbs(path) {
-		return fail()
+	fail := func() (*nyanMCPManager, error) {
+		manager.cancel()
+		return nil, errors.New("invalid config.json mcpClient; see README.md#nyancallmcp")
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return fail()
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
-	if err != nil || len(data) > 1<<20 {
-		return fail()
-	}
-	var cfg nyanMCPConfig
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if dec.Decode(&cfg) != nil || dec.Decode(new(any)) != io.EOF || cfg.Connections == nil || len(cfg.Connections) > 64 {
+	if cfg.Connections == nil || len(cfg.Connections) > 64 {
 		return fail()
 	}
 	for id, c := range cfg.Connections {
@@ -6599,10 +6602,11 @@ func (w *nyanMCPWire) classify(ctx context.Context, err error) *nyanMCPError {
 }
 
 type nyanMCPHTTP struct {
-	base     *http.Transport
-	endpoint *nyanMCPEndpoint
-	wire     *nyanMCPWire
-	token    string
+	base        *http.Transport
+	endpoint    *nyanMCPEndpoint
+	wire        *nyanMCPWire
+	token       string
+	callContext context.Context
 }
 
 func (t *nyanMCPHTTP) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -6610,8 +6614,18 @@ func (t *nyanMCPHTTP) RoundTrip(request *http.Request) (*http.Response, error) {
 	if request.URL.Scheme != target.Scheme || request.URL.Host != target.Host || request.URL.EscapedPath() != target.EscapedPath() || request.URL.RawQuery != "" {
 		return nil, nyanMCPFailure("TRANSPORT")
 	}
+	// The SDK detaches session-close DELETE requests from the Connect context.
+	// Bind every exchange, including response-body reads, to the whole call while
+	// retaining the SDK request's context values and its own cancellation.
+	ctx, cancel := context.WithCancel(request.Context())
+	defer cancel()
+	stopCallCancel := context.AfterFunc(t.callContext, cancel)
+	defer stopCallCancel()
+	if err := t.callContext.Err(); err != nil {
+		return nil, err
+	}
 	// SDK builds all requests. Ignore environment proxies and never forward inbound headers.
-	request = request.Clone(request.Context())
+	request = request.Clone(ctx)
 	if request.GetBody != nil {
 		body, err := request.GetBody()
 		if err != nil {
@@ -6788,7 +6802,7 @@ func (e *nyanMCPEndpoint) transport(ctx context.Context, wire *nyanMCPWire) (mcp
 			// Dial the verified literal IP, avoiding a second DNS lookup (rebinding).
 			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 		}
-		client := &http.Client{Transport: &nyanMCPHTTP{base: base, endpoint: e, wire: wire, token: token}, Timeout: time.Duration(c.MaxTimeoutMs) * time.Millisecond, CheckRedirect: func(*http.Request, []*http.Request) error { return nyanMCPFailure("TRANSPORT") }}
+		client := &http.Client{Transport: &nyanMCPHTTP{base: base, endpoint: e, wire: wire, token: token, callContext: ctx}, Timeout: time.Duration(c.MaxTimeoutMs) * time.Millisecond, CheckRedirect: func(*http.Request, []*http.Request) error { return nyanMCPFailure("TRANSPORT") }}
 		return &mcpsdk.StreamableClientTransport{Endpoint: c.URL, HTTPClient: client, MaxRetries: -1, DisableStandaloneSSE: true}, base.CloseIdleConnections, nil
 	}
 	cmd := exec.CommandContext(ctx, c.Executable, c.Args...)
