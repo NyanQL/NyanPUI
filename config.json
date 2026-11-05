@@ -10,6 +10,10 @@
     "./javascript/lib/nyanPlate.js",
     "./javascript/lib/nyanPlateToJson.js"
   ],
+  "javascript_include_cache": false,
+  "mcpClient": {
+    "connections": {}
+  },
   "log": {
     "Filename": "./logs/nyanpui.log",
     "MaxSize": 5,
