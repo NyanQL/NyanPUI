@@ -263,6 +263,8 @@ MCPのHTTP endpointでは、本文の読み取り前にOrigin検証・レート�
 
 Nyan8・NyanQLと同じく、ログは1行1件のJSON形式で出力します。`time`、`level`、`msg`（処理名）と、処理に応じた項目を記録します。起動時の設定読み込みエラーも標準エラーへ出力し、標準出力はログには使いません。MCPのstdioモードでは標準出力をJSON-RPC応答専用に保ちます。ファイル出力時はアプリケーション・エラーのログが同じローテーション設定を使用し、再起動時にも既存ログを保持します。起動ログは `starting` イベントに `binary_version`、`go_version`、`config_version` を、MCP開始・終了ログは `api` にサーバーの定義名を記録します。
 
+ログ設定を読み込む前の起動失敗では、`debug` を指定できない場合も診断できるよう、`reason` と対象の `file`、取得できる場合はJSONのバイト位置 `offset`・型不一致の `field` / `expected_type` を記録します。設定値やコマンドライン引数の全文は記録しません。
+
 通常の `info` では、起動、設定変更、ジョブ完了、接続状態、警告、エラーを記録します。ジョブ結果は本文ではなく `result_bytes`（結果文字列のバイト数）を記録します。WebSocket接続先は資格情報・パス・クエリ・フラグメントを除いたschemeとhostだけを記録します。リクエスト・WebSocket・Pushの本文、API設定全体、JavaScript全文は自動出力しません。
 
 Nyan8・NyanQLと同じく、全リクエストのURL・ステータス・処理時間を記録するHTTPアクセスログは出力しません。panic時もリクエストのダンプは出力しません。TLSハンドシェイク失敗などHTTPサーバー内部のエラーは、Nyan8と同じ `http_server_error` イベントとしてJSONで記録し、詳細文字列は `debug` 時だけ出力します。
@@ -1467,7 +1469,7 @@ const data = result.structuredContent;
 - `allowHTTP:true`: 管理者がHTTPを明示許可する場合のみ。ローカル試験例以外ではHTTPSを使用してください。
 - `allowedCIDRs`: 省略時は公開宛先のみ。設定すると**そのCIDRに含まれるIPだけ**に接続します。loopback/privateネットワークには明示許可が必要です。metadata/link-local/unspecified/multicastはCIDRで許可しても拒否します。
 - DNSの全解決結果を検証し、そのIPへ直接接続するため検証後に再解決しません。TLS検証は有効。redirect・環境proxyは使いません。ブラウザーから受けたAuthorization/Cookieを転送しません。
-- `bearerTokenFile`: 任意。絶対パスの通常ファイルでowner以外の権限がないもの（例0600）。最大8 KiB、1行の既存トークンを参照します。呼出しごとに再読込するので次回呼出しから更新が有効です。設定例に実トークンを書かないでください。
+- `bearerTokenFile`: 任意。絶対パスの通常ファイル。Unixではowner以外の権限がないもの（例0600）を要求します。WindowsではGoの権限ビットからACLを判定できないため、管理者がACLでアクセスを制限してください（アプリはACLを検証しません）。`environmentFiles` にも同じ規則を適用します。最大8 KiB、1行の既存トークンを参照します。呼出しごとに再読込するので次回呼出しから更新が有効です。設定例に実トークンを書かないでください。
 - JSONとSSEの応答に対応。初期版はSSEの応答ストリーム完了までバッファし、進捗UIは提供しません。展開後の応答全体に上限を適用します。永続GET/SSE、再接続、旧HTTP+SSE transportは使いません。
 
 #### stdio
@@ -1511,7 +1513,7 @@ const data = result.structuredContent;
 }
 ```
 
-- `executable`: 管理者管理の実行可能ファイルの絶対パス。通常ファイル・group/other書込不可。symlinkは起動時に固定します。
+- `executable`: 管理者管理の実行可能ファイルの絶対パス。Unixでは通常ファイル・実行権限あり・group/other書込不可を要求します。Windowsでは通常ファイルの `.exe` に限定し、管理者がACLで書き込みを制限してください（アプリはACLを検証しません）。symlinkは起動時に固定します。
 - `args`: 固定引数のみ（最大64）。`directory`: 固定した絶対作業ディレクトリ。
 - shell・パッケージrunner・主要な汎用インタープリターを実行対象に指定できません。シェル文字列を組み立てません。
 - 親プロセスの環境変数を引き継ぎません。`environmentFiles` は環境変数名→秘密ファイルの絶対パス。必要な値だけを設定し、PATH/HOME/LD_*/DYLD_*などを拒否します。

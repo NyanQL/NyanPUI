@@ -871,13 +871,13 @@ func main() {
 	// 実行ファイルのディレクトリを取得
 	exePath, err := os.Executable()
 	if err != nil {
-		fatalServiceError("executable_path_failed", err)
+		fatalStartupError("executable_path_failed", err, "")
 	}
 	exeDir := filepath.Dir(exePath)
 
 	options, err := resolveStartupOptions(exeDir, os.Args[1:])
 	if err != nil {
-		fatalServiceError("startup_options_failed", err)
+		fatalStartupError("startup_options_failed", err, "")
 	}
 	paths := options.Paths
 	mcpStdio := options.MCPServer != ""
@@ -885,14 +885,14 @@ func main() {
 	// システム設定をロード
 	config, err := loadConfig(paths.Config.Path)
 	if err != nil {
-		fatalServiceError("config_load_failed", err)
+		fatalStartupError("config_load_failed", err, paths.Config.Path)
 	}
 	configBaseDir := filepath.Dir(paths.Config.Path)
 	apiBaseDir := filepath.Dir(paths.API.Path)
 	adjustConfigPaths(configBaseDir, &config)
 	globalConfig = config
 	if err := setupLogger(configBaseDir); err != nil {
-		fatalServiceError("log_level_invalid", err)
+		fatalStartupError("log_level_invalid", err, paths.Config.Path)
 	}
 	nyanMCPClient, err = loadNyanMCPConfig(globalConfig.MCPClient)
 	if err != nil {
@@ -1074,12 +1074,12 @@ func resolveExistingServiceFilePath(pathValue, label, source string) (string, er
 	info, err := os.Stat(resolvedPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("%s file not found: %s (source: %s)", label, resolvedPath, source)
+			return "", fmt.Errorf("%s file not found: %s (source: %s): %w", label, resolvedPath, source, err)
 		}
 		return "", fmt.Errorf("%s file cannot be accessed: %s (source: %s): %w", label, resolvedPath, source, err)
 	}
 	if info.IsDir() {
-		return "", fmt.Errorf("%s file is a directory: %s (source: %s)", label, resolvedPath, source)
+		return "", fmt.Errorf("%s file is a directory: %s (source: %s): %w", label, resolvedPath, source, &os.PathError{Op: "stat", Path: resolvedPath, Err: errors.New("path is a directory")})
 	}
 	return resolvedPath, nil
 }
@@ -2667,6 +2667,37 @@ func logServiceError(level slog.Level, event string, err error, fields ...interf
 func fatalServiceError(event string, err error, fields ...interface{}) {
 	logServiceError(slog.LevelError, event, err, fields...)
 	os.Exit(1)
+}
+
+// Bootstrap failures happen before log.Level can be read. Keep actionable
+// diagnostics on stderr without logging configuration values or command args.
+func fatalStartupError(event string, err error, file string) {
+	fields := []interface{}{}
+	reason := err.Error()
+	var pathError *os.PathError
+	var syntaxError *json.SyntaxError
+	var typeError *json.UnmarshalTypeError
+	switch {
+	case errors.As(err, &pathError):
+		if file == "" {
+			file = pathError.Path
+		}
+		reason = pathError.Err.Error()
+		fields = append(fields, "operation", pathError.Op)
+	case errors.As(err, &syntaxError):
+		reason = "invalid JSON"
+		fields = append(fields, "offset", syntaxError.Offset)
+	case errors.As(err, &typeError):
+		reason = "invalid configuration type"
+		fields = append(fields, "field", typeError.Field, "expected_type", typeError.Type.String(), "offset", typeError.Offset)
+	case event == "startup_options_failed":
+		reason = "invalid startup options; use --api PATH --config PATH [--mcp-server NAME]"
+	}
+	if file != "" {
+		fields = append(fields, "file", file)
+	}
+	fields = append(fields, "reason", boundedLogText(reason))
+	fatalServiceError(event, err, fields...)
 }
 
 func logWebSocketDisconnect(event, name string, err error) {
@@ -6473,11 +6504,7 @@ func loadNyanMCPConfig(cfg *nyanMCPConfig) (*nyanMCPManager, error) {
 			}
 			c.Executable = executable
 			info, err := os.Stat(executable)
-			if err != nil || !info.Mode().IsRegular() || info.Mode()&0111 == 0 || info.Mode().Perm()&0022 != 0 {
-				return fail()
-			}
-			switch strings.ToLower(filepath.Base(executable)) {
-			case "sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "pwsh", "npx", "npm", "yarn", "pnpm", "go", "python", "python3", "node", "ruby", "perl", "env", "osascript":
+			if err != nil || !nyanMCPExecutableAllowed(executable, info.Mode(), runtime.GOOS) {
 				return fail()
 			}
 			if info, err := os.Stat(c.Directory); err != nil || !info.IsDir() {
@@ -6503,6 +6530,34 @@ func loadNyanMCPConfig(cfg *nyanMCPConfig) (*nyanMCPManager, error) {
 	return manager, nil
 }
 
+func nyanMCPExecutableAllowed(path string, mode os.FileMode, goos string) bool {
+	if !mode.IsRegular() {
+		return false
+	}
+	name := strings.ToLower(filepath.Base(path))
+	if goos == "windows" {
+		// Windows exposes 0444/0666, not POSIX permissions or ACLs. Require a
+		// native executable; administrators must protect it with Windows ACLs.
+		if !strings.HasSuffix(name, ".exe") {
+			return false
+		}
+		name = strings.TrimSuffix(name, ".exe")
+	} else if mode&0111 == 0 || mode.Perm()&0022 != 0 {
+		return false
+	}
+	switch name {
+	case "sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "pwsh", "npx", "npm", "yarn", "pnpm", "go", "python", "python3", "node", "ruby", "perl", "env", "osascript":
+		return false
+	}
+	return true
+}
+
+func nyanMCPSecretFileAllowed(mode os.FileMode, goos string) bool {
+	// As with OAuth state, Windows ACLs are managed by the administrator;
+	// os.FileMode does not describe them, even after os.Chmod(0600).
+	return mode.IsRegular() && (goos == "windows" || mode.Perm()&0077 == 0)
+}
+
 func nyanMCPSecret(path string) (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", nyanMCPFailure("AUTH_REQUIRED")
@@ -6513,7 +6568,7 @@ func nyanMCPSecret(path string) (string, error) {
 	}
 	defer f.Close()
 	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+	if err != nil || !nyanMCPSecretFileAllowed(info.Mode(), runtime.GOOS) {
 		return "", nyanMCPFailure("AUTH_REQUIRED")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, 8193))

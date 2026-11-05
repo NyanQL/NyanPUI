@@ -4449,22 +4449,37 @@ func TestHTTPProcessLogging(t *testing.T) {
 
 func TestStartupLoggingFailuresStayOffStdout(t *testing.T) {
 	for _, tc := range []struct {
-		name, config, event string
+		name, config, event, reason string
+		args                        []string
 	}{
-		{"missing_config", "", "startup_options_failed"},
-		{"invalid_json", `{"log":`, "config_load_failed"},
-		{"invalid_level", `{"log":{"Level":"verbose"}}`, "log_level_invalid"},
+		{name: "missing_config", event: "startup_options_failed"},
+		{name: "config_directory", event: "startup_options_failed", reason: "path is a directory"},
+		{name: "missing_api", config: `{"log":{"Level":"debug"}}`, event: "startup_options_failed"},
+		{name: "invalid_json", config: `{"name":"private-config-value","log":`, event: "config_load_failed", reason: "invalid JSON"},
+		{name: "invalid_type", config: `{"Port":"private-config-value"}`, event: "config_load_failed", reason: "invalid configuration type"},
+		{name: "invalid_duration", config: `{"httpTimeouts":{"readTimeout":"private-config-value"}}`, event: "config_load_failed", reason: "httpTimeouts requires a non-negative duration such as 30s or 20m"},
+		{name: "invalid_level", config: `{"log":{"Level":"private-config-value"}}`, event: "log_level_invalid", reason: "log.Level must be debug, info, warn, or error"},
+		{name: "unknown_flag", config: `{}`, event: "startup_options_failed", reason: "invalid startup options", args: []string{"--private-argument=value"}},
+		{name: "positional_argument", config: `{}`, event: "startup_options_failed", reason: "invalid startup options", args: []string{"private-argument"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			configPath, apiPath := filepath.Join(dir, "config.json"), filepath.Join(dir, "api.json")
-			writeLoggingFile(t, apiPath, `{}`)
+			if tc.name != "missing_api" {
+				writeLoggingFile(t, apiPath, `{}`)
+			}
+			if tc.name == "config_directory" {
+				if err := os.Mkdir(configPath, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if tc.config != "" {
 				writeLoggingFile(t, configPath, tc.config)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMCPStdioLoggingHelper$", "--", "--config", configPath, "--api", apiPath)
+			args := append([]string{"-test.run=^TestMCPStdioLoggingHelper$", "--", "--config", configPath, "--api", apiPath}, tc.args...)
+			cmd := exec.CommandContext(ctx, os.Args[0], args...)
 			cmd.Env = append(os.Environ(), "NYANPUI_TEST_STDIO_LOGGING_CHILD=1")
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -4479,6 +4494,28 @@ func TestStartupLoggingFailuresStayOffStdout(t *testing.T) {
 			record := decodeLogObject(t, bytes.TrimSpace(stderr.Bytes()))
 			if record["level"] != "ERROR" || record["msg"] != tc.event {
 				t.Fatalf("unexpected startup error: %#v; want event %q", record, tc.event)
+			}
+			reason, _ := record["reason"].(string)
+			if reason == "" || !strings.Contains(reason, tc.reason) {
+				t.Fatalf("missing startup reason %q: %#v", tc.reason, record)
+			}
+			if len(tc.args) == 0 {
+				wantFile := configPath
+				if tc.name == "missing_api" {
+					wantFile = apiPath
+				}
+				if record["file"] != wantFile {
+					t.Fatalf("missing failing file %q: %#v", wantFile, record)
+				}
+			}
+			if (tc.name == "invalid_json" || tc.name == "invalid_type") && record["offset"] == nil {
+				t.Fatalf("missing JSON error location: %#v", record)
+			}
+			if tc.name == "invalid_type" && (record["field"] != "Port" || record["expected_type"] != "int") {
+				t.Fatalf("missing field/type diagnostic: %#v", record)
+			}
+			if strings.Contains(stderr.String(), "private-") || record["error_detail"] != nil {
+				t.Fatalf("startup log exposed configuration or arguments: %s", stderr.String())
 			}
 		})
 	}
@@ -8666,7 +8703,14 @@ func TestMCPClientConfig(t *testing.T) {
 
 func TestMCPClientConfigStartup(t *testing.T) {
 	f := &nyanMCPFixture{result: json.RawMessage(`{"content":[],"structuredContent":{"source":"config.json"}}`)}
-	server := httptest.NewServer(http.HandlerFunc(f.serve))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer startup-test-token" {
+			t.Error("MCP request is missing the configured bearer token")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		f.serve(w, r)
+	}))
 	defer server.Close()
 	dir := t.TempDir()
 	script := filepath.Join(dir, "caller.js")
@@ -8674,6 +8718,8 @@ func TestMCPClientConfigStartup(t *testing.T) {
 	apiPath := filepath.Join(dir, "api.json")
 	writeTestFile(t, apiPath, `{"caller":{"script":"./caller.js"},"local_mcp":{"type":"mcp","transport":"stdio","tools":["caller"]}}`)
 	connection := nyanMCPConnectionConfig{Transport: "streamable_http", URL: server.URL, AllowHTTP: true, AllowedCIDRs: []string{"127.0.0.0/8", "::1/128"}, CredentialMode: "service", AllowedScripts: []string{script}, Tools: map[string]nyanMCPToolPolicy{"echo": {ReadOnly: true}}, ProtocolVersions: []string{"2025-06-18"}, MaxResultBytes: 1 << 20}
+	connection.BearerTokenFile = filepath.Join(dir, "token")
+	writeLoggingFile(t, connection.BearerTokenFile, "startup-test-token\n")
 	for _, tc := range []struct {
 		name    string
 		enabled bool
@@ -9084,9 +9130,7 @@ func TestNyanMCPStdioHelper(t *testing.T) {
 	os.Exit(0)
 }
 func TestNyanMCPStdio(t *testing.T) {
-	f := &nyanMCPFixture{}
-	manager, script := nyanMCPTestManager(t, f)
-	ep := manager.endpoints["local"]
+	script := writeFixtureFile(t, "0")
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -9095,11 +9139,18 @@ func TestNyanMCPStdio(t *testing.T) {
 	if err := os.WriteFile(secret, []byte("1"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	ep.config.Transport = "stdio"
-	ep.config.Executable = exe
-	ep.config.Args = []string{"-test.run=^TestNyanMCPStdioHelper$"}
-	ep.config.Directory = t.TempDir()
-	ep.config.EnvironmentFiles = map[string]string{"NYAN_MCP_TEST_CHILD": secret}
+	// Exercise startup validation as well as child I/O; directly replacing an
+	// HTTP endpoint's config used to hide Windows file-mode validation failures.
+	manager, err := loadNyanMCPConfig(&nyanMCPConfig{Connections: map[string]nyanMCPConnectionConfig{"local": {
+		Transport: "stdio", Executable: exe, Args: []string{"-test.run=^TestNyanMCPStdioHelper$"},
+		Directory: t.TempDir(), EnvironmentFiles: map[string]string{"NYAN_MCP_TEST_CHILD": secret},
+		CredentialMode: "service", AllowedScripts: []string{script}, Tools: map[string]nyanMCPToolPolicy{"echo": {ReadOnly: true}},
+		ProtocolVersions: []string{"2025-06-18"},
+	}}})
+	if err != nil {
+		t.Fatalf("stdio startup validation failed: %v", err)
+	}
+	t.Cleanup(manager.cancel)
 	vm := nyanMCPTestVM(manager, context.Background(), script, "operation")
 	value, err := vm.RunString(`nyanCallMCP({connection:'local',tool:'echo'}).content[0].text`)
 	if err != nil || value.String() != "stdio" {
@@ -9121,13 +9172,68 @@ func TestNyanMCPSecurityHelpers(t *testing.T) {
 	}
 	secret := filepath.Join(t.TempDir(), "secret")
 	_ = os.WriteFile(secret, []byte("secret"), 0644)
-	if _, err := nyanMCPSecret(secret); err == nil {
-		t.Fatal("world readable credential accepted")
+	if _, err := nyanMCPSecret(secret); (err != nil) != (runtime.GOOS != "windows") {
+		t.Fatalf("credential permission check on %s: %v", runtime.GOOS, err)
 	}
 	path := filepath.Join(t.TempDir(), "config.json")
 	_ = os.WriteFile(path, []byte(`{"mcpClient":{"connections":{},"unknown":true}}`), 0600)
 	if _, err := loadConfig(path); err == nil {
 		t.Fatal("unknown config field accepted")
+	}
+}
+
+func TestNyanMCPPlatformFileValidation(t *testing.T) {
+	for _, goos := range []string{"windows", "linux", "darwin"} {
+		t.Run(goos, func(t *testing.T) {
+			for _, tc := range []struct {
+				name      string
+				mode      os.FileMode
+				windowsOK bool
+				unixOK    bool
+			}{
+				{"inventory.exe", 0666, true, false},
+				{"inventory.EXE", 0444, true, false},
+				{"inventory.exe", 0755, true, true},
+				{"inventory", 0755, false, true},
+				{"inventory.exe", os.ModeDir | 0777, false, false},
+				{"inventory.exe", os.ModeNamedPipe | 0600, false, false},
+				{"inventory.exe", 0775, true, false},
+				{"inventory.cmd", 0666, false, false},
+				{"inventory.bat", 0666, false, false},
+				{"node", 0755, false, false},
+				{"cmd.exe", 0755, false, false},
+			} {
+				want := tc.unixOK
+				if goos == "windows" {
+					want = tc.windowsOK
+				}
+				if got := nyanMCPExecutableAllowed(tc.name, tc.mode, goos); got != want {
+					t.Errorf("executable %s mode %v: allowed=%v, want %v", tc.name, tc.mode, got, want)
+				}
+			}
+			for _, tc := range []struct {
+				mode      os.FileMode
+				windowsOK bool
+				unixOK    bool
+			}{
+				{0600, true, true}, {0400, true, true},
+				{0666, true, false}, {0444, true, false}, {0640, true, false},
+				{os.ModeDir | 0700, false, false}, {os.ModeNamedPipe | 0600, false, false},
+			} {
+				want := tc.unixOK
+				if goos == "windows" {
+					want = tc.windowsOK
+				}
+				if got := nyanMCPSecretFileAllowed(tc.mode, goos); got != want {
+					t.Errorf("secret mode %v: allowed=%v, want %v", tc.mode, got, want)
+				}
+			}
+		})
+	}
+	for _, name := range []string{"powershell.exe", "PWSH.EXE", "node.exe", "python.exe", "npm.exe", "go.exe"} {
+		if nyanMCPExecutableAllowed(name, 0666, "windows") {
+			t.Errorf("Windows interpreter %s accepted", name)
+		}
 	}
 }
 
